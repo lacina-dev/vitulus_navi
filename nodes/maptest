@@ -1,0 +1,1428 @@
+#!/usr/bin/env python
+import rospy
+import tf
+import re
+
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
+from PIL import Image
+import PIL.ImageOps
+import numpy as np
+from nav_msgs.msg import OccupancyGrid
+import time
+import PyKDL as kdl
+import sys
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+import actionlib
+from smach import State, StateMachine
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from nav_msgs.msg import Odometry, Path
+import math
+
+path_list = []
+# dimensions im meters
+robot_radius = 0.25  # 0.153 biggest robots dimension from footprint center
+cover_radius = 0.15  # covered area by robot
+obstacle_reserv = 0.1
+
+# map_legend
+free = 0
+unusable = 254
+border_path1 = 125
+border_path1_point = 100
+border_path2 = 160
+border_path2_point = 140
+border_path_infill = 50
+infill_path_horizontal = 180  # used for second border path too (for waypoints )
+infill_path_vertical = 200  # used for second border path too (for waypoints )
+infill_border_path_horizontal = 70  # horizontal and vertical for first border path (for waypoints )
+infill_border_path_vertical = 90  # horizontal and vertical for first border path (for waypoints )
+left_point = 40
+right_point = 41
+position_rc = [0, 0]
+
+
+class Map:
+
+    def __init__(self):
+        self.width = 0
+        self.height = 0
+        self.resolution = 0.0
+        self.origin_x = 0
+        self.origin_y = 0
+        self.position_rc = [0, 0]
+        self.arr_mask = np.zeros(shape=[0, 0])
+        self.arr_full_map = np.zeros(shape=[0, 0])
+        self.arr_map = np.zeros(shape=[0, 0])
+        self.obstacle_map = np.zeros(shape=[0, 0])
+        self.border_path_map = np.zeros(shape=[0, 0])
+        self.horizontal_infil_path_map = np.zeros(shape=[0, 0])
+        self.vertical_infil_path_map = np.zeros(shape=[0, 0])
+        self.paths = []
+        self.map_msg = OccupancyGrid()
+        self.map_out_msg = OccupancyGrid()
+
+
+    def get_yaw_to_path_pose(self, pose_from, pose_to):
+        x = pose_to.pose.position.x - pose_from.pose.position.x
+        y = pose_to.pose.position.y - pose_from.pose.position.y
+        # print("x: {} y: {}".format(x, y))
+        diagonal = math.sqrt(x ** 2 + y ** 2)
+        if y < 0:
+            if x >= 0:
+                theta_next = math.asin(y / diagonal)
+            else:
+                # self.theta_next = math.asin(y / diagonal) + math.radians(-90)
+                theta_next = math.acos(x / diagonal) * -1
+        else:
+            if x >= 0:
+                theta_next = math.asin(y / diagonal)
+            else:
+                # self.theta_next = math.asin(y / diagonal) + math.radians(90)
+                theta_next = math.acos(x / diagonal)
+        pose_stamped = PoseStamped()
+        pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(0, 0, theta_next).GetQuaternion()))
+        return theta_next, diagonal, pose_stamped.pose.orientation
+
+
+    def draw_arr(self, arr, title="Grid map"):
+        arr = arr[150:250, 150:250]
+        # arr = arr[134:234, 134:234]
+        fig, ax = plt.subplots(figsize=(10, 10), frameon=True)
+        ax.imshow(arr, cmap='gist_gray_r', interpolation='nearest')
+        spacing = 1  # This can be your user specified spacing.
+        minorLocator = MultipleLocator(spacing)
+        ax.yaxis.set_minor_locator(minorLocator)
+        ax.xaxis.set_minor_locator(minorLocator)
+        ax.minorticks_on()
+        ax.grid(b=True, which='minor', color='#37FF00', linestyle='-', alpha=0.4, markevery=2)
+        ax.set_aspect(1)
+        ax.set_yticks(np.arange(0.5, len(arr[0]), 1), minor='True')
+        ax.set_xticks(np.arange(0.5, len(arr[0]), 1), minor='True')
+        ax.yaxis.grid(True, which='minor')
+        ax.xaxis.grid(True, which='minor')
+        plt.tight_layout()
+        plt.show()
+        # Possible values are: Accent, Accent_r, Blues, Blues_r, BrBG, BrBG_r, BuGn, BuGn_r, BuPu,
+        # BuPu_r, CMRmap, CMRmap_r, Dark2, Dark2_r, GnBu, GnBu_r, Greens, Greens_r, Greys, Greys_r,
+        # OrRd, OrRd_r, Oranges, Oranges_r, PRGn, PRGn_r, Paired, Paired_r, Pastel1, Pastel1_r,
+        # Pastel2, Pastel2_r, PiYG, PiYG_r, PuBu, PuBuGn, PuBuGn_r, PuBu_r, PuOr, PuOr_r,
+        # PuRd, PuRd_r, Purples, Purples_r, RdBu, RdBu_r, RdGy, RdGy_r, RdPu, RdPu_r, RdYlBu,
+        # RdYlBu_r, RdYlGn, RdYlGn_r, Reds, Reds_r, Set1, Set1_r, Set2, Set2_r, Set3, Set3_r,
+        # Spectral, Spectral_r, Wistia, Wistia_r, YlGn, YlGnBu, YlGnBu_r, YlGn_r, YlOrBr, YlOrBr_r,
+        # YlOrRd, YlOrRd_r, afmhot, afmhot_r, autumn, autumn_r, binary, binary_r, bone, bone_r, brg,
+        # brg_r, bwr, bwr_r, cool, cool_r, coolwarm, coolwarm_r, copper, copper_r, cubehelix, cubehelix_r,
+        # flag, flag_r, gist_earth, gist_earth_r, gist_gray, gist_gray_r, gist_heat, gist_heat_r,
+        # gist_ncar, gist_ncar_r, gist_rainbow, gist_rainbow_r, gist_stern, gist_stern_r, gist_yarg,
+        # gist_yarg_r, gnuplot, gnuplot2, gnuplot2_r, gnuplot_r, gray, gray_r, hot, hot_r, hsv, hsv_r,
+        # inferno, inferno_r, jet, jet_r, magma, magma_r, nipy_spectral, nipy_spectral_r, ocean, ocean_r,
+        # pink, pink_r, plasma, plasma_r, prism, prism_r, rainbow, rainbow_r, seismic, seismic_r, spectral,
+        # spectral_r, spring, spring_r, summer, summer_r, terrain, terrain_r, viridis, viridis_r, winter, winter_r
+
+    def draw_and_save_img(self, arr, filename="Test"):
+        im = Image.fromarray(arr.astype(np.uint8))  # monochromatic image
+        imrgb = im.convert('RGB')  # color image
+        imrgb = PIL.ImageOps.invert(imrgb)
+        # imrgb.show()
+        imrgb.save(filename + ".bmp", "BMP")
+
+    def fill_unknown(self, arr):
+        arr_result = np.zeros_like(arr)
+        # arr_result[-1:1, -1:1] = fill_val
+        r = 0
+        for row in arr:
+            c = 0
+            for col in row:
+                # if col != 0:
+                # print(col)
+                arr_result[r, c] = col
+                if r>1 and c>1 and r<len(arr)-1 and c<len(row)-1:
+                    if col == -1:
+                        fill = 0
+                        if arr[r-1, c] == 0:
+                            fill += 1
+                        if arr[r+1, c] == 0:
+                            fill += 1
+                        if arr[r, c-1] == 0:
+                            fill += 1
+                        if arr[r, c+1] == 0:
+                            fill += 1
+                        if fill >= 2:
+                            arr_result[r, c] = 0
+
+                #     print(arr[r, c])
+                    # print "{}/{} {}".format(r, c, col)
+                    # arr_result[r - 1:r + 2, c - 1:c + 2] = np.where(np.array(arr[r - 1:r + 2, c - 1:c + 2]) == 0, fill_val,
+                    #                                        np.array(arr[r - 1:r + 2, c - 1:c + 2]))
+
+                    # arr_result[r, c] = np.where(arr[r - 1:r + 2, c - 1:c + 2] == free, fill_val,
+                    #                                                 arr[r - 1:r + 2, c - 1:c + 2])
+                    # a[r - 1:r + 2, c - 1:c + 2] = fill_val
+                    # a[r - 1:r + 2, c:c + 2] = fill_val
+                    # a[r:r + 2, c - 1:c + 2] = fill_val
+                    # a[r:r + 2, c:c + 2] = 1
+                    #
+                    # a[r-1:r+1, c-1:c+2] = fill_val
+                    # a[r-1:r, c-1:c+2] = fill_val
+                    # a[r-1:r+1, c-1:c+1] = fill_val
+                    # a[r-1:r, c-1:c+1] = fill_val
+                    # a[r-1:r+1, c-1:c] = fill_val
+                    # a[r-1:r, c-1:c] = fill_val
+                    # a[r-1:r+2, c-1:c+1] = fill_val
+                    # a[r-1:r+2, c-1:c] = fill_val
+
+                c = c + 1
+            r = r + 1
+        return arr_result
+
+    def incrase_obstacles(self, arr, fill_val=254):
+        arr_result = np.zeros_like(arr)
+        arr_result[-1:1, -1:1] = fill_val
+        r = 0
+        for row in arr:
+            c = 0
+            for col in row:
+                if col != 0:
+                    # print "{}/{} {}".format(r, c, col)
+                    # arr_result[r - 1:r + 2, c - 1:c + 2] = np.where(np.array(arr[r - 1:r + 2, c - 1:c + 2]) == 0, fill_val,
+                    #                                        np.array(arr[r - 1:r + 2, c - 1:c + 2]))
+
+                    arr_result[r - 1:r + 2, c - 1:c + 2] = np.where(arr[r - 1:r + 2, c - 1:c + 2] == free, fill_val,
+                                                                    arr[r - 1:r + 2, c - 1:c + 2])
+                    # a[r - 1:r + 2, c - 1:c + 2] = fill_val
+                    # a[r - 1:r + 2, c:c + 2] = fill_val
+                    # a[r:r + 2, c - 1:c + 2] = fill_val
+                    # a[r:r + 2, c:c + 2] = 1
+                    #
+                    # a[r-1:r+1, c-1:c+2] = fill_val
+                    # a[r-1:r, c-1:c+2] = fill_val
+                    # a[r-1:r+1, c-1:c+1] = fill_val
+                    # a[r-1:r, c-1:c+1] = fill_val
+                    # a[r-1:r+1, c-1:c] = fill_val
+                    # a[r-1:r, c-1:c] = fill_val
+                    # a[r-1:r+2, c-1:c+1] = fill_val
+                    # a[r-1:r+2, c-1:c] = fill_val
+
+                c = c + 1
+            r = r + 1
+        return arr_result
+
+    def remove_blind(self, arr, type, replace):
+        num_of_type = 0
+        for r in range(0, arr.shape[0]):
+            c = 0
+            for c in range(0, arr.shape[1]):
+                if arr[r, c] == type:
+                    for cell in arr[r - 1:r + 2, c - 1:c + 2].flatten():
+                        if cell == free:
+                            num_of_type = num_of_type + 1
+                    if num_of_type == 0:
+                        arr[r, c] = replace
+                    num_of_type = 0
+                c = c + 1
+            r = r + 1
+        return arr
+
+    def find_borders_area(self, arr, area_type):
+        area_info = {'area_type': area_type, 'up_row': 99999999, "down_row": 0,
+                     'left_col': 99999999, "right_col": 0
+                     }
+        for r in range(0, arr.shape[0]):
+            c = 0
+            for c in range(0, arr.shape[1]):
+                if arr[r, c] in area_type:
+                    if area_info['up_row'] > r:
+                        area_info['up_row'] = r
+                    if area_info['down_row'] < r:
+                        area_info['down_row'] = r
+                    if area_info['left_col'] > c:
+                        area_info['left_col'] = c
+                    if area_info['right_col'] < c:
+                        area_info['right_col'] = c
+        return area_info
+
+    def draw_horizontal_lines(self, a, cover_distance):
+        p = self.find_borders_area(a, [free])
+        # print(p)
+        # self.draw_and_save_img(p)
+        r = int(cover_distance / 2)
+        a[p['up_row'] + r, :] = np.where(a[p['up_row'] + r, :] == free, infill_path_horizontal, a[p['up_row'] + r, :])
+        for ri in range(p['up_row'] + r, p['down_row'] - 1, int(cover_distance * 2 / 3)):
+            a[ri, :] = np.where(a[ri, :] == free, infill_path_horizontal, a[ri, :])
+            # a[ri, :] = np.where(a[ri, :] == border_path2, border_path2_point, a[ri, :])
+            # a[ri, :] = np.where(a[ri, :] == border_path1, border_path1_point, a[ri, :])
+            # a[ri, :] = np.where(a[ri, :] == border_path_infill, infill_border_path_horizontal, a[ri, :])
+        return a
+
+    def draw_vertical_lines(self, a, cover_distance):
+        p = self.find_borders_area(a, [free])
+        c = int(cover_distance / 2)
+        a[:, p['left_col'] + c] = np.where(a[:, p['left_col'] + c] == free, infill_path_vertical,
+                                           a[:, p['left_col'] + c])
+        for ci in range(p['left_col'] + c, p['right_col'] - 1, int(cover_distance * 2 / 3)):
+            a[:, ci] = np.where(a[:, ci] == free, infill_path_vertical, a[:, ci])
+            # a[:, ci] = np.where(a[:, ci] == border_path2, border_path2_point, a[:, ci])
+            # a[:, ci] = np.where(a[:, ci] == border_path1, border_path1_point, a[:, ci])
+            # a[:, ci] = np.where(a[:, ci] == border_path_infill, infill_border_path_vertical, a[:, ci])
+            # a[:, ci] = np.where(a[:, ci] == infill_border_path_horizontal, infill_border_path_vertical, a[:, ci])
+        return a
+
+    def get_nearest_point(self, arr, position, point_types=[]):
+        distance = 9999999999
+        result = []
+        for r in range(0, arr.shape[0]):
+            c = 0
+            for c in range(0, arr.shape[1]):
+                if arr[r, c] in point_types:
+                    x = position[0] - r
+                    y = position[1] - c
+                    if np.sqrt(x ** 2 + y ** 2) < distance:
+                        distance = np.sqrt(x ** 2 + y ** 2)
+                        result = [r, c]
+        return result
+
+    def get_horizontal_start(self):
+        distance = 0
+        result = []
+        for r in range(0, self.horizontal_infil_path_map.shape[0]):
+            for c in range(0, self.horizontal_infil_path_map.shape[1]):
+                if self.horizontal_infil_path_map[r, c] == infill_path_horizontal and self.horizontal_infil_path_map[r, c-1] == border_path2:
+                    if r > distance:
+                        result = [r, c]
+        return result
+
+    def find_horizontal_paths(self):  # find left and right ends of horizontal paths and mark them
+        for r in range(0, self.horizontal_infil_path_map.shape[0]):
+            for c in range(0, self.horizontal_infil_path_map.shape[1]):
+                if self.horizontal_infil_path_map[r, c] == infill_path_horizontal \
+                        and self.horizontal_infil_path_map[r, c-1] == border_path2 \
+                        and self.horizontal_infil_path_map[r, c+1] != border_path2\
+                        and self.horizontal_infil_path_map[r, c+2] != border_path2:
+                    self.horizontal_infil_path_map[r, c] = left_point
+                if self.horizontal_infil_path_map[r, c] == infill_path_horizontal \
+                        and self.horizontal_infil_path_map[r, c+1] == border_path2 \
+                        and self.horizontal_infil_path_map[r, c-1] != border_path2\
+                        and self.horizontal_infil_path_map[r, c-2] != border_path2:
+                    self.horizontal_infil_path_map[r, c] = right_point
+
+    def horizontal_path(self):
+        path = MapPath()
+        path.type = infill_path_horizontal
+        path.id = len(self.paths)
+        self.position_rc = [0, 0]
+        direction = "RIGHT"
+        self.position_rc = self.get_nearest_point(self.horizontal_infil_path_map, self.position_rc, [left_point]) # Find beggin of path
+        print(print(self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]]))
+        point_id = 0
+        while True:
+            # print(self.position_rc)
+            # print(self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]])
+            point = MapPoint()
+            point.id = point_id
+            point.map = self
+            point.r = self.position_rc[0]
+            point.c = self.position_rc[1]
+            point.map.position_rc = [point.r, point.c]
+            point.get_neighbours_types(point.map.horizontal_infil_path_map)
+            point.direction = direction
+            position_rc = self.position_rc
+            if direction == "LEFT":
+                point.theta_next = -1.5707963267948966
+            else:
+                point.theta_next = 1.5707963267948966
+
+            if self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]] == left_point:
+                # print(self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]])
+                self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]] = 12
+                if direction == "LEFT":
+                    position_rc = self.get_nearest_point(self.horizontal_infil_path_map, self.position_rc, [left_point, right_point])
+                    if position_rc != []:
+                        if self.horizontal_infil_path_map[position_rc[0], position_rc[1]] == left_point:
+                            # print("LEFT-RIGHT")
+                            direction = "RIGHT"
+                        if self.horizontal_infil_path_map[position_rc[0], position_rc[1]] == right_point:
+                            # print("LEFT-LEFT")
+                            direction = "LEFT"
+                else:
+                    position_rc = [self.position_rc[0], self.position_rc[1] + 1]
+
+            if self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]] == infill_path_horizontal:
+                # print(self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]])
+                self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]] = 181
+                if direction == "RIGHT":
+                    # print("RIGHT")
+                    position_rc = [self.position_rc[0], self.position_rc[1] + 1]
+                if direction == "LEFT":
+                    # print("LEFT")
+                    position_rc = [self.position_rc[0], self.position_rc[1] - 1]
+
+            if self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]] == right_point:
+                # print(self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]])
+                self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]] = 23
+                if direction == "RIGHT":
+                    position_rc = self.get_nearest_point(self.horizontal_infil_path_map, self.position_rc, [left_point, right_point])
+                    # print(position_rc)
+                    if position_rc != []:
+                        if self.horizontal_infil_path_map[position_rc[0], position_rc[1]] == left_point:
+                            # print("RIGHT-RIGHT")
+                            direction = "RIGHT"
+                        if self.horizontal_infil_path_map[position_rc[0], position_rc[1]] == right_point:
+                            # print("RIGHT-LEFT")
+                            direction = "LEFT"
+                else:
+                    position_rc = [self.position_rc[0], self.position_rc[1] - 1]
+            self.position_rc = position_rc
+            if point.id != 0:
+                point.conn_from = path.points[point.id -1]
+                path.points[point.id -1].conn_next = point
+            path.points.append(point)
+            point_id = point_id + 1
+
+            if self.position_rc == []:
+                path.points[0].conn_from = path.points[-1]
+                path.points[-1].conn_next = path.points[0]
+                return path
+
+
+        # for row in self.horizontal_infil_path_map:
+        #     for point in row:
+        #         print(point)
+
+
+    def horizontal_line_to_path(self, start_point):
+        path = MapPath()
+        direction = 'right'
+        self.position_rc = [len(self.horizontal_infil_path_map)-1, 0]
+        # print(self.position_rc)
+        # print(self.horizontal_infil_path_map[self.position_rc[0], self.position_rc[1]])
+        points_available = True
+        path_start = True
+        while points_available:
+            if direction == 'right':
+                if path_start:
+                    self.position_rc = self.get_nearest_point(self.horizontal_infil_path_map, self.position_rc, [left_point])
+                point = MapPoint()
+                point.id = id
+                point.map = self
+                point.r = self.position_rc[0]
+                point.c = self.position_rc[1]
+                point.get_neighbours_types(self.horizontal_infil_path_map)
+                self.horizontal_infil_path_map[point.r, point.c] = 248
+                point.direction = 'RIGHT'
+                path.points.append(point)
+
+            if direction == 'left':
+                if path_start:
+                    self.position_rc = self.get_nearest_point(self, self.horizontal_infil_path_map, self.position_rc, [right_point])
+        return path
+
+    ### CREATE SINGLE PATH FOR OBSTACLE
+    def border_line_to_path(self, map_l, start_point, path_id):
+        path = MapPath()
+        path.type = map_l.border_path_map[start_point[0], start_point[1]]
+        path.id = path_id
+        next_p_r = start_point[0]
+        next_p_c = start_point[1]
+        available_points = True
+        id = 0
+        while available_points:
+            point = MapPoint()
+            point.id = id
+            point.map = map_l
+            point.r = next_p_r
+            point.c = next_p_c
+            point.map.position_rc = [point.r, point.c]
+            point.get_neighbours_types(point.map.border_path_map)
+            point.map.border_path_map[point.r, point.c] = 249
+            direction = 'nn'
+            try:
+                direction = list(point.neigh.keys())[list(point.neigh.values()).index(point.type)]
+            except:
+                # print("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+                pass
+            # direction = list(point.neigh.keys())[list(point.neigh.values()).index(point.type)]
+            # list(config_order.keys())[list(config_order.values()).index(element)]
+            if direction == 'up':
+                next_p_r = point.r - 1
+                next_p_c = point.c
+                point.direction = 'UP'
+            if direction == 'down':
+                next_p_r = point.r + 1
+                next_p_c = point.c
+                point.direction = 'DOWN'
+            if direction == 'left':
+                next_p_r = point.r
+                next_p_c = point.c - 1
+                point.direction = 'LEFT'
+            if direction == 'right':
+                next_p_r = point.r
+                next_p_c = point.c + 1
+                point.direction = 'RIGHT'
+            if direction == 'nn':
+                available_points = False
+                path.points[0].conn_from = point
+                if path.points[0].r < point.r:
+                    point.direction = 'UP'
+                if path.points[0].r > point.r:
+                    point.direction = 'DOWN'
+                if path.points[0].c < point.c:
+                    point.direction = 'LEFT'
+                if path.points[0].c < point.c:
+                    point.direction = 'RIGHT'
+            if point.id != 0:
+                point.conn_from = path.points[-1]
+                path.points[-1].conn_next = point
+            path.points.append(point)
+            id = id + 1
+        return path
+
+
+class MapPoint:
+
+    def __init__(self):
+        self.id = 0
+        self.map = Map()
+        self.r = 0
+        self.c = 0
+        self.x = 0
+        self.y = 0
+        self.type = 0
+        self.conn_from = None
+        self.conn_next = None
+        self.theta_next = 0
+        self.neigh = {'up': -1, 'down': -1, 'left': -1, 'right': 0}
+        self.shape = "NN"  # NN, UL upper left corner, UR, DL, DR, VR vertical, HR horizontal
+        self.direction = 'NN'  # NN, UP, DOWN, RIGHT, LEFT
+
+    def set_x_y(self):
+        self.x = float((float(self.r) * self.map.resolution) + (self.map.origin_x))
+        self.y = float((float(self.c) * self.map.resolution) + (self.map.origin_y))
+
+    def set_yaw_to_next(self):
+        self.set_x_y()
+        self.conn_next.set_x_y()
+        self.conn_next.conn_next.set_x_y()
+        self.conn_next.conn_next.conn_next.set_x_y()
+        self.conn_next.conn_next.conn_next.conn_next.set_x_y()
+        x = self.conn_next.conn_next.conn_next.conn_next.x - self.x
+        y = self.conn_next.conn_next.conn_next.conn_next.y - self.y
+        # print("x: {} y: {}".format(x, y))
+        diagonal = math.sqrt(x ** 2 + y ** 2)
+        if y < 0:
+            if x >= 0:
+                self.theta_next = math.asin(y / diagonal)
+                pass
+            else:
+                # self.theta_next = math.asin(y / diagonal) + math.radians(-90)
+                self.theta_next = math.acos(x / diagonal) * -1
+                pass
+        else:
+            if x >= 0:
+                self.theta_next = math.asin(y / diagonal)
+                pass
+            else:
+                # self.theta_next = math.asin(y / diagonal) + math.radians(90)
+                self.theta_next = math.acos(x / diagonal)
+                pass
+        # print("theta: {} x: {} y: {}".format(self.theta_next, x, y))
+
+    def get_yaw_to_point(self, point):
+        self.set_x_y()
+        point.set_x_y()
+        x = point.x - self.x
+        y = point.y - self.y
+        # print("x: {} y: {}".format(x, y))
+        diagonal = math.sqrt(x ** 2 + y ** 2)
+        if y < 0:
+            if x >= 0:
+                theta_next = math.asin(y / diagonal)
+            else:
+                theta_next = math.asin(y / diagonal) + math.radians(-90)
+        else:
+            if x > 0:
+                theta_next = math.asin(y / diagonal)
+            else:
+                theta_next = math.acos(x / diagonal)
+        # print("From point {} to point {} theta: {} x: {} y: {}".format(self.id, point.id, self.theta_next, x, y))
+        return theta_next
+
+
+
+
+
+    def get_neighbours_types(self, map):
+        self.type = map[self.r, self.c]
+        self.neigh['up'] = map[self.r - 1, self.c]
+        self.neigh['down'] = map[self.r + 1, self.c]
+        self.neigh['left'] = map[self.r, self.c - 1]
+        self.neigh['right'] = map[self.r, self.c + 1]
+        if self.neigh['up'] in [self.type, 249] and self.neigh['down'] in [self.type, 249]:
+            self.shape = "VR"
+        if self.neigh['left'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+            self.shape = "HR"
+        if self.neigh['up'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+            self.shape = "DL"
+        if self.neigh['up'] in [self.type, 249] and self.neigh['left'] in [self.type, 249]:
+            self.shape = "DR"
+        if self.neigh['down'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+            self.shape = "UL"
+        if self.neigh['down'] in [self.type, 249] and self.neigh['left'] in [self.type, 249]:
+            self.shape = "UR"
+
+    def get_pose(self):
+        pose = Pose()
+        x = float((float(self.r) * mapa.resolution) + (mapa.origin_x))
+        y = float((float(self.c) * mapa.resolution) + (mapa.origin_y))
+        z = 0.0
+        # print(x)
+
+        th = 0
+        if self.direction == 'UP':
+            th = th + 180
+        if self.direction == 'RIGHT':
+            th = th + 90
+        if self.direction == 'LEFT':
+            th = th + 270
+
+        roll = 0
+        pitch = 0
+        yaw = (th) * (3.14 / 180)
+
+        # Covariance
+        # P = np.mat(np.diag([x, y, yaw]))
+
+        # msg = PoseWithCovarianceStamped()
+        # msg.header.stamp = rospy.Time.now()
+        # msg.header.frame_id = 'map'  # i.e. '/odom'
+        # # msg.child_frame_id = self.child_frame_id # i.e. '/base_footprint'
+        #
+        # msg.pose.pose.position = Point(x, y, z)
+        # msg.pose.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+        # p_cov = np.array([0.0] * 36).reshape(6, 6)
+        #
+        # # position covariance
+        # p_cov[0:2, 0:2] = P[0:2, 0:2]
+        # # orientation covariance for Yaw
+        # # x and Yaw
+        # p_cov[5, 0] = p_cov[0, 5] = P[2, 0]
+        # # y and Yaw
+        # p_cov[5, 1] = p_cov[1, 5] = P[2, 1]
+        # # Yaw and Yaw
+        # p_cov[5, 5] = P[2, 2]
+        #
+        # msg.pose.covariance = tuple(p_cov.ravel().tolist())
+
+        # pose.header.frame_id = 'map'
+        pose.position.x = x
+        pose.position.y = y
+        pose.position.z = z
+        pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+        pose_stamped = PoseStamped()
+        pose_stamped.pose.position.x = x
+        pose_stamped.pose.position.y = y
+        pose_stamped.pose.position.z = z
+        pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, self.theta_next).GetQuaternion()))
+        # pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+
+        return pose, pose_stamped, yaw
+
+    def get_path_pose(self):
+        pose = Pose()
+        x = float((float(self.r) * mapa.resolution) + (mapa.origin_x))
+        y = float((float(self.c) * mapa.resolution) + (mapa.origin_y))
+        z = 0.0
+        # print(x)
+
+        th = 0
+        if self.direction == 'UP':
+            th = th + 180
+        if self.direction == 'RIGHT':
+            th = th + 90
+        if self.direction == 'LEFT':
+            th = th + 270
+
+        roll = 0
+        pitch = 0
+        yaw = (th) * (3.14 / 180)
+
+        pose.position.x = x
+        pose.position.y = y
+        pose.position.z = z
+        pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+        pose_stamped = PoseStamped()
+        pose_stamped.pose.position.x = x
+        pose_stamped.pose.position.y = y
+        pose_stamped.pose.position.z = z
+        pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+
+        return pose, pose_stamped
+
+
+class MapPath:
+
+    def __init__(self):
+        self.id = 0
+        self.type = 0
+        self.points = []
+        self.interval = 1
+
+
+
+
+class Waypoint(State):
+    def __init__(self, wpoint):
+
+        State.__init__(self, outcomes=['success'])
+
+        # Get an action client
+        self.client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+        self.client.wait_for_server()
+
+        # Define the goal
+        self.goal = MoveBaseGoal()
+        self.goal.target_pose.header.frame_id = 'map'
+        self.goal.target_pose.pose = wpoint.get_pose()
+        # self.goal.target_pose.pose.position.x = x
+        # self.goal.target_pose.pose.position.y = y
+        # self.goal.target_pose.pose.position.z = z
+        # self.goal.target_pose.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+    def execute(self, userdata):
+        self.client.send_goal(self.goal)
+        self.client.wait_for_result()
+        aaaaa = self.client.get_result()
+        # print('ddddddddd')
+        # print(aaaaa)
+        return 'success'
+
+
+
+
+
+def callback(data):
+    rospy.loginfo("[{}] Width: {} ".format(rospy.get_caller_id(),data.info.width))
+    # rospy.loginfo(rospy.get_caller_id() + " Width: %s", data.info.width)
+    rospy.loginfo(rospy.get_caller_id() + " Heigth: %s", data.info.height)
+    rospy.loginfo(rospy.get_caller_id() + " Resolution: %s", data.info.resolution)
+    rospy.loginfo(rospy.get_caller_id() + " Map load time: %s", data.info.map_load_time)
+    rospy.loginfo(rospy.get_caller_id() + " Width in (m): %s", data.info.width * data.info.resolution)
+    rospy.loginfo(rospy.get_caller_id() + " Heigth in (m): %s", data.info.height * data.info.resolution)
+
+    obstacle_distance = int(round((robot_radius + obstacle_reserv) / data.info.resolution))
+    # print obstacle_distance
+
+    cover_distance = int(round(cover_radius * 2 / data.info.resolution))
+    # print cover_distance
+
+    position_rc = [data.info.width / 2, data.info.height / 2]
+    print("Prepare array...")
+    # arr = np.array(data.data).reshape((data.info.width, data.info.height))
+    arr = np.array(data.data).reshape((data.info.height, data.info.width))
+    # mapa.draw_and_save_img(arr)
+    # mapa.draw_arr(arr)
+    arr = np.fliplr(arr)
+    arr = np.rot90(arr, 1)
+
+    mapa.arr_mask = np.zeros(shape=[data.info.width, data.info.height])
+
+
+
+    # arr = np.flipud(arr)
+    # mapa.draw_and_save_img(arr)
+    print("Prepare map...")
+    mapa.position_rc = position_rc
+    mapa.width = data.info.width
+    mapa.height = data.info.height
+    mapa.resolution = data.info.resolution
+    mapa.origin_x = data.info.origin.position.x
+    mapa.origin_y = data.info.origin.position.y
+    mapa.arr = np.copy(arr)
+
+    arr_filled = mapa.fill_unknown(arr)
+    # mapa.draw_and_save_img(arr_filled)
+    arr_filled = mapa.fill_unknown(arr_filled)
+    # mapa.draw_and_save_img(arr_filled)
+    arr = mapa.fill_unknown(arr_filled)
+    # mapa.draw_and_save_img(arr)
+
+    print(arr.shape)
+
+    ######################################################
+    mapa.arr_full_map = np.copy(arr)
+
+
+
+    # arr = np.fliplr(arr)
+
+    ###################################### Apply mask
+    print("Apply mask...")
+    # np_mask = read_pgm("Map_baseMask.pgm")
+    np_mask = read_pgm("../maps/zahradaMask.pgm")
+    # arr = np.fliplr(arr)
+    np_mask = np.rot90(np_mask, 1)
+    np_mask = np.rot90(np_mask, 1)
+    np_mask = np.rot90(np_mask, 1)
+    # print(np_mask.shape)
+    # print(len(np_mask))
+    r = 0
+    for row in np_mask:
+        # print(r)
+        c = 0
+        for col in row:
+            # print("{}x{}".format(r,c))
+            if col < 11:
+                arr[r, c] = unusable
+                mapa.arr_mask[r, c] = 90
+            c += 1
+        r += 1
+
+    arr = np.where(arr == 0, arr, unusable)
+    mapa.arr_mask = np.where(mapa.arr_mask == 0, unusable, mapa.arr_mask)
+
+    # mapa.fill_unknown(arr)
+
+    # Zvetsi prekazky o obstacle_distance
+    print("Increase obstacles...")
+    a = arr
+    for i in range(1, obstacle_distance):
+        a = mapa.incrase_obstacles(a, unusable)
+    mapa.obstacle_map = np.copy(a)
+    # draw_arrr(mapa.obstacle_map)
+    mapa.draw_and_save_img(mapa.obstacle_map, "Increased_obstacles")
+
+    # nakresli prvni obkruznou trasu
+    print("Draw first border path...")
+    a = mapa.incrase_obstacles(a, border_path1)
+    a = mapa.remove_blind(a, border_path1, unusable)
+    # nakresli druhou obkruznou trasu
+    print("Draw second border path...")
+    for i in range(0, 1):
+        a = mapa.incrase_obstacles(a, border_path_infill)
+    a = mapa.incrase_obstacles(a, border_path2)
+    a = mapa.remove_blind(a, border_path2, border_path_infill)
+    mapa.border_path_map = np.copy(a)
+    # print(mapa.border_path_map)
+    # mapa.draw_arr(mapa.border_path_map)
+    mapa.draw_and_save_img(mapa.border_path_map, "Around_obstacles")
+
+    # horizontal points and routes
+    print("Draw horizontal path...")
+    ah = np.copy(a)
+    mapa.horizontal_infil_path_map = mapa.draw_horizontal_lines(ah, cover_distance)
+    # draw_arr(mapa.horizontal_infil_path_map)
+
+    # vertical points and routes
+    print("Draw vertical path...")
+    av = np.copy(a)
+    mapa.vertical_infil_path_map = mapa.draw_vertical_lines(av, cover_distance)
+    # draw_arr(mapa.vertical_infil_path_map)
+    mapa.draw_and_save_img(mapa.horizontal_infil_path_map, "Horizontal_paths")
+    mapa.draw_and_save_img(mapa.vertical_infil_path_map, "Vertical_paths")
+
+    ######## Create paths
+    print("Create navigation border path...")
+    path_types = [border_path2, border_path1]
+    # path_types = []
+    path_id = 0
+    for path_type in path_types:
+        while True:
+            start_point = mapa.get_nearest_point(mapa.border_path_map, mapa.position_rc, [path_type])
+            if len(start_point) == 0:
+                break
+            path = mapa.border_line_to_path(mapa, start_point, path_id)
+            mapa.paths.append(path)
+            path_id = path_id + 1
+            # draw_arr(mapa.border_path_map)
+
+
+
+    for path in mapa.paths:
+        # path.points.append(path.points[0]) ## close loop
+
+        path.points[-1].conn_next = path.points[0]
+
+        for point in path.points:
+            # print 'in: {} out: {}'.format(point.conn_from.direction, point.direction)
+            point.set_yaw_to_next()
+
+            mapa.arr[point.r, point.c] = path_type
+            if point.id == 0:
+                mapa.arr[point.r, point.c] = 40
+
+
+
+    print("Create navigation horizontal path...")
+    mapa.find_horizontal_paths()
+    path = mapa.horizontal_path()
+    mapa.paths.append(path)
+
+
+
+
+
+
+    # rospy.init_node('patrol')
+
+    # patrol = StateMachine(outcomes=['endstate'])
+    #
+    # state_id = 0
+    # with patrol:
+    #     for path_i in range(len(mapa.paths)):
+    #         interval = 0
+    #         interval_max = 7
+    #         for point_i in range(len(mapa.paths[path_i].points)):
+    #
+    #             print('path: {}/{}   point: {}/{}'.format(path_i, len(mapa.paths), point_i, len(mapa.paths[path_i].points)))
+    #
+    #             if path_i == (len(mapa.paths))-1 and point_i == (len(mapa.paths[path_i].points))-1:
+    #                 StateMachine.add(state_id, Waypoint(mapa.paths[path_i].points[point_i]),
+    #                                  transitions={'success': 'endstate'})
+    #                 print('NE')
+    #                 pos_arr.poses.append(mapa.paths[path_i].points[point_i].get_pose())
+    #
+    #             else:
+    #                 print(mapa.paths[path_i].points[point_i].shape)
+    #                 if mapa.paths[path_i].points[point_i].shape in ['UL', 'UR', 'DL', 'DR']:
+    #                     StateMachine.add(state_id, Waypoint(mapa.paths[path_i].points[point_i]),
+    #                                      transitions={'success': state_id + 1})
+    #                     state_id = state_id + 1
+    #                     print('ANO')
+    #                     pos_arr.poses.append(mapa.paths[path_i].points[point_i].get_pose())
+    #                     interval = 0
+    #                 else:
+    #                     if interval == interval_max:
+    #                         StateMachine.add(state_id, Waypoint(mapa.paths[path_i].points[point_i]),
+    #                                          transitions={'success': state_id + 1})
+    #                         state_id = state_id + 1
+    #                         print('ANO')
+    #                         pos_arr.poses.append(mapa.paths[path_i].points[point_i].get_pose())
+    #                         interval = 0
+    #             interval = interval + 1
+    #
+    #         # state_id = state_id + 1
+    #
+    #     # for i, w in enumerate(waypoints):
+    #     #     StateMachine.add(w[0],
+    #     #                      Waypoint(w[1], w[2]),
+    #     #                      transitions={'success': waypoints[(i + 1) % len(waypoints)][0]})
+    #
+    # patrol.execute()
+
+
+    # rospy.init_node('patrol')
+
+    # patrol = StateMachine(outcomes=['endstate'])
+    #
+    # state_id = 0
+    # with patrol:
+
+    # # for path_i in range(len(mapa.paths)):
+    # for path_i in range(1):
+    #     interval = 0
+    #     interval_max = 200 # 200 x 0.05 = 10 m   almost disabled midpoints
+    #     for point_i in range(len(mapa.paths[path_i].points)):
+    #
+    #         print('path: {}/{}   point: {}/{}'.format(path_i, len(mapa.paths), point_i, len(mapa.paths[path_i].points)))
+    #
+    #         ## END
+    #         if path_i == (len(mapa.paths))-1 and point_i == (len(mapa.paths[path_i].points))-1:
+    #             print('NE')
+    #             pose, pose_stamped = mapa.paths[path_i].points[point_i].get_pose()
+    #             pos_arr.poses.append(pose)
+    #             path_msg.poses.append(pose_stamped)
+    #
+    #         else:
+    #             print(mapa.paths[path_i].points[point_i].shape)
+    #             if mapa.paths[path_i].points[point_i].shape in ['UL', 'UR', 'DL', 'DR']:
+    #                 print('ANO1')
+    #                 pose, pose_stamped = mapa.paths[path_i].points[point_i].get_pose()
+    #                 pos_arr.poses.append(pose)
+    #                 path_msg.poses.append(pose_stamped)
+    #                 interval = 0
+    #             else:
+    #                 if interval == interval_max:
+    #                     print('ANO')
+    #                     pose, pose_stamped = mapa.paths[path_i].points[point_i].get_pose()
+    #                     pos_arr.poses.append(pose)
+    #                     path_msg.poses.append(pose_stamped)
+    #                     interval = 0
+    #         interval = interval + 1
+
+
+    for path_i in range(len(mapa.paths)):
+    # for path_i in range(1):
+        interval = 0
+        interval_max = 1
+        last_theta = -1
+        step = 0
+        # for point_i in range(len(mapa.paths[path_i].points[0:3500])):
+        first_pose = None
+        for point_i in range(len(mapa.paths[path_i].points)):
+            if interval > interval_max:
+                interval = 0
+            if interval == 0 or point_i == len(mapa.paths[path_i].points)-1:
+                points_4_back = mapa.paths[path_i].points[point_i].conn_from.conn_from.conn_from.conn_from
+                points_3_back = mapa.paths[path_i].points[point_i].conn_from.conn_from.conn_from
+                points_2_back = mapa.paths[path_i].points[point_i].conn_from.conn_from
+                points_1_back = mapa.paths[path_i].points[point_i].conn_from
+                point = mapa.paths[path_i].points[point_i]
+                points_1_fwd = mapa.paths[path_i].points[point_i].conn_next
+                points_2_fwd = mapa.paths[path_i].points[point_i].conn_next.conn_next
+                points_3_fwd = mapa.paths[path_i].points[point_i].conn_next.conn_next.conn_next
+                points_4_fwd = mapa.paths[path_i].points[point_i].conn_next.conn_next.conn_next.conn_next
+                pose, pose_stamped, yaw = mapa.paths[path_i].points[point_i].get_pose()
+                pos_arr.poses.append(pose)
+
+                if mapa.paths[path_i].type in [border_path1, border_path2]:
+                    if point_i == len(mapa.paths[path_i].points) - 1: ## last pose in path
+                        path_borders_msg.poses.append(pose_stamped)
+
+
+                    if last_theta == -1:  ## first pose in path
+                        path_borders_msg.poses.append(pose_stamped)
+                        # first_pose = pose_stamped
+                        last_theta = point.theta_next
+                    else:
+                        # if last_theta != yaw:
+                        #     path_borders_msg.poses.append(pose_stamped)
+                        ## if next 4 points have same orientation as current point
+                        # path_borders_msg.poses.append(pose_stamped)
+                        # last_theta = point.theta_next
+                        if step == 4:
+                            # theta_diff = points_1_back.theta_next - point.theta_next
+                            theta_diff = points_1_back.theta_next - last_theta
+
+                            if abs(theta_diff) > math.radians(18):
+                                # print(theta_diff)
+
+                                path_borders_msg.poses.append(pose_stamped)
+                                last_theta = point.theta_next
+                            # else:
+                            #     theta_diff = points_1_fwd.theta_next - last_theta
+                            #     if abs(theta_diff) > math.radians(30):
+                            #         path_borders_msg.poses.append(pose_stamped)
+                            #         last_theta = point.theta_next
+
+                            step = 0
+
+
+                        point_i += 4
+                    # if point_i == len(mapa.paths[path_i].points) - 1: ## last pose in path
+                    #     last_theta = -1
+                    #     path_borders_msg.poses.append(first_pose)
+                step += 1
+
+
+
+                        # if points_1_fwd.theta_next == point.theta_next \
+                        #         and points_2_fwd.theta_next == point.theta_next \
+                        #         and points_3_fwd.theta_next == point.theta_next \
+                        #         and points_4_fwd.theta_next == point.theta_next:
+                        #     # if points_1_back.theta_next != point.theta_next:
+                        #     theta_diff = points_1_back.theta_next - point.theta_next
+                        #     if abs(theta_diff) > math.radians(15):
+                        #
+                        #         path_msg.poses.append(pose_stamped)
+                        #         last_theta = point.theta_next
+                        #
+                        # ## if last 4 points have same orientation as current point
+                        # if points_1_back.theta_next == point.theta_next \
+                        #         and points_2_back.theta_next == point.theta_next \
+                        #         and points_3_back.theta_next == point.theta_next \
+                        #         and points_4_back.theta_next == point.theta_next:
+                        #     # if points_1_fwd.theta_next != point.theta_next:
+                        #     theta_diff = points_1_fwd.theta_next - point.theta_next
+                        #     if abs(theta_diff) > math.radians(15):
+                        #         pose1, pose_stamped1, yaw1 = points_1_fwd.get_pose()
+                        #         path_msg.poses.append(pose_stamped1)
+                        #         last_theta = points_1_fwd.theta_next
+
+
+
+
+
+                if mapa.paths[path_i].type == infill_path_horizontal:
+                    # print("on horizontal")
+                    # if next_point.theta_next != point.theta_next:
+                    #     path_Hinfill_msg.poses.append(pose_stamped)
+                    # print(mapa.horizontal_infil_path_map[mapa.paths[path_i].points[point_i].r, mapa.paths[path_i].points[point_i].c])
+                    # path_Hinfill_msg.poses.append(pose_stamped)
+                    if mapa.horizontal_infil_path_map[mapa.paths[path_i].points[point_i].r, mapa.paths[path_i].points[point_i].c] in [left_point,
+                                                                                                                                      right_point,
+                                                                                                                                      12, 23]:
+                        # print(mapa.horizontal_infil_path_map[mapa.paths[path_i].points[point_i].r, mapa.paths[path_i].points[point_i].c])
+                        # print("YES")
+                        path_Hinfill_msg.poses.append(pose_stamped)
+                # last_theta = point.theta_next
+    # repaired_poses = path_borders_msg.poses
+    print("Border path optimization 1")
+    repaired_poses = []
+    for pose_id in range(len(path_borders_msg.poses)):
+        current_pose = path_borders_msg.poses[pose_id]
+
+        if pose_id < (len(path_borders_msg.poses)-1) and pose_id > 0:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(path_borders_msg.poses[pose_id],
+                                                                     path_borders_msg.poses[pose_id + 1])
+            prev_theta, prev_distance, prev_orientation = mapa.get_yaw_to_path_pose(path_borders_msg.poses[pose_id - 1],
+                                                                                    path_borders_msg.poses[pose_id])
+            print("theta: {} \t distance:{}".format(theta, distance))
+            theta_delta = abs(theta - prev_theta)
+            # if prev_theta == theta and prev_distance < 0.7:
+            current_pose.pose.orientation = orientation
+            if theta_delta < 0.2 and prev_distance < 1.0:
+                print("pose id: {} excluded".format(pose_id))
+            else:
+                repaired_poses.append(current_pose)
+        else:
+            repaired_poses.append(current_pose)
+            print("start-end")
+
+    for pose_id in range(len(repaired_poses)-1):
+        if pose_id < len(repaired_poses)-1:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id],
+                                                                     repaired_poses[pose_id + 1])
+
+        repaired_poses[pose_id].pose.orientation = orientation
+
+    print("Border path optimization 2")
+    repaired_poses2 = []
+    for pose_id in range(len(repaired_poses)):
+        current_pose = repaired_poses[pose_id]
+        if pose_id < len(repaired_poses)-1 and pose_id > 0:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id], repaired_poses[pose_id+1])
+            prev_theta, prev_distance, prev_orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id-1], repaired_poses[pose_id])
+            print("theta: {} \t distance:{}".format(theta, distance))
+            theta_delta = abs(theta - prev_theta)
+            # if prev_theta == theta and prev_distance < 0.7:
+            current_pose.pose.orientation = orientation
+            if theta_delta < 0.2 and prev_distance < 1.0:
+                print("pose id: {} excluded".format(pose_id))
+            elif theta_delta < 0.57 and prev_distance < 0.22: ## 0.57
+                print("pose id: {} excluded2".format(pose_id))
+            else:
+                repaired_poses2.append(current_pose)
+        else:
+            repaired_poses2.append(current_pose)
+
+    repaired_poses = repaired_poses2
+    for pose_id in range(len(repaired_poses)-1):
+        if pose_id < len(repaired_poses)-1:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id],
+                                                                     repaired_poses[pose_id + 1])
+
+        repaired_poses[pose_id].pose.orientation = orientation
+
+    print("Border path optimization 3")
+    repaired_poses2 = []
+    for pose_id in range(len(repaired_poses)):
+        current_pose = repaired_poses[pose_id]
+        if pose_id < len(repaired_poses) - 1 and pose_id > 0:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id],
+                                                                     repaired_poses[pose_id + 1])
+            prev_theta, prev_distance, prev_orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id - 1],
+                                                                                    repaired_poses[pose_id])
+            print("theta: {} \t distance:{}".format(theta, distance))
+            theta_delta = abs(theta - prev_theta)
+            # if prev_theta == theta and prev_distance < 0.7:
+            current_pose.pose.orientation = orientation
+            if theta_delta < 0.08 and (distance + prev_distance) < 12.0:
+                print("pose id: {} excluded".format(pose_id))
+            elif theta_delta < 0.30 and prev_distance < 0.5:  ## 0.57
+                print("pose id: {} excluded2".format(pose_id))
+            else:
+                repaired_poses2.append(current_pose)
+        else:
+            repaired_poses2.append(current_pose)
+
+    repaired_poses = repaired_poses2
+    for pose_id in range(len(repaired_poses)):
+        if pose_id < len(repaired_poses) - 1:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id],
+                                                                     repaired_poses[pose_id + 1])
+
+            repaired_poses[pose_id].pose.orientation = orientation
+
+
+    print("Border path optimization 4")
+    repaired_poses2 = []
+    for pose_id in range(len(repaired_poses)):
+        current_pose = repaired_poses[pose_id]
+        if pose_id < len(repaired_poses) - 1 and pose_id > 0:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id],
+                                                                     repaired_poses[pose_id + 1])
+            prev_theta, prev_distance, prev_orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id - 1],
+                                                                                    repaired_poses[pose_id])
+            print("theta: {} \t distance:{}".format(theta, distance))
+            theta_delta = abs(theta - prev_theta)
+            # if prev_theta == theta and prev_distance < 0.7:
+            current_pose.pose.orientation = orientation
+            # if theta_delta < 0.08 and (distance + prev_distance) < 12.0:
+            #     print("pose id: {} excluded".format(pose_id))
+            if theta_delta < 0.08 and (distance + prev_distance) < 12.0:
+                print("pose id: {} excluded".format(pose_id))
+            elif theta_delta < 0.8 and prev_distance < 0.3:  ## 0.57
+                print("pose id: {} excluded2".format(pose_id))
+            else:
+                repaired_poses2.append(current_pose)
+        else:
+            repaired_poses2.append(current_pose)
+    repaired_poses = repaired_poses2
+
+    print("Final pose orientation in path optimize")
+    repaired_poses2 = []
+    for pose_id in range(len(repaired_poses)):
+        if pose_id < len(repaired_poses) - 1:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id],
+                                                                     repaired_poses[pose_id + 1])
+            prev_theta, prev_distance, prev_orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id - 1],
+                                                                                    repaired_poses[pose_id])
+            c_pose = repaired_poses[pose_id]
+            # p_pose = repaired_poses[pose_id]
+            # p_pose.pose.orientation = prev_orientation
+            # repaired_poses2.append(p_pose)
+            c_pose.pose.orientation = orientation
+            repaired_poses2.append(c_pose)
+            # print("added")
+        else:
+            repaired_poses2.append(repaired_poses[pose_id])
+
+    repaired_poses = repaired_poses2
+
+    print("Border path optimization 5")
+    repaired_poses2 = []
+    for pose_id in range(len(repaired_poses)):
+        current_pose = repaired_poses[pose_id]
+        if pose_id < len(repaired_poses) - 1 and pose_id > 0:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id],
+                                                                     repaired_poses[pose_id + 1])
+            prev_theta, prev_distance, prev_orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id - 1],
+                                                                                    repaired_poses[pose_id])
+            print("theta: {} \t distance:{}".format(theta, distance))
+            theta_delta = abs(theta - prev_theta)
+            # if prev_theta == theta and prev_distance < 0.7:
+            current_pose.pose.orientation = orientation
+            # if theta_delta < 0.08 and (distance + prev_distance) < 12.0:
+            #     print("pose id: {} excluded".format(pose_id))
+            if theta_delta < 0.08 and (distance + prev_distance) < 12.0:
+                print("pose id: {} excluded".format(pose_id))
+            elif theta_delta < 0.8 and prev_distance < 0.3:  ## 0.57
+                print("pose id: {} excluded2".format(pose_id))
+            else:
+                repaired_poses2.append(current_pose)
+        else:
+            repaired_poses2.append(current_pose)
+    repaired_poses = repaired_poses2
+
+    print("Final pose orientation in path optimize")
+    repaired_poses2 = []
+    for pose_id in range(len(repaired_poses)):
+        if pose_id < len(repaired_poses) - 1:
+            theta, distance, orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id],
+                                                                     repaired_poses[pose_id + 1])
+            prev_theta, prev_distance, prev_orientation = mapa.get_yaw_to_path_pose(repaired_poses[pose_id - 1],
+                                                                                    repaired_poses[pose_id])
+            c_pose = repaired_poses[pose_id]
+            # p_pose = repaired_poses[pose_id]
+            # p_pose.pose.orientation = prev_orientation
+            # repaired_poses2.append(p_pose)
+            c_pose.pose.orientation = orientation
+            repaired_poses2.append(c_pose)
+            # print("added")
+        else:
+            repaired_poses2.append(repaired_poses[pose_id])
+
+    repaired_poses = repaired_poses2
+
+    waypoint_list_pub = rospy.Publisher('/waypoint_list', Path, queue_size=10, latch=True)
+    path_msg.header.frame_id = 'map'
+    path_msg.header.stamp = rospy.Time.now()
+    path_msg.poses = repaired_poses + path_Hinfill_msg.poses
+    # path_msg.poses = repaired_poses
+    waypoint_list_pub.publish(path_msg)
+                # print('path: {}/{}   point: {}/{} x:{} y:{} from_x:{} from_y:{} next_x:{} next_y:{}'.format(path_i+1,
+                #                                                     len(mapa.paths),
+                #                                                     point_i,
+                #                                                     len(mapa.paths[path_i].points),
+                #                                                     # float((float(mapa.paths[path_i].points[point_i].r) * mapa.resolution) + (mapa.origin_x)),
+                #                                                     # float((float(mapa.paths[path_i].points[point_i].c) * mapa.resolution) + (mapa.origin_y)),
+                #                                                     point.r,
+                #                                                     point.c,
+                #                                                     from_point.r,
+                #                                                     from_point.c,
+                #                                                     next_point.r,
+                #                                                     next_point.c,
+                #                                                     ))
+
+
+
+            # interval += 1
+            ### path: 0/6   point: 0/152   x:0.46320799365639687 y:-13.161693405359983
+            ### path: 0/6   point: 151/152 x:0.46320799365639687 y:-13.111693404614925
+
+            # state_id = state_id + 1
+
+        # for i, w in enumerate(waypoints):
+        #     StateMachine.add(w[0],
+        #                      Waypoint(w[1], w[2]),
+        #                      transitions={'success': waypoints[(i + 1) % len(waypoints)][0]})
+
+    # patrol.execute()
+
+    print("Save maps to .bmp files...")
+    mapa.draw_and_save_img(mapa.arr, "Map_base")
+    # mapa.draw_and_save_img(mapa.arr)
+    # mapa.draw_and_save_img(mapa.horizontal_infil_path_map, "Hor_infill")
+    # mapa.draw_and_save_img(mapa.vertical_infil_path_map)
+
+    # mapa.find_horizontal_paths()
+    mapa.draw_and_save_img(mapa.horizontal_infil_path_map, "Hor_infill")
+    # mapa.draw_arr(mapa.horizontal_infil_path_map)
+    mapa.draw_and_save_img(mapa.arr_mask, "Mask")
+
+
+
+    ##################################################################### pub map
+    # Set up the header.
+    mapa.map_msg.header.stamp = rospy.Time.now()
+    mapa.map_msg.header.frame_id = "map"
+
+    # .info is a nav_msgs/MapMetaData message.
+    # mapa.map_msg.info.resolution = self.resolution
+    # mapa.map_msg.info.width = self.width
+    # mapa.map_msg.info.height = self.height
+    mapa.map_msg.info = data.info
+    # Rotated maps are not supported... quaternion represents no
+    # rotation.
+    # mapa.map_msg.info.origin = Pose(Point(self.origin_x, self.origin_y, 0),
+    #                             Quaternion(0, 0, 0, 1))
+
+    # Flatten the numpy array into a list of integers from 0-100.
+    # This assumes that the grid entries are probalities in the
+    # range 0-1. This code will need to be modified if the grid
+    # entries are given a different interpretation (like
+    # log-odds).
+    arr1 = np.copy(mapa.arr_full_map)
+    arr1 = np.fliplr(arr1)
+    arr1 = np.rot90(arr1, 1)
+    # arr1 = np.rot90(arr1, 1)
+    # arr1 = np.rot90(arr1, 1)
+    # print(arr1.shape)
+
+    flat_grid = arr1.reshape((arr1.size,))
+    # mapa.map_msg.data = list(np.round(flat_grid))
+    for i in range(flat_grid.size):
+        # print(i)
+        if flat_grid[i] > 253:
+            flat_grid[i] = -1
+    mapa.map_msg.data = flat_grid.tolist()
+    # print(mapa.map_msg)
+
+    map_pub = rospy.Publisher('map_fill', OccupancyGrid, latch=True)
+    map_pub.publish(mapa.map_msg)
+    ##################################################################### pub map
+
+
+    mapa.map_out_msg.header.stamp = rospy.Time.now()
+    mapa.map_out_msg.header.frame_id = "map"
+
+    # .info is a nav_msgs/MapMetaData message.
+    # mapa.map_msg.info.resolution = self.resolution
+    # mapa.map_msg.info.width = self.width
+    # mapa.map_msg.info.height = self.height
+    mapa.map_out_msg.info = data.info
+
+    arr2 = mapa.horizontal_infil_path_map
+    # arr2 = mapa.arr
+    # arr2 = mapa.arr_mask
+    arr2 = np.fliplr(arr2)
+    arr2 = np.rot90(arr2, 1)
+    # arr1 = np.rot90(arr1, 1)
+    # arr1 = np.rot90(arr1, 1)
+    # print(arr1.shape)
+
+    flat_grid2 = arr2.reshape((arr2.size,))
+    # mapa.map_msg.data = list(np.round(flat_grid))
+    for i in range(flat_grid2.size):
+        # print(i)
+        if flat_grid2[i] > 100 and flat_grid2[i] <= 253:
+            flat_grid2[i] = 125
+        if flat_grid2[i] > 1 and flat_grid2[i] <= 99:
+            flat_grid2[i] = 125
+        if flat_grid2[i] > 253:
+            flat_grid2[i] = 100
+        if flat_grid2[i] == -1:
+            flat_grid2[i] = 90
+        if flat_grid2[i] == 0:
+            flat_grid2[i] = -1
+    mapa.map_out_msg.data = flat_grid2.tolist()
+    # print(mapa.map_msg)
+
+    map_out_pub = rospy.Publisher('map_out', OccupancyGrid, latch=True)
+    map_out_pub.publish(mapa.map_out_msg)
+
+    rospy.loginfo(rospy.get_caller_id() + " Paths are ready")
+
+
+mapa = Map()
+pos_arr = PoseArray()
+path_msg = Path()
+path_borders_msg = Path()
+path_Hinfill_msg = Path()
+
+
+def read_pgm(filename, byteorder='>'):
+    """Return image data from a raw PGM file as numpy array.
+    Format specification: http://netpbm.sourceforge.net/doc/pgm.html
+    """
+    with open(filename, 'rb') as f:
+        buffer_ = f.read()
+    try:
+        header, width, height, maxval = re.search(
+            b"(^P5\s(?:\s*#.*[\r\n])*"
+            b"(\d+)\s(?:\s*#.*[\r\n])*"
+            b"(\d+)\s(?:\s*#.*[\r\n])*"
+            b"(\d+)\s(?:\s*#.*[\r\n]\s)*)", buffer_).groups()
+    except AttributeError:
+        raise ValueError("Not a raw PGM file: '%s'" % filename)
+    return np.frombuffer(buffer_,
+                         dtype='u1' if int(maxval) < 256 else byteorder+'u2',
+                         count=int(width)*int(height),
+                         offset=len(header)
+                         ).reshape((int(height), int(width)))
+
+
+
+def map_test():
+    waypoint_pub = rospy.Publisher("waypointstack", PoseWithCovarianceStamped, queue_size=50)
+    poseArray_pub = rospy.Publisher('/waypointsarr', PoseArray, queue_size=1)
+    # global waypoint_list_pub
+    # waypoint_list_pub = rospy.Publisher('/waypoint_list', Path, queue_size=10, latch=True)
+    rospy.init_node('map_test', anonymous=True)
+    rospy.loginfo("Initialising map_test node...")
+    current_time = rospy.Time.now()
+    rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, callback)
+    rate = rospy.Rate(1)  # 1hz
+
+    while not rospy.is_shutdown():
+        time.sleep(5)
+        pos_arr.header.frame_id = 'map'
+        pos_arr.header.stamp = rospy.Time.now()
+        poseArray_pub.publish(pos_arr)
+        path_msg.header.frame_id = 'map'
+        path_msg.header.stamp = rospy.Time.now()
+        # waypoint_list_pub.publish(path_msg)
+
+
+        # spin() simply keeps python from exiting until this node is stopped
+        rospy.Rate(1)
+        # rate.sleep()
+        # rospy.spin()
+
+
+if __name__ == '__main__':
+    map_test()

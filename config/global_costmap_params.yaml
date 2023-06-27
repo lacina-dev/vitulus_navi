@@ -1,0 +1,26 @@
+global_costmap:
+#  global_frame: t265_odom_frame
+  global_frame: map
+  robot_base_frame: base_link
+#  robot_base_frame: t265_link
+#  robot_base_frame: t265_pose_frame
+  update_frequency: 10.0
+  publish_frequency: 10.0
+#  static_map: false
+  plugins:
+    - name: static_layer
+      type: "costmap_2d::StaticLayer"
+    - name: static_layer
+      type: "costmap_2d::InflationLayer"
+#
+
+
+#  plugins:
+#    - {name: static_layer, type: "costmap_2d::StaticLayer"}
+#  #  - {name: voxel_layer, type: "costmap_2d::NonPersistentVoxelLayer"}
+#  #  - {name: voxel_layer, type: "costmap_2d::VoxelLayer"}
+#  #  - {name: voxel_layer, type: "rtabmap_ros::VoxelLayer"}
+#  #  - {name: laser_layer,      type: "costmap_2d::VoxelLayer"}
+#  #  - {name: clear_layer,  type: "costmap_2d::ObstacleLayer"}
+#  #  - {name: rgbd_obstacle_layer, type: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"}
+#    - {name: static_layer,  type: "costmap_2d::InflationLayer"}

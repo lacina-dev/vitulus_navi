@@ -1,0 +1,43 @@
+<launch>
+    <!--    <include file="$(find vitulus_navi)/launch/vitulus_ekf_indoor.launch">-->
+<!--    </include>-->
+
+    <include file="$(find vitulus_navi)/launch/vitulus_ekf_indoor.launch">
+    </include>
+
+<!--    <include file="$(find vitulus_navi)/launch/navsat.launch">-->
+<!--    </include>-->
+
+
+    <include file="$(find vitulus_navi)/launch/pointcloud_to_laserscan.launch">
+        <!-- arg name="multi_robot_name" value="$(arg multi_robot_name)"/ -->
+    </include>
+
+<!--    <include file="$(find vitulus_slam)/launch/rtabmap.launch" pass_all_args="true">-->
+<!--    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" pass_all_args="true">-->
+
+    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" />
+<!--    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" pass_all_args="true" />-->
+
+<!--    <include file="$(find vitulus_slam)/launch/vitulus_rtabmap4wd.launch" pass_all_args="true">-->
+<!--    <include file="$(find vitulus_slam)/launch/rtabmap_t265.launch" pass_all_args="true">-->
+        <!-- arg name="multi_robot_name" value="$(arg multi_robot_name)"/ -->
+<!--    </include>-->
+
+    <include file="$(find vitulus_navi)/launch/obstacles.launch">
+        <!-- arg name="multi_robot_name" value="$(arg multi_robot_name)"/ -->
+    </include>
+
+
+<!--    MOVE BASE-->
+    <include file="$(find vitulus_navi)/launch/vitulus_navi.launch">
+    </include>
+
+
+
+<!--    Proxy for interactive marker usage on web gui-->
+    <node name="proxy" pkg="interactive_marker_proxy" type="proxy" args="topic_ns:=/interactive_marker target_frame:=/map"/>
+
+    <!-- node name="rviz" pkg="rviz" type="rviz" args=""/ -->
+
+</launch>

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>vitulus_navi</name>
+  <version>0.0.0</version>
+  <description>The vitulus_navi package</description>
+  <maintainer email="robert.lacina@gmail.com">Robert Lacina</maintainer>
+  <license>Apache 2.0</license>
+  <author email="robert.lacina@gmail.com">Robert Lacina</author>
+
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>roscpp</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+
+
+  <build_export_depend>roscpp</build_export_depend>
+  <build_export_depend>rospy</build_export_depend>
+  <build_export_depend>std_msgs</build_export_depend>
+  <exec_depend>roscpp</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>turtlebot3_msgs</exec_depend>
+    <exec_depend>move_base_flex</exec_depend>
+  <exec_depend>move_base</exec_depend>
+
+</package>

@@ -1,0 +1,204 @@
+#!/usr/bin/env python
+import rospy
+from std_msgs.msg import Int64
+from std_srvs.srv import SetBool
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
+import rospy
+from std_msgs.msg import String
+from std_msgs.msg import Float32
+from geometry_msgs.msg import Twist
+import roslaunch
+from geometry_msgs.msg import TransformStamped
+
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
+from tf2_ros import LookupException, ConnectivityException, Buffer, TransformListener, TransformBroadcaster, ExtrapolationException
+
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+
+
+class Republisher:
+    def __init__(self):
+        self.pub_gps = rospy.Publisher("/odometry/repub/gps", Odometry, queue_size=10)
+        self.pub_local_base = rospy.Publisher("/odometry/filtered/repub/local_base", Odometry, queue_size=10)
+        self.sub_odom = rospy.Subscriber("/odometry/gps", Odometry, self.callback_odom)
+        self.sub_odom_filtr_local = rospy.Subscriber("/odometry/filtered/local", Odometry, self.callback_odom_filtr_local)
+        self.sub_odom_filtr_local_base = rospy.Subscriber("/odometry/filtered/local_base", Odometry, self.callback_odom_filtr_local_base)
+        self.sub_imu = rospy.Subscriber("/gnss/navheading", Imu, self.callback_imu)
+        self.imu_msg = Imu()
+        self.odom_msg = Odometry()
+        self.tf_publisher = TransformBroadcaster()
+        # self.tf_publisher_map = TransformBroadcaster()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer)
+        self.init = False
+        self.init_count = 10
+        self.base_link_yaw_offset = 0
+
+
+    def callback_odom_filtr_local(self, msg):
+        pass
+        # self.make_transforms(msg)
+
+    def callback_odom_filtr_local_base(self, msg):
+        orientation_q = msg.pose.pose.orientation
+        orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+        q = quaternion_from_euler(roll, pitch, yaw - 1.5707963)  # yaw offset
+        msg.pose.pose.orientation.x = q[0]
+        msg.pose.pose.orientation.y = q[1]
+        msg.pose.pose.orientation.z = q[2]
+        msg.pose.pose.orientation.w = q[3]
+        self.pub_local_base.publish(msg)
+
+    def make_transforms(self, msg):
+        ####  odom -> base_link
+
+        if not self.init:
+            if self.init_count > 0:
+                self.init_count -= 1
+            else:
+                orientation_q = msg.pose.pose.orientation
+                orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+                (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+                # q = quaternion_from_euler(roll, pitch, yaw)  # yaw offset
+                self.base_link_yaw_offset = yaw
+                self.init = True
+
+
+        else:
+            static_transformStamped = TransformStamped()
+            # static_transformStamped.header.stamp = self.odom_msg.header.stamp
+            static_transformStamped.header.stamp = rospy.Time.now()
+            static_transformStamped.header.frame_id = 'odom'
+            static_transformStamped.child_frame_id = 'base_link'
+            static_transformStamped.transform.translation.x = msg.pose.pose.position.x
+            static_transformStamped.transform.translation.y = msg.pose.pose.position.y
+            static_transformStamped.transform.translation.z = msg.pose.pose.position.z
+            # static_transformStamped.transform.rotation.x = msg.pose.pose.orientation.x
+            # static_transformStamped.transform.rotation.y = msg.pose.pose.orientation.y
+            # static_transformStamped.transform.rotation.z = msg.pose.pose.orientation.z
+            # static_transformStamped.transform.rotation.w = msg.pose.pose.orientation.w
+            orientation_q = msg.pose.pose.orientation
+            orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+            (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+            q = quaternion_from_euler(roll, pitch, yaw - self.base_link_yaw_offset)  # yaw offset
+
+            static_transformStamped.transform.rotation.x = q[0]
+            static_transformStamped.transform.rotation.y = q[1]
+            static_transformStamped.transform.rotation.z = q[2]
+            static_transformStamped.transform.rotation.w = q[3]
+            self.tf_publisher.sendTransform(static_transformStamped)
+            # print("ddd")
+
+            ####  map -> odom
+            try:
+
+                trans = self.tf_buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+                trans = TransformStamped()
+                trans.transform.rotation.w = 1
+                # Translation: [493077.814, 5540711.941, 0.000]
+                # x: 493077.1198938032
+                # y: 5540712.342230735
+
+
+
+                trans.header.stamp = rospy.Time.now()
+                trans.header.frame_id = "map"
+                trans.child_frame_id = "odom"
+                # trans.transform.translation.x = trans.transform.translation.x - 493077.1198938032
+                # trans.transform.translation.y = trans.transform.translation.y - 5540712.342230735
+                print(trans.transform.translation)
+                self.tf_publisher.sendTransform(trans)
+                trans = self.tf_buffer.lookup_transform('utm', 'base_link', rospy.Time(0))
+                print(trans.transform)
+            except (LookupException, ConnectivityException, ExtrapolationException):
+                pass
+
+
+
+        # static_transformStamped = TransformStamped()
+        # # static_transformStamped.header.stamp = self.odom_msg.header.stamp
+        # static_transformStamped.header.stamp = rospy.Time.now()
+        # static_transformStamped.header.frame_id = 'odom'
+        # static_transformStamped.child_frame_id = 'base_link'
+        # static_transformStamped.transform.translation.x = msg.pose.pose.position.x
+        # static_transformStamped.transform.translation.y = msg.pose.pose.position.y
+        # static_transformStamped.transform.translation.z = msg.pose.pose.position.z
+        # static_transformStamped.transform.rotation.x = msg.pose.pose.orientation.x
+        # static_transformStamped.transform.rotation.y = msg.pose.pose.orientation.y
+        # static_transformStamped.transform.rotation.z = msg.pose.pose.orientation.z
+        # static_transformStamped.transform.rotation.w = msg.pose.pose.orientation.w
+        # self._tf_publisher_map.sendTransform(static_transformStamped)
+
+    def callback_odom(self, msg):
+        # print(msg)
+        # msg.header.frame_id = "odom"
+        msg.child_frame_id = "gnsslite"
+        msg.pose.pose.orientation = self.imu_msg.orientation
+        # print(self.imu_msg.orientation_covariance)
+        # print(self.imu_msg.orientation_covariance[8])
+        p_cov = msg.pose.covariance
+        new_cov = (
+            p_cov[0], p_cov[1], p_cov[2], p_cov[3], p_cov[4], p_cov[5],
+            p_cov[6], p_cov[7], p_cov[8], p_cov[9], p_cov[10], p_cov[11],
+            p_cov[12], p_cov[13], p_cov[14], p_cov[15], p_cov[16], p_cov[17],
+            p_cov[18], p_cov[19], p_cov[20], self.imu_msg.orientation_covariance[0], p_cov[22], p_cov[23],
+            p_cov[24], p_cov[25], p_cov[26], p_cov[27], self.imu_msg.orientation_covariance[4], p_cov[29],
+            p_cov[30], p_cov[31], p_cov[32], p_cov[33], p_cov[34], self.imu_msg.orientation_covariance[8],
+                   )
+        msg.pose.covariance = new_cov
+        # print(msg.pose.covariance)
+
+        orientation_q = msg.pose.pose.orientation
+        orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+        q = quaternion_from_euler(roll, pitch, yaw + 1.5707963) # yaw offset
+        msg.pose.pose.orientation.x = q[0]
+        msg.pose.pose.orientation.y = q[1]
+        msg.pose.pose.orientation.z = q[2]
+        msg.pose.pose.orientation.w = q[3]
+        self.odom_msg = msg
+        self.pub_gps.publish(msg)
+
+    def callback_imu(self, msg):
+        self.imu_msg = msg
+
+
+
+if __name__ == '__main__':
+    try:
+
+        ## Run republisher
+        rospy.init_node('odom_republisher')
+        rospy.loginfo("Initialising odom_republisher node...")
+        repub = Republisher()
+        rospy.spin()
+
+
+    except rospy.ROSInterruptException:
+       print("Odom republisher failed start!!!!")
+
+
+#
+# ^Cvitulus@vitulus-nuc:~/catkin_ws/src$ rosrun tf tf_echo map odom
+# At time 1662386920.304
+# - Translation: [0.000, 0.000, 0.000]
+# - Rotation: in Quaternion [0.000, 0.000, 0.000, 1.000]
+#             in RPY (radian) [0.000, -0.000, 0.000]
+#             in RPY (degree) [0.000, -0.000, 0.000]
+#
+# ^Cvitulus@vitulus-nuc:~/catkin_ws/src$ rosrun tf tf_echo odom utm
+# At time 0.000
+# - Translation: [-485917.331, -5541344.502, 0.000]
+# - Rotation: in Quaternion [0.000, 0.000, 0.001, 1.000]
+#             in RPY (radian) [0.000, -0.000, 0.001]
+#             in RPY (degree) [0.000, -0.000, 0.074]
+#
+# ^Cvitulus@vitulus-nuc:~/catkin_ws/src$ rosrun tf tf_echo utm odom
+# At time 0.000
+# - Translation: [493077.814, 5540711.941, 0.000]
+# - Rotation: in Quaternion [0.000, 0.000, -0.001, 1.000]
+#             in RPY (radian) [0.000, 0.000, -0.001]
+#             in RPY (degree) [0.000, 0.000, -0.074]

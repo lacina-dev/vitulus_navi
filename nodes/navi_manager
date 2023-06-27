@@ -1,0 +1,1095 @@
+#!/usr/bin/env python3
+
+import rospy
+import math
+from std_msgs.msg import String
+from visualization_msgs.msg import Marker
+from turtlebot3_msgs.msg import Sound
+from nav_msgs.msg import Odometry, Path
+import shutil
+from turtlebot3_msgs.msg import Sound
+from os import listdir
+from os.path import isfile, join, exists
+import roslaunch
+import uuid
+import os
+import sys, time
+import dynamic_reconfigure.client
+import yaml
+import pickle
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
+from tf.transformations import quaternion_from_euler
+from tf.transformations import euler_from_quaternion
+from tf import TransformListener
+from tf import listener
+from geometry_msgs.msg import TransformStamped
+
+from std_srvs.srv import EmptyRequest, Empty
+from dynamic_reconfigure.srv import Reconfigure, ReconfigureRequest, ReconfigureResponse
+from dynamic_reconfigure.msg import DoubleParameter, Config, IntParameter, BoolParameter
+
+from robot_localization.srv import SetPoseRequest, SetPose
+
+set_pose_srv = None
+# set_pose_srv = rospy.ServiceProxy('/set_pose_map', SetPose)
+
+# from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
+# from tf2_ros import LookupException, ConnectivityException, Buffer, TransformListener, TransformBroadcaster, ExtrapolationException
+import tf2_ros
+# from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+from mapdata import MapPoint, MapData, MapPath
+from interactive_markers.interactive_marker_server import *
+from visualization_msgs.msg import *
+# Brings in the SimpleActionClient
+import actionlib
+# Brings in the .action file and messages used by the move base action
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+import math
+
+
+
+
+server = None
+interactive_marker_pose = Pose
+save_map_msg = String()
+remove_map_msg = String()
+edit_map_msg = String()
+load_map_msg = String()
+new_map_msg = String()
+status_msg = String()
+string_msg = String()
+sound_msg = Sound()
+navi_launch = None
+odom_sub = None
+map_data = MapData("new")
+running_map_data = MapData("new")
+point_to_publish = ""
+path_to_publish = ""
+move_base_client_state = ""
+
+map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
+waypoint_list_pub = rospy.Publisher('navi_manager/waypoint_list', Path, queue_size=10)
+status_msg_pub = rospy.Publisher('navi_manager/status', String, queue_size=10)
+pub_sound = rospy.Publisher('/sound', Sound, queue_size=10)
+map_point_pub = rospy.Publisher('navi_manager/map_point', Marker, queue_size=10)
+map_point_list_pub = rospy.Publisher('navi_manager/map_point_list', String, queue_size=10)
+map_path_list_pub = rospy.Publisher('navi_manager/map_path_list', String, queue_size=10)
+map_path_pub = rospy.Publisher('navi_manager/map_path', Path, queue_size=10)
+map_path_goal_arr_pub = rospy.Publisher('move_base_client/goals_arr', Path, queue_size=10)
+oodometry_odom_pub = rospy.Publisher('odometry/odom', Odometry, queue_size=10)
+
+tf = None
+tf2_Buffer = None
+tf2_TransformListener = None
+tf2_StaticTransformBroadcaster = None
+tf2_TransformBroadcaster = None
+odom_local_msg = Odometry()
+odom_imu_msg = Odometry()
+odom_navsat_msg = Odometry()
+odom_gps_msg = Odometry()
+
+
+def interactiveMarkerFeedback(feedback):
+    global interactive_marker_pose
+    interactive_marker_pose = feedback.pose
+    print(interactive_marker_pose)
+
+
+def callback_new_interactive_marker(msg):
+    print(msg)
+
+    int_marker = InteractiveMarker()
+    int_marker.header.frame_id = "map"
+    int_marker.name = "webgui_marker"
+    int_marker.description = "Marker for webUI"
+
+    int_marker.pose.position = msg.position;
+    int_marker.pose.orientation.x = 0;
+    int_marker.pose.orientation.y = 0;
+    int_marker.pose.orientation.z = 0;
+    int_marker.pose.orientation.w = 1;
+
+    global interactive_marker_pose
+    interactive_marker_pose = int_marker.pose
+    print(interactive_marker_pose)
+
+    box_marker = Marker()
+    box_marker.type = Marker.ARROW
+    box_marker.scale.x = 0.6
+    box_marker.scale.y = 0.6
+    box_marker.scale.z = 0.6
+    box_marker.color.r = 0.05
+    box_marker.color.g = 1.0
+    box_marker.color.b = 0.0
+    box_marker.color.a = 0.8
+
+    box_control = InteractiveMarkerControl()
+    box_control.always_visible = True
+    box_control.markers.append(box_marker)
+    int_marker.controls.append(box_control)
+
+    rotate_control = InteractiveMarkerControl()
+    rotate_control.orientation.w = 1
+    rotate_control.orientation.x = 0
+    rotate_control.orientation.y = 1
+    rotate_control.orientation.z = 0
+    rotate_control.name = "rotate_z"
+    rotate_control.interaction_mode = InteractiveMarkerControl.ROTATE_AXIS
+    rotate_control.always_visible = False
+    int_marker.controls.append(rotate_control);
+    global server
+    server.insert(int_marker, interactiveMarkerFeedback)
+    server.applyChanges()
+
+def save_running_map_data(object):
+    with open('/home/vitulus/.ros/mapdata.pkl', 'wb') as output:
+        pickle.dump(object, output, pickle.HIGHEST_PROTOCOL)
+
+
+def load_running_map_data():
+    with open('/home/vitulus/.ros/mapdata.pkl', 'rb') as input:
+        global running_map_data
+        running_map_data = pickle.load(input)
+    set_map_utm_transform()
+
+
+def get_maplist():
+    mypath = "/home/vitulus/.vitulus/saves/maps/"
+    onlyfiles = ["{} ({:.2f} GB)".format(f, float(os.path.getsize(join(mypath, f)))/1000000000).replace(".db", "") for f in listdir(mypath) if isfile(join(mypath, f))]
+    onlyfilesStr = '---'.join(onlyfiles)
+    map_list_pub.publish(onlyfilesStr)
+    return onlyfiles
+
+
+def get_waypoints():
+    waypoints_names = [wp['name'] for wp in running_map_data['points']]
+    print('')
+    print('#############################')
+    print(waypoints_names)
+    for point in running_map_data['points']:
+        print(point)
+    waypoints_names_str = '---'.join(waypoints_names)
+    # waypoint_list_pub.publish(waypoints_names_str)
+    print('#############################')
+
+    msg = Path()
+    msg.header.frame_id = "map"
+    msg.header.stamp = rospy.Time.now()
+
+    for wp in running_map_data['points']:
+        print(wp)
+        pose = PoseStamped()
+        pose.pose = wp['pose']
+        # pose.pose.position.x = wp[0].transform.location.x
+        # pose.pose.position.y = -wp[0].transform.location.y
+        # pose.pose.position.z = wp[0].transform.location.z
+        #
+        # quaternion = tf.transformations.quaternion_from_euler(
+        #     0, 0, -math.radians(wp[0].transform.rotation.yaw))
+        # pose.pose.orientation.x = quaternion[0]
+        # pose.pose.orientation.y = quaternion[1]
+        # pose.pose.orientation.z = quaternion[2]
+        # pose.pose.orientation.w = quaternion[3]
+        msg.poses.append(pose)
+
+    waypoint_list_pub.publish(msg)
+    rospy.loginfo("Published {} waypoints.".format(len(msg.poses)))
+
+
+def start_navi_launch(args = []):
+    status_msg_pub.publish("Starting navi module...")
+    print(sys.argv)
+    sys.argv = [sys.argv[0]]
+    print(sys.argv)
+    for arg in args:
+        sys.argv.append(arg)
+    print(sys.argv)
+
+    # sys.argv.append("rtabmap_args:=--delete_db_on_start")
+    uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
+    roslaunch.configure_logging(uuid)
+    launch = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/launch_navi.launch"])
+    launch.start()
+
+    rospy.loginfo("Vitulus navi started.")
+    status_msg_pub.publish("Vitulus navi started.")
+    return launch
+
+
+def shutdown_navi_launch():
+    status_msg_pub.publish("Stopping navi module.")
+    navi_launch.shutdown()
+    rospy.loginfo("Vitulus navi stopped.")
+    status_msg_pub.publish("Vitulus navi stopped.")
+
+
+def callback_remove_map(msg):
+    global remove_map_msg
+    remove_map_msg = msg.data
+    if remove_map_msg != "":
+        if (exists("/home/vitulus/.vitulus/saves/maps/" + remove_map_msg + ".db")) :
+            os.remove("/home/vitulus/.vitulus/saves/maps/" + remove_map_msg + ".db")
+        if (exists("/home/vitulus/.vitulus/saves/maps_data/" + remove_map_msg + ".pkl")):
+            os.remove("/home/vitulus/.vitulus/saves/maps_data/" + remove_map_msg + ".pkl")
+
+        status_msg_pub.publish("Map " + remove_map_msg + " removed.")
+        rospy.loginfo("Map " + remove_map_msg + " removed.")
+    else:
+        status_msg_pub.publish("Map not removed. Empty name.")
+        rospy.logerr("Map not removed. Empty name.")
+    sound_msg.value = 4
+    pub_sound.publish(sound_msg)
+
+
+
+def callback_save_map(msg):
+    global save_map_msg
+    save_map_msg = msg.data
+    if save_map_msg != "":
+        save_map_utm_pose()
+        shutdown_navi_launch()
+        status_msg_pub.publish("Saving the map...")
+        if (exists("/home/vitulus/.ros/rtabmap.db") and exists("/home/vitulus/.ros/mapdata.pkl")) :
+            shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps/" + save_map_msg + ".db")
+            shutil.copyfile("/home/vitulus/.ros/mapdata.pkl", "/home/vitulus/.vitulus/saves/maps_data/" + save_map_msg + ".pkl")
+            status_msg_pub.publish("Map " + save_map_msg + " saved.")
+            rospy.loginfo("Map " + save_map_msg + " saved.")
+        else:
+            status_msg_pub.publish("There is no map to save.")
+            rospy.loginfo("There is no map to save.")
+        global navi_launch
+        navi_launch = start_navi_launch(["localization:=true"])
+    else:
+        status_msg_pub.publish("Map not saved. Empty name.")
+        rospy.logerr("Map not saved. Empty name.")
+    sound_msg.value = 4
+    pub_sound.publish(sound_msg)
+
+
+def callback_edit_map(msg):
+    global edit_map_msg
+    edit_map_msg = msg.data
+    global navi_launch
+
+    if edit_map_msg == "localize":
+        shutdown_navi_launch()
+        status_msg_pub.publish("Backuping current map...")
+        shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST.db")
+        shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST.pkl")
+        status_msg_pub.publish("Current map is in localization mode.")
+        rospy.loginfo("Current map is in localization mode.")
+        navi_launch = start_navi_launch(["localization:=true"])
+    else:
+        shutdown_navi_launch()
+        status_msg_pub.publish("Backuping current map...")
+        shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST.db")
+        shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST.pkl")
+        status_msg_pub.publish("Current map is in edit mode.")
+        rospy.loginfo("Current map is in edit mode.")
+        navi_launch = start_navi_launch(["localization:=false"])
+    sound_msg.value = 4
+    pub_sound.publish(sound_msg)
+
+
+def callback_load_map(msg, init=False):
+    global load_map_msg
+    load_map_msg = msg.data
+    if load_map_msg != "":
+        status_msg_pub.publish("Map {} will be loaded...".format(msg.data))
+        if not init:
+            shutdown_navi_launch()
+        status_msg_pub.publish("Loading the map...")
+        shutil.copyfile("/home/vitulus/.vitulus/saves/maps/" + load_map_msg + ".db", "/home/vitulus/.ros/rtabmap.db")
+        shutil.copyfile("/home/vitulus/.vitulus/saves/maps_data/" + load_map_msg + ".pkl", "/home/vitulus/.ros/mapdata.pkl")
+        status_msg_pub.publish("Map " + load_map_msg + " saved.")
+        rospy.loginfo("Map " + load_map_msg + " loaded.")
+        global navi_launch
+        navi_launch = start_navi_launch(["localization:=true"])
+        load_running_map_data()
+    else:
+        status_msg_pub.publish("Map not loaded. Empty name.")
+        rospy.logerr("Map not loaded. Empty name.")
+    sound_msg.value = 4
+    pub_sound.publish(sound_msg)
+
+
+def callback_new_map(msg):
+    global new_map_msg
+    new_map_msg = msg.data
+
+    if new_map_msg != "":
+        if new_map_msg != "INIT":
+            shutdown_navi_launch()
+        status_msg_pub.publish("Backuping current map...")
+        if (exists("/home/vitulus/.ros/rtabmap.db") and exists("/home/vitulus/.ros/mapdata.pkl")):
+            shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST.db")
+            shutil.copyfile("/home/vitulus/.ros/mapdata.pkl", "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST.pkl")
+            status_msg_pub.publish("There is nothing to backup.")
+            rospy.loginfo("There is nothing to backup.")
+        global navi_launch
+        navi_launch = start_navi_launch(["rtabmap_args:=--delete_db_on_start", "localization:=false"])
+        global running_map_data
+        running_map_data = map_data
+        save_running_map_data(running_map_data)
+        status_msg_pub.publish("New current map created.")
+        rospy.loginfo("New current map created.")
+    else:
+        status_msg_pub.publish("Empty name.")
+        rospy.logerr("Empty name.")
+    sound_msg.value = 4
+    pub_sound.publish(sound_msg)
+
+def set_odom_transform():
+
+    global odom_imu_msg
+    global odom_navsat_msg
+    global odom_gps_msg
+    static_transformStamped = TransformStamped()
+
+    static_transformStamped.header.stamp = rospy.Time.now()
+    static_transformStamped.header.frame_id = "odom"
+    static_transformStamped.child_frame_id = "base_link"
+
+    static_transformStamped.transform.rotation.w = 1
+
+    static_transformStamped.transform.translation.x = odom_gps_msg.pose.pose.position.x
+    static_transformStamped.transform.translation.y = odom_gps_msg.pose.pose.position.y
+    static_transformStamped.transform.translation.z = odom_gps_msg.pose.pose.position.z
+    static_transformStamped.transform.rotation.x = odom_imu_msg.pose.pose.orientation.x
+    static_transformStamped.transform.rotation.y = odom_imu_msg.pose.pose.orientation.y
+    static_transformStamped.transform.rotation.z = odom_imu_msg.pose.pose.orientation.z
+    static_transformStamped.transform.rotation.w = odom_imu_msg.pose.pose.orientation.w
+    tf2_TransformBroadcaster.sendTransform(static_transformStamped)
+    odom_msg = Odometry()
+    odom_msg.header.stamp = rospy.Time.now()
+    odom_msg.header.frame_id = "odom"
+    odom_msg.child_frame_id = "base_link"
+    odom_msg.pose.pose.position.x = static_transformStamped.transform.translation.x
+    odom_msg.pose.pose.position.y = static_transformStamped.transform.translation.y
+    odom_msg.pose.pose.position.z = static_transformStamped.transform.translation.z
+    odom_msg.pose.pose.orientation.x = static_transformStamped.transform.rotation.x
+    odom_msg.pose.pose.orientation.y = static_transformStamped.transform.rotation.y
+    odom_msg.pose.pose.orientation.z = static_transformStamped.transform.rotation.z
+    odom_msg.pose.pose.orientation.w = static_transformStamped.transform.rotation.w
+
+
+    oodometry_odom_pub.publish(odom_msg)
+
+
+def set_map_utm_transform():
+
+        # print("############################################################################################################################")
+        # print("############################################################################################################################")
+
+        global tf2_Buffer
+        available = False
+        while not available:
+            try:
+                # trans = tf2_Buffer.lookup_transform('utm', 'map', rospy.Time(0))
+                trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+                available = True
+            except:
+                available = False
+        m_x = 0
+        m_y = 0
+        if running_map_data.is_utm():
+            m_x = trans.transform.translation.x - running_map_data.utm_x
+            m_y = trans.transform.translation.y - running_map_data.utm_y
+            m_orientation_z = running_map_data.utm_orientation_z
+            m_orientation_w = running_map_data.utm_orientation_w
+        else:
+            m_orientation_z = 0
+            m_orientation_w = 1
+
+        # print("################ x #######################")
+        # print(m_x)
+        # print("################ y #######################")
+        # print(m_y)
+        # print("################ ori z #######################")
+        # print(m_orientation_z)
+        # print("################ ori w #######################")
+        # print(m_orientation_w)
+        # print("###################################################################################################################################")
+
+        static_transformStamped = TransformStamped()
+
+        static_transformStamped.header.stamp = rospy.Time.now()
+        static_transformStamped.header.frame_id = "map"
+        static_transformStamped.child_frame_id = "odom"
+
+        static_transformStamped.transform.translation.x = m_x
+        static_transformStamped.transform.translation.y = m_y
+
+
+        # static_transformStamped.transform.translation.z = float(sys.argv[4])
+
+        # quat = tf.transformations.quaternion_from_euler(
+        #     float(sys.argv[5]), float(sys.argv[6]), float(sys.argv[7]))
+        # static_transformStamped.transform.rotation.x = quat[0]
+        # static_transformStamped.transform.rotation.y = quat[1]
+        static_transformStamped.transform.rotation.z = m_orientation_z
+        static_transformStamped.transform.rotation.w = m_orientation_w
+
+        tf2_TransformBroadcaster.sendTransform(static_transformStamped)
+            # rospy.wait_for_service('/set_pose_map')
+            # try:
+            #     srv_msg = SetPoseRequest()
+            #
+            #     # pose = PoseWithCovarianceStamped()
+            #     srv_msg.pose.header.stamp = rospy.Time.now()
+            #     srv_msg.pose.header.frame_id = "base_link"
+            #
+            #     srv_msg.pose.pose.pose.position.x = m_x * 1
+            #     srv_msg.pose.pose.pose.position.y = m_y * 1
+            #     set_pose_srv(srv_msg)
+            #
+            #     # srv_msg.pose.pose.orientation = m_y
+            #     print("################ srv_msg #######################")
+            #     print(srv_msg)
+            #     print("#######################################")
+            #
+            #     # srvs = rospy.ServiceProxy('/set_pose', srv_msg)
+            #     # resp = srvs()
+            # except rospy.ServiceException as e:
+            #     print("Service call failed: %s" % e)
+
+
+def save_map_utm_pose():
+    if not running_map_data.is_utm():
+        global tf2_Buffer
+        trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+        running_map_data.utm_x = trans.transform.translation.x
+        running_map_data.utm_y = trans.transform.translation.y
+        running_map_data.utm_z = trans.transform.translation.z
+        running_map_data.utm_orientation_z = trans.transform.rotation.z
+        running_map_data.utm_orientation_w = trans.transform.rotation.w
+        # print("###########################################################################")
+        # print("###########################################################################")
+        # print("###########################################################################")
+        # print("###########################################################################")
+        # print(trans)
+        # print("###########################################################################")
+        # print("###########################################################################")
+        # print("###########################################################################")
+        # print("###########################################################################")
+        save_running_map_data(running_map_data)
+
+def callback_speed(msg):
+    if msg.data == "SLOW":
+        rospy.wait_for_service('/move_base/TebLocalPlannerROS/set_parameters')
+        srvs_request = ReconfigureRequest()
+        dbl_param = DoubleParameter(name = "max_vel_x", value = 0.25)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name = "max_vel_x_backwards", value = 0.25)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name = "max_vel_theta", value = 0.5)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name = "acc_lim_x", value = 0.25)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name = "acc_lim_theta", value = 0.5)
+        srvs_request.config.doubles.append(dbl_param)
+        try:
+            srvs = rospy.ServiceProxy('/move_base/TebLocalPlannerROS/set_parameters', Reconfigure)
+            # srsmsg = ReconfigureRequest()
+            resp = srvs(srvs_request)
+            print(resp)
+        except rospy.ServiceException as e:
+            print("Service call failed: %s" % e)
+
+    if msg.data == "MEDIUM":
+        rospy.wait_for_service('/move_base/TebLocalPlannerROS/set_parameters')
+        srvs_request = ReconfigureRequest()
+        dbl_param = DoubleParameter(name="max_vel_x", value=0.5)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name="max_vel_x_backwards", value=0.5)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name="max_vel_theta", value=1.0)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name="acc_lim_x", value=0.5)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name="acc_lim_theta", value=1.0)
+        srvs_request.config.doubles.append(dbl_param)
+        try:
+            srvs = rospy.ServiceProxy('/move_base/TebLocalPlannerROS/set_parameters', Reconfigure)
+            # srsmsg = ReconfigureRequest()
+            resp = srvs(srvs_request)
+            print(resp)
+        except rospy.ServiceException as e:
+            print("Service call failed: %s" % e)
+
+    if msg.data == "FAST":
+        rospy.wait_for_service('/move_base/TebLocalPlannerROS/set_parameters')
+        srvs_request = ReconfigureRequest()
+        dbl_param = DoubleParameter(name="max_vel_x", value=1.2)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name="max_vel_x_backwards", value=1.2)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name="max_vel_theta", value=1.5)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name="acc_lim_x", value=0.8)
+        srvs_request.config.doubles.append(dbl_param)
+        dbl_param = DoubleParameter(name="acc_lim_theta", value=1.5)
+        srvs_request.config.doubles.append(dbl_param)
+        try:
+            srvs = rospy.ServiceProxy('/move_base/TebLocalPlannerROS/set_parameters', Reconfigure)
+            # srsmsg = ReconfigureRequest()
+            resp = srvs(srvs_request)
+            print(resp)
+        except rospy.ServiceException as e:
+            print("Service call failed: %s" % e)
+
+def callback_dyn_reconfig(config):
+    rospy.loginfo("Config set to {max_vel_x}, {max_vel_x_backwards}, {max_vel_theta}, {acc_lim_x}, {acc_lim_theta}".format(**config))
+
+def rtd(value):
+    return '{:06.2f}'.format(float(value))
+
+def callback_odom(msg):
+    global odom_msg
+    odom_msg = msg
+    # print(odom_msg.pose)
+
+def getCurrentPose():
+    # print(tf.allFramesAsString())
+    # if tf.frameExists("t265_pose_frame") and tf.frameExists("map"):
+    tf_frames = ["/map", "/base_link"]
+    t = tf.getLatestCommonTime(*tf_frames)
+    position, orientation = tf.lookupTransform(*tf_frames, t)
+    pose = Pose(Point(*position), Quaternion(*(orientation)))
+    pose.orientation.x = 0
+    pose.orientation.y = 0
+    return pose, tf_frames[0].replace('/', '')
+
+def callback_save_waypoint(msg):
+    if msg.data != "":
+        pose, tf_frame = getCurrentPose()
+        point = MapPoint(msg.data, pose, tf_frame)
+        point_exist = running_map_data.get_map_point(msg.data)
+        if not point_exist:
+            running_map_data.add_map_point(point)
+            save_running_map_data(running_map_data)
+            status_msg_pub.publish("New point {} added.".format(msg.data))
+            rospy.loginfo("New point {} added.".format(msg.data))
+        else:
+            point_exist = point
+            save_running_map_data(running_map_data)
+            status_msg_pub.publish("{} point changed.".format(msg.data))
+            rospy.loginfo("{} point changed.".format(msg.data))
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.loginfo("The name is empty!")
+
+def publish_map_point(name):
+    point = running_map_data.get_map_point(name)
+    if point:
+        point.marker_message.header.stamp = rospy.Time.now()
+        map_point_pub.publish(point.marker_message)
+
+
+def publish_map_point_list():
+    map_point_list_pub.publish(running_map_data.get_map_point_list())
+
+
+def callback_publish_point(msg):
+    if msg.data != "":
+        global point_to_publish
+        point_to_publish = msg.data
+        status_msg_pub.publish("{} point is published".format(msg.data))
+        rospy.loginfo("{} point is published".format(msg.data))
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.loginfo("The name is empty!")
+
+
+def movebase_client(goal):
+    print(goal)
+    # Create an action client called "move_base" with action definition file "MoveBaseAction"
+    client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+
+    # Waits until the action server has started up and started listening for goals.
+    client.wait_for_server()
+    print(goal)
+
+    # # Creates a new goal with the MoveBaseGoal constructor
+    # goal = MoveBaseGoal()
+    # goal.target_pose.header.frame_id = "t265_pose_frame"
+    # goal.target_pose.header.stamp = rospy.Time.now()
+    # goal.target_pose.pose.position.x = 0.5
+    # goal.target_pose.pose.orientation.w = 1.0
+
+    # Sends the goal to the action server.
+    client.send_goal(goal)
+    # Waits for the server to finish performing the action.
+    wait = client.wait_for_result()
+    # If the result doesn't arrive, assume the Server is not available
+    if not wait:
+        rospy.logerr("Action server not available!")
+        rospy.signal_shutdown("Action server not available!")
+    else:
+        # Result of executing the action
+        return client.get_result()
+
+
+def callback_goal_point(msg):
+    status_msg_pub.publish("{} is new goal".format(msg.data))
+    rospy.loginfo("{} is new goal".format(msg.data))
+    if msg.data != "":
+        point = running_map_data.get_map_point(msg.data)
+        if point:
+            goal = MoveBaseGoal()
+            goal.target_pose.pose = point.pose
+            goal.target_pose.header.frame_id = point.marker_message.header.frame_id
+            goal.target_pose.header.stamp = rospy.Time.now()
+
+            status_msg_pub.publish("{} goal sending to move_base".format(msg.data))
+            rospy.loginfo("{} goal sending to move_base".format(msg.data))
+            result = movebase_client(goal)
+            if result:
+                status_msg_pub.publish("{} goal reached".format(msg.data))
+                rospy.loginfo("{} goal reached".format(msg.data))
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.loginfo("The name is empty!")
+
+
+def callback_save_path(msg):
+    if msg.data != "":
+        pose, tf_frame = getCurrentPose()
+        path = MapPath(msg.data, tf_frame)
+        path.add_pose(pose)
+        path_exist = running_map_data.get_map_path(msg.data)
+        if not path_exist:
+            running_map_data.add_map_path(path)
+            save_running_map_data(running_map_data)
+            status_msg_pub.publish("New path {} added with first waypoint.".format(msg.data))
+            rospy.loginfo("New path {} with first waypoint.".format(msg.data))
+        else:
+            path_exist = path
+            save_running_map_data(running_map_data)
+            status_msg_pub.publish("{} path changed.".format(msg.data))
+            rospy.loginfo("{} path changed.".format(msg.data))
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.loginfo("The name is empty!")
+
+
+def publish_map_path_list():
+    map_path_list_pub.publish(running_map_data.get_map_path_list())
+
+
+def callback_save_path_point(msg):
+    if msg.data != "":
+        pose, tf_frame = getCurrentPose()
+        path_exist = running_map_data.get_map_path(msg.data)
+        print(path_exist.message)
+        if path_exist:
+            running_map_data.add_map_path_point(path_exist.name, pose)
+            save_running_map_data(running_map_data)
+            status_msg_pub.publish("Current position added to {} path.".format(msg.data))
+            rospy.loginfo("Current position added to {} path.".format(msg.data))
+            print("####################################################")
+            print(running_map_data.get_map_path(msg.data).poses)
+        else:
+            status_msg_pub.publish("{} path not exist.".format(msg.data))
+            rospy.loginfo("{} path not exist.".format(msg.data))
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.loginfo("The name is empty!")
+
+
+def publish_map_path(name):
+    path = running_map_data.get_map_path(name)
+    if path:
+        # print('#############################################')
+        # print('#############################################')
+        # print('#############################################')
+        # print(path.message)
+        # print('#############################################')
+        path.message.header.stamp = rospy.Time.now()
+        map_path_pub.publish(path.message)
+
+
+def callback_publish_path(msg):
+    if msg.data != "":
+        global path_to_publish
+        path_to_publish = msg.data
+        status_msg_pub.publish("{} path is published".format(msg.data))
+        rospy.loginfo("{} path is published".format(msg.data))
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.logwarn("The name is empty!")
+
+
+def callback_move_base_client_state(msg):
+    if msg.data != "":
+        global move_base_client_state
+        move_base_client_state = msg.data
+        # print(msg.data)
+
+
+def callback_interactive_marker_goal(msg):
+    status_msg_pub.publish("Interactive marker is new goal")
+    rospy.loginfo("Interactive marker is new goal")
+    if msg.data != "":
+        global interactive_marker_pose
+        print(interactive_marker_pose.position)
+        point = Pose()
+        point.position = interactive_marker_pose.position
+        point.orientation = interactive_marker_pose.orientation
+        if point:
+            goal = MoveBaseGoal()
+            goal.target_pose.pose = point
+            goal.target_pose.header.frame_id = 'map'
+            goal.target_pose.header.stamp = rospy.Time.now()
+
+            status_msg_pub.publish("Interactive marker goal sending to move_base")
+            rospy.loginfo("Interactive marker goal sending to move_base")
+            result = movebase_client(goal)
+            if result:
+                status_msg_pub.publish("Interactive marker goal reached")
+                rospy.loginfo("Interactive marker goal reached")
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.loginfo("The name is empty!")
+
+
+
+def callback_execute_path(msg):
+    if msg.data != "":
+        print("PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATTTTTTTTTHHHHHHHHH")
+        print("PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATTTTTTTTTHHHHHHHHH")
+        print("PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATTTTTTTTTHHHHHHHHH")
+        print("PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATTTTTTTTTHHHHHHHHH")
+        global move_base_client_state
+        print(move_base_client_state)
+        if move_base_client_state == "READY":
+            path = running_map_data.get_map_path(msg.data)
+            print("path")
+            print(path)
+            if path:
+                # poseArr = PoseArray()
+                # poseArr.header.frame_id = path.tf_frame
+                # poseArr.header.stamp = rospy.Time.now()
+                # poseArr.poses = path.poses
+                # map_path_goal_arr_pub.publish(poseArr)
+                path_exe = Path()
+                path_exe.header.frame_id = path.tf_frame
+                path_exe.header.stamp = rospy.Time.now()
+                for pose in path.poses:
+                    pose_st = PoseStamped()
+                    pose_st.header.stamp = rospy.Time.now()
+                    pose_st.header.frame_id = path.tf_frame
+                    pose_st.pose = pose
+                    path_exe.poses.append(pose_st)
+                map_path_goal_arr_pub.publish(path_exe)
+
+                status_msg_pub.publish("{} path is sent to move base client".format(msg.data))
+                rospy.loginfo("{} path is sent to move base client".format(msg.data))
+            else:
+                status_msg_pub.publish("{} path does not exist".format(msg.data))
+                rospy.logwarn("{} path does not exist".format(msg.data))
+        else:
+            status_msg_pub.publish("Move base client executing another task. The {} can't be executed".format(msg.data))
+            rospy.logwarn("Move base client executing another task. The {} can't be executed".format(msg.data))
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.logwarn("The name is empty!")
+
+def next_path_pose(pose, add_x, add_y, add_theta):
+    print("############aktualni pose: ")
+    print(pose)
+
+    current_pose_map = PoseStamped()
+    current_pose_map.header.frame_id = 'map'
+    current_pose_map.pose = pose
+
+    euler = euler_from_quaternion([pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w])
+    print(euler)
+
+    hypotenuse = add_x
+    target_x = math.cos(euler[2]) * hypotenuse
+    print("x: {}".format(target_x))
+    target_y = math.sin(euler[2]) * hypotenuse
+    print("y: {}".format(target_y))
+
+    next_pose = Pose()
+    next_pose.position.x = pose.position.x + target_x
+    next_pose.position.y = pose.position.y + target_y
+    next_pose.position.z = pose.position.z
+
+    next_pose.orientation = geometry_msgs.msg.Quaternion(*quaternion_from_euler(0, 0, euler[2] + add_theta))
+
+
+    # print("z: {}  w: {}".format(next_pose.orientation.z, next_pose.orientation.w))
+    return next_pose
+
+
+
+def callback_create_mow_path(msg):
+    if msg.data != "":
+        # point = MapPoint(msg.data, pose, tf_frame)
+        # running_map_data.add_map_point(point)
+        # save_running_map_data(running_map_data)
+        point_exist = running_map_data.get_map_point(msg.data)
+        if not point_exist:
+            status_msg_pub.publish("Point {} does not exist.".format(msg.data))
+            rospy.loginfo("Point {} does not exist.".format(msg.data))
+        else:
+            path = MapPath(msg.data, 'map')
+            path.add_pose(point_exist.pose)
+            print(point_exist.pose)
+            pose = point_exist.pose
+            # euler = euler_from_quaternion([pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w])
+            # print("EULER :")
+            # print(euler)
+            # hypotenuse = 1
+            # target_x = math.cos(euler[2]) * hypotenuse
+            # print("x: {}".format(target_x))
+            # target_y = math.sin(euler[2]) * hypotenuse
+            # print("y: {}".format(target_y))
+            # path.add_pose(pose)  # pose, +x, +y ,+theta)
+            # print(next_path_pose(pose, 1, 0, 0))
+            # path.add_pose(next_path_pose(pose, 1, 0, 0))  #  pose, +x, +y ,+theta)
+
+            last_pose = next_path_pose(point_exist.pose, 0, 0, 0)  #  pose, +x, +y ,+theta
+
+
+            # path.add_pose(next_pose)
+
+            # next_pose = next_path_pose(next_pose, 1, 0, 0)  # pose, +x, +y ,+theta
+            # path.add_pose(next_pose)
+            width = 1.0
+            height = 4
+            h_step = 4
+            w_step = 0.25
+
+            ### Path around border
+
+            for half_square in range(0,2):
+                for fwd_step in range(0, int(height / h_step)):
+                    next_pose = next_path_pose(last_pose, h_step, 0, 0)  # pose, +x, +y ,+theta
+                    path.add_pose(next_pose)
+                    last_pose = next_pose
+
+                next_pose = next_path_pose(last_pose, 0, 0, -1.57)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+                for fwd_step in range(0, int(width / w_step)):
+                    next_pose = next_path_pose(last_pose, w_step, 0, 0)  # pose, +x, +y ,+theta
+                    path.add_pose(next_pose)
+                    last_pose = next_pose
+
+                next_pose = next_path_pose(last_pose, 0, 0, -1.57)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+            ### Infill path
+
+            for right_step in range(0, int(width/w_step/2)):
+                ## forward
+                for fwd_step in range(0, int(height/h_step)):
+                    next_pose = next_path_pose(last_pose, h_step, 0, 0)  # pose, +x, +y ,+theta
+                    path.add_pose(next_pose)
+                    last_pose = next_pose
+
+                next_pose = next_path_pose(last_pose, 0, 0, -1.57)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+                next_pose = next_path_pose(last_pose, w_step, 0, 0)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+                next_pose = next_path_pose(last_pose, 0, 0, -1.57)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+                ## back
+                for fwd_step in range(0, int(height/h_step)):
+                    next_pose = next_path_pose(last_pose, h_step, 0, 0)  # pose, +x, +y ,+theta
+                    path.add_pose(next_pose)
+                    last_pose = next_pose
+
+                next_pose = next_path_pose(last_pose, 0, 0, 1.57)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+                next_pose = next_path_pose(last_pose, w_step, 0, 0)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+                next_pose = next_path_pose(last_pose, 0, 0, 1.57)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+            ## forward
+            for fwd_step in range(0, int(height / h_step)):
+                next_pose = next_path_pose(last_pose, h_step, 0, 0)  # pose, +x, +y ,+theta
+                path.add_pose(next_pose)
+                last_pose = next_pose
+
+
+
+
+            path_exist = running_map_data.get_map_path(msg.data)
+            if not path_exist:
+                running_map_data.add_map_path(path)
+                save_running_map_data(running_map_data)
+                status_msg_pub.publish("New path {} added with first waypoint.".format(msg.data))
+                rospy.loginfo("New path {} with first waypoint.".format(msg.data))
+            else:
+                path_exist = path
+                save_running_map_data(running_map_data)
+                status_msg_pub.publish("{} path changed.".format(msg.data))
+                rospy.loginfo("{} path changed.".format(msg.data))
+            # print(running_map_data.get_map_path(msg.data).poses)
+
+    else:
+        status_msg_pub.publish("The name is empty!")
+        rospy.loginfo("The name is empty!")
+
+def callback_odom_filtered_imu(msg):
+    global odom_imu_msg
+    odom_imu_msg = msg
+
+def callback_odom_filtered_navsat(msg):
+    global odom_navsat_msg
+    odom_navsat_msg = msg
+
+def callback_odom_gps(msg):
+    global odom_gps_msg
+    odom_gps_msg = msg
+
+def callback_odom_filtered_map(msg):
+    global odom_local_msg
+    odom_local_msg = msg
+    # if running_map_data.is_utm():
+    #     global tf2_Buffer
+    #     available = False
+    #     while not available:
+    #         try:
+    #             # trans = tf2_Buffer.lookup_transform('utm', 'map', rospy.Time(0))
+    #             trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+    #             available = True
+    #         except:
+    #             available = False
+    #     m_x = trans.transform.translation.x - running_map_data.utm_x
+    #     m_y = trans.transform.translation.y - running_map_data.utm_y
+    #     # m_x = running_map_data.utm_x - trans.transform.translation.x
+    #     # m_y = running_map_data.utm_y - trans.transform.translation.y
+    #
+    #     print("########################################")
+    #     print("########################################")
+    #     print(trans)
+    #     print("################ x #######################")
+    #     print(running_map_data.utm_x)
+    #     print("################ y #######################")
+    #     print(running_map_data.utm_y)
+    #     print("#######################################")
+
+
+
+def navi_manager():
+    with open(r'/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/config/navi_manager.yaml') as file:
+        # The FullLoader parameter handles the conversion from YAML
+        # scalar values to Python the dictionary format
+        params = yaml.load(file, Loader=yaml.Loader)
+        print(params)
+
+    # map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
+    rospy.init_node('navi_manager', anonymous=True)
+
+
+    rospy.Subscriber("/navi_manager/new_interactive_marker", Pose, callback_new_interactive_marker)
+    global server
+    server = InteractiveMarkerServer("interactive_marker")
+
+
+    rospy.loginfo("Initialising navi_manager node...")
+    # rate = rospy.Rate(0.2)  # 1hz
+    rate = rospy.Rate(50)  # 1hz
+    rospy.loginfo("Node initialised.")
+    global tf
+    global tf2_Buffer
+    global tf2_TransformListener
+    global tf2_StaticTransformBroadcaster
+    global tf2_TransformBroadcaster
+    global set_pose_srv
+    tf2_Buffer = tf2_ros.Buffer()
+    tf2_TransformListener = tf2_ros.TransformListener(tf2_Buffer)
+    tf = TransformListener()
+    tf2_StaticTransformBroadcaster = tf2_ros.StaticTransformBroadcaster()
+    tf2_TransformBroadcaster = tf2_ros.TransformBroadcaster()
+    # set_pose_srv = rospy.ServiceProxy('/set_pose_map', SetPose)
+
+    rospy.Subscriber("/navi_manager/save_map", String, callback_save_map)
+    rospy.Subscriber("/navi_manager/remove_map", String, callback_remove_map)
+    rospy.Subscriber("/navi_manager/edit_map", String, callback_edit_map)
+    rospy.Subscriber("/navi_manager/load_map", String, callback_load_map)
+    rospy.Subscriber("/navi_manager/new_map", String, callback_new_map)
+    rospy.Subscriber("/navi_manager/speed", String, callback_speed)
+    rospy.Subscriber("/odometry/map", Odometry, callback_odom)
+    rospy.Subscriber("/navi_manager/save_waypoint", String, callback_save_waypoint)
+    rospy.Subscriber("/navi_manager/publish_point", String, callback_publish_point)
+    rospy.Subscriber("/navi_manager/goal_point", String, callback_goal_point)
+    rospy.Subscriber("/navi_manager/save_path", String, callback_save_path)
+    rospy.Subscriber("/navi_manager/save_path_point", String, callback_save_path_point)
+    rospy.Subscriber("/navi_manager/publish_path", String, callback_publish_path)
+    rospy.Subscriber("/move_base_client/state", String, callback_move_base_client_state)
+    rospy.Subscriber("/navi_manager/execute_path", String, callback_execute_path)
+    rospy.Subscriber("/navi_manager/create_mow_path", String, callback_create_mow_path)
+    rospy.Subscriber("/navi_manager/interactive_marker_goal", String, callback_interactive_marker_goal)
+    rospy.Subscriber("/odometry/filtered/navsat", Odometry, callback_odom_filtered_navsat)
+    rospy.Subscriber("/odometry/filtered/imu", Odometry, callback_odom_filtered_imu)
+    rospy.Subscriber("/odometry/gps", Odometry, callback_odom_gps)
+
+
+    global navi_launch
+    if params['load_map_on_start'] == '':
+        string_msg.data = "INIT"
+        callback_new_map(string_msg)
+        # shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/RtabmapMaps/BACKUP_LAST.db")
+        # rospy.loginfo("New map created on start.")
+        # navi_launch = start_navi_launch(["rtabmap_args:=--delete_db_on_start", "localization:=false"])
+    else:
+        string_msg.data = params['load_map_on_start']
+        callback_load_map(string_msg, init=True)
+        # shutil.copyfile("/home/vitulus/RtabmapMaps/" + params['load_map_on_start'] + ".db", "/home/vitulus/.ros/rtabmap.db")
+        # rospy.loginfo("Map " + params['load_map_on_start'] + " loaded.")
+        # navi_launch = start_navi_launch(["localization:=true"])
+
+    # global dyn_reconfig_client
+    # dyn_reconfig_client = dynamic_reconfigure.client.Client("/move_base/TebLocalPlannerROS", timeout=60, config_callback=callback_dyn_reconfig)
+    # dyn_reconfig_client = dynamic_reconfigure.client.Client("/move_base/TebLocalPlannerROS", timeout=30, config_callback=callback_dyn_reconfig)
+
+    # rospy.wait_for_service('/set_pose_map')
+    # set_map_utm_transform()
+
+
+
+
+
+
+
+    while not rospy.is_shutdown():
+        get_maplist()
+        # get_waypoints()
+        global point_to_publish
+        publish_map_point(point_to_publish)
+        publish_map_point_list()
+        publish_map_path_list()
+        publish_map_path(path_to_publish)
+        set_odom_transform()
+        set_map_utm_transform()
+
+        rate.sleep()
+
+
+if __name__ == '__main__':
+    try:
+
+        navi_manager()
+    except rospy.ROSInterruptException:
+        pass

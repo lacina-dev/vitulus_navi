@@ -1,0 +1,40 @@
+<launch>
+
+   <!-- Ekf -->
+    <!-- Ekf -->
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_base_local" clear_params="true">
+      <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base.yaml" />
+      <remap from="/odometry/filtered" to="/odometry/filtered/local_base" />
+        <remap from="/set_pose" to="/set_pose_odom"/>
+    </node>
+
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_base" clear_params="true" output="screen">
+<!--        <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base_outdoor.yaml" />-->
+        <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base_gnss.yaml" />
+        <remap from="/odometry/filtered" to="/odometry/filtered/local" />
+        <remap from="/set_pose" to="/set_pose_map"/>
+    </node>
+
+<!--    <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_imu.yaml" />-->
+    <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_bno_nav.yaml" />
+<!--    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_imu" clear_params="true" output="screen">-->
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_bno_nav" clear_params="true" output="screen">
+        <remap from="odometry/filtered" to="odometry/filtered/imu"/>
+        <remap from="accel/filtered" to="accel/filtered/imu"/>
+        <remap from="/set_pose" to="/set_pose_imu"/>
+    </node>
+
+    <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_navsat.yaml" />
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_navsat" clear_params="true" output="screen">
+        <remap from="odometry/filtered" to="odometry/filtered/navsat"/>
+        <remap from="/set_pose" to="/set_pose_navsat"/>
+    </node>
+
+<!--<node pkg="tf" type="static_transform_publisher" name="map_odom" args="0 0 0 0 0 0 /map /odom 100"/>-->
+
+    <!-- Run the map server with a blank map -->
+<!--  <node name="map_server" pkg="map_server" type="map_server" args="$(find vitulus_navi)/maps/blank_map.yaml" />-->
+
+
+
+</launch>

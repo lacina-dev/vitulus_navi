@@ -1,0 +1,232 @@
+local_costmap:
+#  global_frame: t265_odom_frame
+  global_frame: map
+#  robot_base_frame: t265_pose_frame
+  robot_base_frame: base_link
+  update_frequency: 10.0
+  publish_frequency: 10.0
+#  static_map: false
+  rolling_window: true
+  width: 4.0
+  height: 4.0
+  resolution: 0.02
+
+  #observation_sources: point_cloud_sensor point_cloud_sensor2 laser_scan_sensor
+  #observation_sources:  point_cloud_sensor2 point_cloud_sensor
+  #observation_sources: laser_scan_from_points laser_scan point_cloud_sensor2 point_cloud_sensor
+
+  #laser_scan_sensor: {sensor_frame: base_scan, data_type: LaserScan, topic: /scan, marking: true, clearing: true}
+
+  #point_cloud_sensor: {sensor_frame: camera_link, data_type: PointCloud2, topic: /voxel_grid/output_y, marking: true, clearing: true}
+  #point_cloud_sensor: {sensor_frame: camera_link, data_type: PointCloud2, topic: /rtabmap/local_grid_obstacle, marking: true, clearing: false}
+
+  rgbd_obstacle_layer:
+    enabled:               true
+    voxel_decay:           1     #seconds if linear, e^n if exponential
+    decay_model:           0      #0=linear, 1=exponential, -1=persistent
+    voxel_size:            0.05   #meters
+    track_unknown_space:   true   #default space is unknown
+    observation_persistence: 0.0  #seconds
+    max_obstacle_height:   2.0    #meters
+    unknown_threshold:     15     #voxel height
+    mark_threshold:        0      #voxel height
+    update_footprint_enabled: false
+    combination_method:    1      #1=max, 0=override
+    obstacle_range:        3.0    #meters
+    origin_z:              0.0    #meters
+    publish_voxel_map:     true   # default off
+    transform_tolerance:   0.2    # seconds
+    mapping_mode:          false  # default off, saves map not for navigation
+    map_save_duration:     60     #default 60s, how often to autosave
+    observation_sources:   rgbd1_clear rgbd1_mark
+    rgbd1_mark:
+      data_type: PointCloud2
+      topic: /obstacles_cloud
+      marking: true
+      clearing: false
+      min_obstacle_height: 0.00     #default 0, meters
+      max_obstacle_height: 0.5     #defaule 3, meters
+      expected_update_rate: 0.0    #default 0, if not updating at this rate at least, remove from buffer
+      observation_persistence: 0.0 #default 0, use all measurements taken during now-value, 0=latest
+      inf_is_valid: false          #default false, for laser scans
+      clear_after_reading: true    #default false, clear the buffer after the layer gets readings from it
+      filter: "voxel"              #default passthrough, apply "voxel", "passthrough", or no filter to sensor data, recommended to have at one filter on
+      voxel_min_points: 0          #default 0, minimum points per voxel for voxel filter
+    rgbd1_clear:
+      enabled: true                #default true, can be toggled on/off with associated service call
+      data_type: PointCloud2
+      topic: /obstacles_cloud
+      marking: false
+      clearing: true
+      min_z: 0.1                   #default 0, meters
+      max_z: 7.0                   #default 10, meters
+      vertical_fov_angle: 0.73      #default 0.7, radians
+      horizontal_fov_angle: 1.2   #default 1.04, radians
+      decay_acceleration: 1.       #default 0, 1/s^2. If laser scanner MUST be 0
+      model_type: 0                #default 0 (depth camera). Use 1 for 3D Lidar
+
+
+  voxel_layer:
+    enabled: true
+    origin_z: 0.0
+    z_resolution: 0.1
+    z_voxels: 10
+    publish_voxel_map: true
+    footprint_clearing_enabled: false
+    mark_treshold: 1
+    max_obstacle_height: 0.5
+
+
+    observation_sources:   point_cloud_sensor
+  #  observation_sources:   laser_scan_from_points point_cloud_sensor2 point_cloud_sensor point_cloud_sensor_clear
+
+    point_cloud_sensor: {sensor_frame: d435_link,
+                         data_type: PointCloud2,
+                         topic: /obstacles_cloud,
+    #                     topic: /rtabmap/local_grid_obstacle,
+                         marking: true,
+                         clearing: true,
+                         observation_persistence: 0.0,  # 1.5
+                         max_obstacle_height: 0.5,
+                         min_obstacle_height: 0.00,
+                         obstacle_range: 2.0,
+                         raytrace_range: 3.0,
+                         expected_update_rate: 0.1,
+                         track_unknown_space: true,
+                         inf_is_valid: true,
+    }
+
+    point_cloud_sensor_clear: { sensor_frame: d435_link,
+                          data_type: PointCloud2,
+                          topic: /obstacles_cloud,
+      #                     topic: /rtabmap/local_grid_obstacle,
+                          marking: false,
+                          clearing: true,
+                          observation_persistence: 0.0,  # 1.5
+                          max_obstacle_height: 3.5,
+                          min_obstacle_height: -2.00,
+                          obstacle_range: 0.0,
+                          raytrace_range: 3.0,
+                          expected_update_rate: 0.1,
+                          track_unknown_space: true,
+                          inf_is_valid: true,
+    }
+
+    point_cloud_sensor2: { sensor_frame: d435_link,
+                           data_type: PointCloud2,
+                           topic: /ground_cloud,
+      #                     topic: /voxel_grid/output_y,
+                           marking: false,
+                           clearing: true,
+                           observation_persistence: 0.0,
+                           max_obstacle_height: 1,
+                           min_obstacle_height: -1.5,
+                           obstacle_range: 0.0,
+                           raytrace_range: 3.0,
+                           expected_update_rate: 0.1,
+                           track_unknown_space: true,
+                           inf_is_valid: true,
+    }
+
+    laser_scan_from_points: { sensor_frame: d435_link,
+                              data_type: LaserScan,
+                              topic: /scan_from_points,
+                              marking: false,
+                              clearing: true,
+                              observation_persistence: 0.0,
+                              max_obstacle_height: 3.5,
+                              min_obstacle_height: -2.0,
+                              obstacle_range: 2.0,
+                              raytrace_range: 3.0,
+                              expected_update_rate: 0.2,
+                              track_unknown_space: false,
+                              inf_is_valid: true,
+    }
+  laser_layer:
+     enabled: true
+     observation_sources: laser_scan_clear laser_scan
+     track_unknown_space: true
+
+     laser_scan: {sensor_frame: base_scan,
+                         data_type: LaserScan,
+                         topic: /scan,
+                         marking: true,
+                         clearing: true,
+                         observation_persistence: 0.0,
+                         max_obstacle_height: 0.5,
+                         min_obstacle_height: 0.0,
+                         obstacle_range: 4.0,
+                         raytrace_range: 12.0,
+                         expected_update_rate: 0.2,
+                         track_unknown_space: true,
+                         inf_is_valid: true
+    }
+     laser_scan_clear: { sensor_frame: base_scan,
+                   data_type: LaserScan,
+                   topic: /scan,
+                   marking: false,
+                   clearing: true,
+                   observation_persistence: 0.0,
+                   max_obstacle_height: 0.5,
+                   min_obstacle_height: 0.0,
+                   obstacle_range: 4.0,
+                   raytrace_range: 12.0,
+                   expected_update_rate: 0.2,
+                   track_unknown_space: true,
+                   inf_is_valid: true
+     }
+
+  #clear_layer:
+  #   enabled: true
+  #   observation_sources: point_cloud_sensor2
+  #   track_unknown_space: true
+
+
+
+
+  #point_cloud_sensor2: {sensor_frame: camera_link, data_type: PointCloud2, topic: /voxel_grid/output_y, marking: false, clearing: true}
+
+  plugins:
+  #  - {name: static_layer, type: "costmap_2d::StaticLayer"}
+  #  - {name: voxel_layer, type: "costmap_2d::NonPersistentVoxelLayer"}
+  #  - {name: voxel_layer, type: "costmap_2d::VoxelLayer"}
+  #  - {name: voxel_layer, type: "rtabmap_ros::VoxelLayer"}
+    - {name: laser_layer,      type: "costmap_2d::NonPersistentVoxelLayer"}
+  #  - {name: clear_layer,  type: "costmap_2d::ObstacleLayer"}
+    - {name: rgbd_obstacle_layer, type: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"}
+    - {name: inflation_layer,  type: "costmap_2d::InflationLayer"}
+
+
+  #plugins:
+  #    - {name: above_layer, type: "costmap_2d::ObstacleLayer"}
+  ##    - {name: cliff_layer, type: "costmap_2d::ObstacleLayer"}
+  #
+  #
+  #above_layer:
+  #  enabled: true
+  #  observation_sources: pcloud
+  #  combination_method: 1
+  #  footprint_clearing_enabled: true
+  #
+  #  pcloud:
+  #    topic: /voxel_grid/output_y
+  #    sensor_frame: camera_link
+  #    data_type: PointCloud2
+  #    marking: true
+  #    clearing: true
+  #    min_obstacle_height: 0.1
+  #
+  #cliff_layer:
+  #  enabled: true
+  #  observation_sources: pcloud_cliff
+  #  combination_method: 1
+  #  footprint_clearing_enabled: true
+  #
+  #  pcloud_cliff:
+  #    topic: /voxel_grid/output_y
+  #    sensor_frame: camera_link
+  #    data_type: PointCloud2
+  #    marking: true
+  #    clearing: true
+  #    max_obstacle_height: -0.45
+  #    min_obstacle_height: -1.5

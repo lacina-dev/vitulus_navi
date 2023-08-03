@@ -139,8 +139,6 @@ class MapPoint:
         x = float((float(self.c) * self.resolution) + (self.origin_x))
         y = float((float(self.r) * self.resolution) + (self.origin_y))
         z = 0.0
-        # print(x)
-
         th = 0
         if self.direction == 'UP':
             th = th + 180
@@ -148,7 +146,6 @@ class MapPoint:
             th = th + 90
         if self.direction == 'LEFT':
             th = th + 270
-
         roll = 0
         pitch = 0
         yaw = (th) * (3.14 / 180)
@@ -163,36 +160,6 @@ class MapPoint:
         pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, self.theta_next).GetQuaternion()))
 
         return pose, pose_stamped, yaw
-
-    def get_path_pose(self):
-        pose = Pose()
-        x = float((float(self.r) * self.resolution) + (self.origin_x))
-        y = float((float(self.c) * self.resolution) + (self.origin_y))
-        z = 0.0
-        # print(x)
-
-        th = 0
-        if self.direction == 'UP':
-            th = th + 180
-        if self.direction == 'RIGHT':
-            th = th + 90
-        if self.direction == 'LEFT':
-            th = th + 270
-
-        roll = 0
-        pitch = 0
-        yaw = (th) * (3.14 / 180)
-        pose.position.x = x
-        pose.position.y = y
-        pose.position.z = z
-        pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
-        pose_stamped = PoseStamped()
-        pose_stamped.pose.position.x = x
-        pose_stamped.pose.position.y = y
-        pose_stamped.pose.position.z = z
-        pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
-
-        return pose, pose_stamped
 
 
 class MapPath:
@@ -243,46 +210,30 @@ class MapPathList:
         points = []
         zone = self.map_zone_list.get_zone(name='Zone')
         if zone is not None:
-            # print(zone.paths)
-            # poly = zone.paths[1].polygon
-            # print("Paths_len: {}".format(len(zone.paths_list.paths)))
             for path in zone.paths_list.paths:
-                # print("Path_type: {}".format(path.path_type))
                 if path.path_type in ['border', 'obstacle']:
-                    # line_start = Point32(path.polygon.exterior.coords[0][0], path.polygon.exterior.coords[0][1], 0)
-                    # print("Path_type in: {}".format(path.path_type))
-                    # print("TEST: {}".format(shapely.get_coordinates(path.polygon.exterior)))
-                    # points.append(shapely.get_coordinates(path.polygon.exterior))
                     line_start = None
                     for point in shapely.get_coordinates(path.polygon.exterior):
                         if line_start == None:
                             line_start = Point32(point[0], point[1], 0)
-                            # print("point_start: ", point)
                         else:
-                            # print("point: ", point)
                             points.append(line_start)
                             points.append(Point32(point[0], point[1], 0))
-                            # points.append([line_start, Point32(point[0], point[1], 0)])
                             line_start = Point32(point[0], point[1], 0)
 
-        # print(points)
         marker = Marker()
         marker.header.frame_id = "map"
         marker.header.stamp = rospy.Time.now()
         marker.ns = "my_namespace"
-        # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
         marker.type = Marker.LINE_LIST
         marker.id = 0
-        # Set the scale of the marker
         marker.scale.x = 0.02
         marker.scale.y = 0.02
         marker.scale.z = 0.02
-        # Set the color
         marker.color.r = 0.0
         marker.color.g = 1.0
         marker.color.b = 1.0
         marker.color.a = 1.0
-        # Set the pose of the marker
         marker.pose.position.x = 0
         marker.pose.position.y = 0
         marker.pose.position.z = 0
@@ -316,7 +267,7 @@ class MapPathList:
             if path.path_type == 'border':
                 print("border path polygon: {}".format(path.polygon))
 
-    def make_infill_line(self, angle, line_distance, margin=0.10):
+    def make_coverage_lines(self, angle, line_distance, margin=0.10):
 
         # get boundary of border polygon
         for path in self.paths:
@@ -370,12 +321,10 @@ class MapPathList:
 
         # cut lines to fit the polygon outer border
         multiline = shapely.ops.split(multiline, zone_path_poly_cut)
-        # print("multiline: {}".format(multiline))
 
         # remove lines out of the zone
         line_list = []
         for line in multiline.geoms:
-            # print("line: {}".format(line))
             if shapely.contains_properly(border_path_poly, line):
                 line_list.append(line)
         multiline = geometry.MultiLineString(line_list)
@@ -387,7 +336,6 @@ class MapPathList:
             for poly in obstacle_polygons_obj:
                 if shapely.intersects(poly.buffer(margin - 0.00001), line):
                     hit = True
-                    # print("hit")
             if not hit:
                 line_list.append(line)
         multiline = geometry.MultiLineString(line_list)
@@ -496,7 +444,6 @@ class MapPathList:
         result = False
         for multiline in multiline_list:
             for line in multiline.geoms:
-                # if shapely.intersects(geom, line):  # Other lines
                 if line.intersects(geom):  # Other lines
                     result = True
                     print("Line cross other line.")
@@ -516,7 +463,6 @@ class MapPathList:
                     self.marker_test(line=geom, polygon=polygon)
                     # time.sleep(2)
                     return result
-
         return result
 
     def is_crossing_check(self, geom, polygon_list, polygon):
@@ -534,41 +480,32 @@ class MapPathList:
             self.marker_test(line=geom, polygon=polygon)
             # time.sleep(2)
             return result
-
         return result
 
     def marker_test(self, multiline_list=None, line=None, polygon=None):
-        # marker_array = MarkerArray()
         if polygon is not None:
             points = []
             line_start = None
             for point in shapely.get_coordinates(polygon.exterior):
                 if line_start == None:
                     line_start = Point32(point[0], point[1], 0)
-                    # print("point_start: ", point)
                 else:
-                    # print("point: ", point)
                     points.append(line_start)
                     points.append(Point32(point[0], point[1], 0))
-                    # points.append([line_start, Point32(point[0], point[1], 0)])
                     line_start = Point32(point[0], point[1], 0)
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = rospy.Time.now()
             marker.ns = "polygon" + str(len(self.marker_array.markers))
-            # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
             marker.type = Marker.LINE_LIST
             marker.id = len(self.marker_array.markers)
-            # Set the scale of the marker
             marker.scale.x = 0.02
             marker.scale.y = 0.02
             marker.scale.z = 0.02
-            # Set the color
             marker.color.r = random.uniform(0.0, 1.0)
             marker.color.g = random.uniform(0.0, 1.0)
             marker.color.b = random.uniform(0.0, 1.0)
             marker.color.a = 1.0
-            # Set the pose of the marker
             marker.pose.position.x = 0
             marker.pose.position.y = 0
             marker.pose.position.z = 0
@@ -588,19 +525,15 @@ class MapPathList:
             marker.header.frame_id = "map"
             marker.header.stamp = rospy.Time.now()
             marker.ns = "line" + str(len(self.marker_array.markers))
-            # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
             marker.type = Marker.LINE_LIST
             marker.id = len(self.marker_array.markers) + 1000
-            # Set the scale of the marker
             marker.scale.x = 0.02
             marker.scale.y = 0.02
             marker.scale.z = 0.02
-            # Set the color
             marker.color.r = random.uniform(0.0, 1.0)
             marker.color.g = random.uniform(0.0, 1.0)
             marker.color.b = random.uniform(0.0, 1.0)
             marker.color.a = 1.0
-            # Set the pose of the marker
             marker.pose.position.x = 0
             marker.pose.position.y = 0
             marker.pose.position.z = 0
@@ -616,7 +549,6 @@ class MapPathList:
             for multiline in multiline_list:
                 points = []
                 for line in multiline.geoms:
-                    # print("line coords: {}".format(shapely.get_coordinates(line)))
                     coords = shapely.get_coordinates(line)
                     points.append(Point32(coords[0][0], coords[0][1], 0))
                     points.append(Point32(coords[1][0], coords[1][1], 0))
@@ -625,19 +557,15 @@ class MapPathList:
                 marker.header.frame_id = "map"
                 marker.header.stamp = rospy.Time.now()
                 marker.ns = "coverage_path" + str(len(self.marker_array.markers))
-                # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
                 marker.type = Marker.LINE_LIST
                 marker.id = len(self.marker_array.markers) + 10000
-                # Set the scale of the marker
                 marker.scale.x = 0.02
                 marker.scale.y = 0.02
                 marker.scale.z = 0.02
-                # Set the color
                 marker.color.r = random.uniform(0.0, 1.0)
                 marker.color.g = random.uniform(0.0, 1.0)
                 marker.color.b = random.uniform(0.0, 1.0)
                 marker.color.a = 1.0
-                # Set the pose of the marker
                 marker.pose.position.x = 0
                 marker.pose.position.y = 0
                 marker.pose.position.z = 0
@@ -656,7 +584,6 @@ class MapPathList:
         for multiline in multiline_list:
             points = []
             for line in multiline.geoms:
-                # print("line coords: {}".format(shapely.get_coordinates(line)))
                 coords = shapely.get_coordinates(line)
                 points.append(Point32(coords[0][0], coords[0][1], 0))
                 points.append(Point32(coords[1][0], coords[1][1], 0))
@@ -665,19 +592,15 @@ class MapPathList:
             marker.header.frame_id = "map"
             marker.header.stamp = rospy.Time.now()
             marker.ns = "coverage_path" + str(i)
-            # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
             marker.type = Marker.LINE_LIST
             marker.id = 0
-            # Set the scale of the marker
             marker.scale.x = 0.02
             marker.scale.y = 0.02
             marker.scale.z = 0.02
-            # Set the color
             marker.color.r = random.uniform(0.0, 1.0)
             marker.color.g = random.uniform(0.0, 1.0)
             marker.color.b = random.uniform(0.0, 1.0)
             marker.color.a = 1.0
-            # Set the pose of the marker
             marker.pose.position.x = 0
             marker.pose.position.y = 0
             marker.pose.position.z = 0
@@ -752,7 +675,6 @@ class MapPolygonList():
             self.polygons.append(poly)
         else:
             self.update_poly(poly)
-
 
     def update_poly(self, poly_msg):
         for i, poly in enumerate(self.polygons):
@@ -913,7 +835,6 @@ class MapZone:
 
 
     def remove_blind(self, arr, type, replace):
-        # self.log_publisher("Remove blind: " + str(type) + " replace: " + str(replace))
         num_of_type = 0
         for r in range(0, arr.shape[0]):
             c = 0
@@ -932,11 +853,8 @@ class MapZone:
     def border_line_to_path(self, start_point, path_id):
         self.log_publisher("Border line to path.".format())
         path = MapPath()
-        # path.type = map_l.border_path_map[start_point[0], start_point[1]]
         path.type = self.np_border[start_point[0], start_point[1]]
         path.id = path_id
-        # next_p_r = start_point[0]
-        # next_p_c = start_point[1]
         next_p_r = start_point[0]
         next_p_c = start_point[1]
         available_points = True
@@ -944,7 +862,6 @@ class MapZone:
         while available_points:
             point = MapPoint()
             point.id = id
-            # point.map = map_l
             point.resolution = self.resolution
             point.origin_x = self.origin_x
             point.origin_y = self.origin_y
@@ -1040,7 +957,7 @@ class MapZone:
                 if point.id == 0:
                     self.np_border[point.r, point.c] = 40
 
-        self.paths_list.make_infill_line(self.msg.coverage_angle, self.msg.paths_distance)
+        self.paths_list.make_coverage_lines(self.msg.coverage_angle, self.msg.paths_distance)
 
 class MapZoneList():
 
@@ -1189,13 +1106,11 @@ class MapLayerList:
     def assemble_map_light(self, map_free_poly_list, map_obstacles_poly_list):
         # free layer
         self.layer_assembled_light.np_layer = np.copy(self.layer_free.np_layer)
-
         # free poly layer
         self.layer_free_poly.reset_layer()
         for poly in map_free_poly_list:
             self.layer_free_poly.draw_fill_polygon(poly)
         self.draw_layer_to_assembled_light(self.layer_free_poly)
-
         # obstacles layer
         self.layer_obstacles_poly.reset_layer()
         for poly in map_obstacles_poly_list:
@@ -1203,11 +1118,9 @@ class MapLayerList:
         self.draw_layer_to_assembled_light(self.layer_obstacles_poly)
 
     def assemble_map(self, map_free_poly_list, map_obstacles_poly_list):
-
         # assemble light layer
         self.assemble_map_light(map_free_poly_list, map_obstacles_poly_list)
         self.layer_assembled.np_layer = np.copy(self.layer_assembled_light.np_layer)
-
         # inflation layer
         self.draw_layer_to_assembled(self.layer_increase_obstacles)
 
@@ -1249,10 +1162,10 @@ class MapEditor():
         self.np_polygons = None
         self.map_poly_list = MapPolygonList()
         self.map_zone_list = MapZoneList()
-        self.unusable = 100
-        self.border_path1 = 125
-        self.border_path2 = 124
-        self.border_path_infill = 50
+        # self.unusable = 100
+        # self.border_path1 = 125
+        # self.border_path2 = 124
+        # self.border_path_infill = 50
 
     def marker_arr_publisher(self):
         zone = self.map_zone_list.get_zone(name='Zone')
@@ -1264,7 +1177,6 @@ class MapEditor():
         zone = self.map_zone_list.get_zone(name='Zone')
         if zone is not None:
             for path in zone.paths_list.paths:
-                # print("Path_type: {}".format(path.path_type))
                 if path.path_type in ['border', 'obstacle']:
                     line_start = None
                     for point in shapely.get_coordinates(path.polygon.exterior):
@@ -1278,19 +1190,15 @@ class MapEditor():
         marker.header.frame_id = "map"
         marker.header.stamp = rospy.Time.now()
         marker.ns = "my_namespace"
-        # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
         marker.type = Marker.LINE_LIST
         marker.id = 0
-        # Set the scale of the marker
         marker.scale.x = 0.02
         marker.scale.y = 0.02
         marker.scale.z = 0.02
-        # Set the color
         marker.color.r = 0.0
         marker.color.g = 1.0
         marker.color.b = 1.0
         marker.color.a = 1.0
-        # Set the pose of the marker
         marker.pose.position.x = 0
         marker.pose.position.y = 0
         marker.pose.position.z = 0
@@ -1363,13 +1271,7 @@ class MapEditor():
         map_zone = MapZone(msg, self.map_layers.layer_assembled.np_layer, self.initial_map, self.log_pub_publisher)
         self.map_zone_list.add_zone(map_zone)
         self.map_zone_list_publisher()
-        # Assemble map
-        # self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
-        # self.np_show = self.map_layers.layer_assembled.np_layer
-        # Assemble map light
-        # self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = map_zone.np_border
-        
         self.log_pub_publisher("Zone {} saved.".format(msg.name))
 
     def callback_map_remove_poly(self, msg):
@@ -1384,13 +1286,10 @@ class MapEditor():
         map_poly = MapPolygon(msg, self.np_filled, self.initial_map)
         self.map_poly_list.add_poly(map_poly)
         self.map_poly_list_publisher()
-        # Assemble map
-        # self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
-        # self.np_show = self.map_layers.layer_assembled.np_layer
-        self.log_pub_publisher("Polygon {} saved.".format(msg.name))
         # Assemble map light
         self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled_light.np_layer
+        self.log_pub_publisher("Polygon {} saved.".format(msg.name))
 
     def callback_map_reload(self, msg):
         self.map_poly_list_publisher()
@@ -1406,8 +1305,6 @@ class MapEditor():
         x_origin = -1 * int(self.initial_map.info.origin.position.x / resolution)
         y_origin = -1 * int(self.initial_map.info.origin.position.y / resolution)
         print("x: {} y: {}".format(x_origin, y_origin))
-        # for point in msg.polygon.points:
-        #     print("x: {} y: {}".format(point.x, point.y))
         polygon = []
         for point in msg.polygon.points:
             x_point = int(point.x/resolution)
@@ -1452,7 +1349,6 @@ class MapEditor():
 
     def fill_unknown(self, arr):
         arr_result = np.zeros_like(arr)
-        # arr_result[-1:1, -1:1] = fill_val
         r = 0
         for row in arr:
             c = 0
@@ -1496,31 +1392,19 @@ class MapEditor():
         # Refresh inflation layer with new free layer
         self.map_layers.layer_increase_obstacles.np_map = self.map_layers.layer_free.np_layer
         self.reset_inflation_layer()
-
-        # Assemble map
-        # self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
-        # self.np_show = self.map_layers.layer_assembled.np_layer
-        self.log_pub_publisher("Fill free finished.")
         # Assemble map light
         self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled_light.np_layer
+        self.log_pub_publisher("Fill free finished.")
 
     def reset_inflation_layer(self):
         self.map_layers.layer_increase_obstacles.reset_layer()
-
         # draw obstacles from map and poly
         self.map_layers.layer_increase_obstacles.layer_from_color(self.map_layers.layer_free.np_layer, MapSpec.OBSTACLE)
-
         # draw free poly as unknown to to remove unwanted obstacles
         self.map_layers.layer_increase_obstacles.layer_from_color(self.map_layers.layer_free_poly.np_layer, MapSpec.FREE, MapSpec.UNKNOWN)
-        # for poly in self.map_poly_list.get_free_poly_np_list():
-        #     self.map_layers.layer_increase_obstacles.draw_fill_polygon_color(poly, MapSpec.UNKNOWN)
-
         # draw obstacles poly
         self.map_layers.layer_increase_obstacles.layer_from_color(self.map_layers.layer_obstacles_poly.np_layer, MapSpec.OBSTACLE)
-        # for poly in self.map_poly_list.get_obstacles_poly_np_list():
-        #     self.map_layers.layer_increase_obstacles.draw_fill_polygon_color(poly, MapSpec.OBSTACLE)
-
         # set actual map
         self.map_layers.layer_increase_obstacles.np_map = self.map_layers.layer_assembled_light.np_layer
 
@@ -1540,13 +1424,10 @@ class MapEditor():
         else:
             self.increase_obstacles_count = msg.data
         self.increase_obstacles()
-        self.log_pub_publisher("Draw obstacle margin finished.")
         # Assemble map
         self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled.np_layer
-        # Assemble map light
-        # self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
-        # self.np_show = self.map_layers.layer_assembled_light.np_layer
+        self.log_pub_publisher("Draw obstacle margin finished.")
 
     def callback_map(self, msg):
         self.initial_map = msg
@@ -1566,7 +1447,6 @@ class MapEditor():
         self.np_filled = arr
         self.np_obstacles = arr
         np.set_printoptions(threshold=sys.maxsize)
-        # print(self.np_show)
         self.map_layers.init_layers(arr)
 
 def map_test():

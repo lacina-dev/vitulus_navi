@@ -1,0 +1,1937 @@
+#!/usr/bin/env python
+import rospy
+import tf
+from tf import transformations
+import re
+import shapely
+from shapely import geometry
+from shapely import affinity
+from shapely import ops
+
+import random
+
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
+from std_msgs.msg import Int16, String, Bool
+from PIL import Image
+import PIL.ImageOps
+import numpy as np
+from scipy.ndimage import rotate
+import cv2
+from nav_msgs.msg import OccupancyGrid
+import time
+import PyKDL as kdl
+import sys
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+import actionlib
+from smach import State, StateMachine
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PolygonStamped, Polygon, Point32
+from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList
+from visualization_msgs.msg import Marker, MarkerArray
+import math
+
+# path_list = []
+# # dimensions im meters
+# robot_radius = 0.25  # 0.153 biggest robots dimension from footprint center
+# cover_radius = 0.15  # covered area by robot
+# obstacle_reserv = 0.1
+#
+# # map_legend
+# free = 0
+# unusable = 254
+# border_path1 = 125
+# border_path1_point = 100
+# border_path2 = 160
+# border_path2_point = 140
+# border_path_infill = 50
+# infill_path_horizontal = 180  # used for second border path too (for waypoints )
+# infill_path_vertical = 200  # used for second border path too (for waypoints )
+# infill_border_path_horizontal = 70  # horizontal and vertical for first border path (for waypoints )
+# infill_border_path_vertical = 90  # horizontal and vertical for first border path (for waypoints )
+# left_point = 40
+# right_point = 41
+# position_rc = [0, 0]
+
+
+class MapSpec:
+    ROBOT_RADIUS = 0.25
+    COVERAGE_DIAMETER = 0.25
+    OBSTACLE_RESERVE = 0.1
+    FILL_UNKNOWN_ITERATION = 5
+
+    UNKNOWN = -1
+    FREE = 0
+    OBSTACLE = 100
+    BORDER_PATH = 120
+    BORDER_PATH_POINT = 130
+    BORDER_PATH2 = 121
+    BORDER_PATH2_POINT = 131
+    BORDER_PATH3 = 122
+    BORDER_PATH3_POINT = 132
+    BORDER_PATH_INFILL = 50
+    COVERAGE_PATH = 190
+
+    LAYER_ORIGINAL = 0
+    LAYER_FREE = 1
+    LAYER_OBSTACLES = 2
+    LAYER_FREE_POLY = 3
+    LAYER_OBSTACLES_POLY = 4
+    LAYER_ASSEMBLED_LIGHT = 5
+    LAYER_INFLATION = 6
+    LAYER_ASSEMBLED = 7
+    LAYER_ZONE = 8
+    LAYER_BORDER_PATH = 9
+    LAYER_COVERAGE_PATH = 10
+
+
+class MapPoint:
+
+    def __init__(self):
+        self.id = 0
+        # self.map = Map()
+        self.resolution = 0
+        self.origin_x = 0
+        self.origin_y = 0
+        self.position_rc = [0, 0]
+
+        self.r = 0
+        self.c = 0
+        self.x = 0
+        self.y = 0
+        self.type = 0
+        self.conn_from = None
+        self.conn_next = None
+        self.theta_next = 0
+        self.neigh = {'up': -1, 'down': -1, 'left': -1, 'right': 0}
+        self.shape = "NN"  # NN, UL upper left corner, UR, DL, DR, VR vertical, HR horizontal
+        self.direction = 'NN'  # NN, UP, DOWN, RIGHT, LEFT
+
+    def set_x_y(self):
+        self.x = float((float(self.r) * self.resolution) + (self.origin_x))
+        self.y = float((float(self.c) * self.resolution) + (self.origin_y))
+
+    def set_yaw_to_next(self):
+        self.set_x_y()
+        self.conn_next.set_x_y()
+        self.conn_next.conn_next.set_x_y()
+        self.conn_next.conn_next.conn_next.set_x_y()
+        self.conn_next.conn_next.conn_next.conn_next.set_x_y()
+        x = self.conn_next.conn_next.conn_next.conn_next.x - self.x
+        y = self.conn_next.conn_next.conn_next.conn_next.y - self.y
+        # print("x: {} y: {}".format(x, y))
+        diagonal = math.sqrt(x ** 2 + y ** 2)
+        if y < 0:
+            if x >= 0:
+                self.theta_next = math.asin(y / diagonal)
+                pass
+            else:
+                # self.theta_next = math.asin(y / diagonal) + math.radians(-90)
+                self.theta_next = math.acos(x / diagonal) * -1
+                pass
+        else:
+            if x >= 0:
+                self.theta_next = math.asin(y / diagonal)
+                pass
+            else:
+                # self.theta_next = math.asin(y / diagonal) + math.radians(90)
+                self.theta_next = math.acos(x / diagonal)
+                pass
+        # print("theta: {} x: {} y: {}".format(self.theta_next, x, y))
+
+    def get_yaw_to_point(self, point):
+        self.set_x_y()
+        point.set_x_y()
+        x = point.x - self.x
+        y = point.y - self.y
+        # print("x: {} y: {}".format(x, y))
+        diagonal = math.sqrt(x ** 2 + y ** 2)
+        if y < 0:
+            if x >= 0:
+                theta_next = math.asin(y / diagonal)
+            else:
+                theta_next = math.asin(y / diagonal) + math.radians(-90)
+        else:
+            if x > 0:
+                theta_next = math.asin(y / diagonal)
+            else:
+                theta_next = math.acos(x / diagonal)
+        # print("From point {} to point {} theta: {} x: {} y: {}".format(self.id, point.id, self.theta_next, x, y))
+        return theta_next
+
+
+
+
+
+    def get_neighbours_types(self, map):
+        self.type = map[self.r, self.c]
+        self.neigh['up'] = map[self.r - 1, self.c]
+        self.neigh['down'] = map[self.r + 1, self.c]
+        self.neigh['left'] = map[self.r, self.c - 1]
+        self.neigh['right'] = map[self.r, self.c + 1]
+        # self.type = map[self.c, self.r]
+        # self.neigh['up'] = map[self.c - 1, self.r]
+        # self.neigh['down'] = map[self.c + 1, self.r]
+        # self.neigh['left'] = map[self.c, self.r - 1]
+        # self.neigh['right'] = map[self.c, self.r + 1]
+        if self.neigh['up'] in [self.type, 249] and self.neigh['down'] in [self.type, 249]:
+            self.shape = "VR"
+        if self.neigh['left'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+            self.shape = "HR"
+        if self.neigh['up'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+            self.shape = "DL"
+        if self.neigh['up'] in [self.type, 249] and self.neigh['left'] in [self.type, 249]:
+            self.shape = "DR"
+        if self.neigh['down'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+            self.shape = "UL"
+        if self.neigh['down'] in [self.type, 249] and self.neigh['left'] in [self.type, 249]:
+            self.shape = "UR"
+
+    def get_pose(self):
+        pose = Pose()
+        x = float((float(self.c) * self.resolution) + (self.origin_x))
+        y = float((float(self.r) * self.resolution) + (self.origin_y))
+        z = 0.0
+        # print(x)
+
+        th = 0
+        if self.direction == 'UP':
+            th = th + 180
+        if self.direction == 'RIGHT':
+            th = th + 90
+        if self.direction == 'LEFT':
+            th = th + 270
+
+        roll = 0
+        pitch = 0
+        yaw = (th) * (3.14 / 180)
+
+        pose.position.x = x
+        pose.position.y = y
+        pose.position.z = z
+        pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+        pose_stamped = PoseStamped()
+        pose_stamped.pose.position.x = x
+        pose_stamped.pose.position.y = y
+        pose_stamped.pose.position.z = z
+        pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, self.theta_next).GetQuaternion()))
+        # pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+        return pose, pose_stamped, yaw
+
+    def get_path_pose(self):
+        pose = Pose()
+        x = float((float(self.r) * self.resolution) + (self.origin_x))
+        y = float((float(self.c) * self.resolution) + (self.origin_y))
+        z = 0.0
+        # print(x)
+
+        th = 0
+        if self.direction == 'UP':
+            th = th + 180
+        if self.direction == 'RIGHT':
+            th = th + 90
+        if self.direction == 'LEFT':
+            th = th + 270
+
+        roll = 0
+        pitch = 0
+        yaw = (th) * (3.14 / 180)
+
+        pose.position.x = x
+        pose.position.y = y
+        pose.position.z = z
+        pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+        pose_stamped = PoseStamped()
+        pose_stamped.pose.position.x = x
+        pose_stamped.pose.position.y = y
+        pose_stamped.pose.position.z = z
+        pose_stamped.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+
+        return pose, pose_stamped
+
+
+class MapPath:
+
+    def __init__(self):
+        self.id = 0
+        self.type = 0
+        self.path_type = 'none'  # 'obstacle', 'coverage', 'border'
+        self.points = []
+        self.interval = 1
+        self.polygon = geometry.Polygon()
+        self.poly_coords = []
+        self.area = 0
+        self.centroid = []
+        self.path = Path()
+
+    def make_polygon_from_points(self, resolution, simplify_limit=0.10, preserve_topology=True):
+
+        self.poly_coords = []
+        for point in self.points:
+            pose, pose_stamped, yaw = point.get_pose()
+            self.poly_coords.append((pose.position.x + (resolution/2), pose.position.y + (resolution/2)))
+            # self.poly_coords.append(((point.r / resolution), (point.c / resolution)))
+        self.polygon = geometry.Polygon(self.poly_coords)
+        print("**********************************************")
+        print("path id: {}".format(self.id))
+        print("Points: {}".format(len(self.polygon.exterior.coords)))
+        print("Area: {}".format(self.polygon.area))
+        print("Simplification...")
+        self.polygon = self.polygon.simplify(simplify_limit, preserve_topology=preserve_topology)
+        print("Points: {}".format(len(self.polygon.exterior.coords)))
+        print("Area: {}".format(self.polygon.area))
+        self.area = self.polygon.area
+
+        self.path.header.frame_id = 'map'
+        self.path.header.stamp = rospy.Time.now()
+
+
+
+
+
+
+class MapPathList:
+
+    def __init__(self):
+        self.paths = []
+        self.multilines = []
+        self.last_path_id = 0
+        self.coverage_paths_marker_array = MarkerArray()
+        self.marker_arr_pub = rospy.Publisher("/marker_test", MarkerArray, queue_size=2)
+        self.marker_array = MarkerArray()
+
+    def marker_publisher(self):
+        points = []
+        zone = self.map_zone_list.get_zone(name='Zone')
+        if zone is not None:
+            # print(zone.paths)
+            # poly = zone.paths[1].polygon
+            # print("Paths_len: {}".format(len(zone.paths_list.paths)))
+            for path in zone.paths_list.paths:
+                # print("Path_type: {}".format(path.path_type))
+                if path.path_type in ['border', 'obstacle']:
+                    # line_start = Point32(path.polygon.exterior.coords[0][0], path.polygon.exterior.coords[0][1], 0)
+                    # print("Path_type in: {}".format(path.path_type))
+                    # print("TEST: {}".format(shapely.get_coordinates(path.polygon.exterior)))
+                    # points.append(shapely.get_coordinates(path.polygon.exterior))
+                    line_start = None
+                    for point in shapely.get_coordinates(path.polygon.exterior):
+                        if line_start == None:
+                            line_start = Point32(point[0], point[1], 0)
+                            # print("point_start: ", point)
+                        else:
+                            # print("point: ", point)
+                            points.append(line_start)
+                            points.append(Point32(point[0], point[1], 0))
+                            # points.append([line_start, Point32(point[0], point[1], 0)])
+                            line_start = Point32(point[0], point[1], 0)
+
+        # print(points)
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "my_namespace"
+        # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
+        marker.type = Marker.LINE_LIST
+        marker.id = 0
+        # Set the scale of the marker
+        marker.scale.x = 0.02
+        marker.scale.y = 0.02
+        marker.scale.z = 0.02
+        # Set the color
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+        # Set the pose of the marker
+        marker.pose.position.x = 0
+        marker.pose.position.y = 0
+        marker.pose.position.z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+        marker.points = points
+        self.marker_pub.publish(marker)
+
+    def set_path_type(self):
+
+        path_types = [MapSpec.BORDER_PATH, MapSpec.BORDER_PATH2, MapSpec.BORDER_PATH3]
+        for path_type_selected in path_types:
+            print(path_type_selected)
+            area = 0.0
+            brd_path = None
+            for path in self.paths:
+                if path.type == path_type_selected:
+                    path.path_type = 'obstacle'
+                    if path.area > area:
+                        area = path.area
+                        brd_path = path
+            print(brd_path)
+            if brd_path is not None:
+                brd_path.path_type = 'border'
+
+        # # Border 2
+        # area = 0
+        # brd_path = None
+        # for path in self.paths:
+        #     if path.type == MapSpec.BORDER_PATH2:
+        #         path.path_type = 'obstacle'
+        #         if path.area > area:
+        #             area = path.area
+        #             brd_path = path
+        # if brd_path is not None:
+        #     brd_path.path_type = 'border'
+        #
+        # # Border 3
+        # area = 0
+        # brd_path = None
+        # for path in self.paths:
+        #     if path.type == MapSpec.BORDER_PATH3:
+        #         path.path_type = 'obstacle'
+        #         if path.area > area:
+        #             area = path.area
+        #             brd_path = path
+        # if brd_path is not None:
+        #     brd_path.path_type = 'border'
+
+        print("Teeeeeeeeeeeddddd")
+        print("len: {}".format(len(self.paths)))
+        for path in self.paths:
+            print("id: {} type: {} path_type: {} area: {}".format(path.id, path.type, path.path_type, path.area))
+            if path.path_type == 'border':
+                print("border path polygon: {}".format(path.polygon))
+
+    def make_infill_line(self, angle, line_distance, margin=0.10):
+
+        # get boundary of border polygon
+        for path in self.paths:
+            if path.type == MapSpec.BORDER_PATH and path.path_type == 'border':
+                border_path_poly = path.polygon
+        print("border_path_poly: {}".format(border_path_poly))
+        bounds = border_path_poly.bounds
+        print("bounds: {}".format(bounds))
+        border_path_poly_cut = border_path_poly.buffer(-margin)
+
+        # get obstacle polygons
+        obstacle_polygons = []
+        obstacle_polygons_obj = []
+        obstacle_polygons_cut = []
+        for path in self.paths:
+            if path.type == MapSpec.BORDER_PATH and path.path_type == 'obstacle':
+                obstacle_polygons.append(path.polygon.exterior.coords)
+                obstacle_polygons_obj.append(path.polygon)
+                obst_poly_cut = path.polygon.buffer(margin)
+                obstacle_polygons_cut.append(obst_poly_cut.exterior.coords)
+        print("obstacle_polygons: {}".format(obstacle_polygons))
+
+        # polygon of zone borders with obstacles as holes
+        zone_path_poly = geometry.Polygon(border_path_poly.exterior.coords, obstacle_polygons)
+        zone_path_poly_cut = geometry.Polygon(border_path_poly_cut.exterior.coords, obstacle_polygons_cut)
+        print("zone_path_poly: {}".format(zone_path_poly))
+        max_length = 0.5 + shapely.distance(geometry.Point(bounds[0], bounds[1]), geometry.Point(bounds[2], bounds[3]))
+        print("max_length: {}".format(max_length))
+
+        # Create lines for coverage
+        length = max_length
+        line_distance = line_distance / 100  # cm to m
+        start = geometry.Point(bounds[0], bounds[1], 0.0)
+        end = geometry.Point(start.x + length, start.y, 0.0)
+        line_list = []
+        line_count = int(length / line_distance)
+        for i in range(0, line_count):
+            line = geometry.LineString([start, end])
+            line_list.append(line)
+            start = geometry.Point(start.x, start.y + line_distance, 0.0)
+            end = geometry.Point(end.x, end.y + line_distance, 0.0)
+        multiline = geometry.MultiLineString(line_list)
+        # print("multiline centroid: {}".format(multiline.centroid))
+        # print("border_path_poly centroid: {}".format(zone_path_poly.centroid))
+
+        # center with border polygon
+        move_x = zone_path_poly.centroid.x - multiline.centroid.x
+        move_y = zone_path_poly.centroid.y - multiline.centroid.y
+        # print("move_x: {} move_y: {}".format(move_x, move_y))
+        multiline = affinity.translate(multiline, xoff=move_x, yoff=move_y, zoff=0)
+        # print("multiline centroid: {}".format(multiline.centroid))
+        # print("border_path_poly centroid: {}".format(zone_path_poly.centroid))
+
+        # rotate lines
+        multiline = affinity.rotate(multiline, angle, origin="center", use_radians=False)
+
+        # cut lines to fit the polygon outer border
+        multiline = shapely.ops.split(multiline, zone_path_poly_cut)
+        # print("multiline: {}".format(multiline))
+
+        # remove lines out of the zone
+        line_list = []
+        for line in multiline.geoms:
+            # print("line: {}".format(line))
+            if shapely.contains_properly(border_path_poly, line):
+                line_list.append(line)
+        multiline = geometry.MultiLineString(line_list)
+
+        # Remove lines in obstacle polygons
+        line_list = []
+        for line in multiline.geoms:
+            hit = False
+            for poly in obstacle_polygons_obj:
+                if shapely.intersects(poly.buffer(margin - 0.00001), line):
+                    hit = True
+                    # print("hit")
+            if not hit:
+                line_list.append(line)
+        multiline = geometry.MultiLineString(line_list)
+
+        # Remove short lines
+        line_list = []
+        for line in multiline.geoms:
+            print("line: {}".format(line))
+            print("line.length: {}".format(line.length))
+            if line.length > 0.15:
+                line_list.append(line)
+        multiline = geometry.MultiLineString(line_list)
+
+        self.marker_array = MarkerArray()
+
+        # connect lines by nearest point of lines around /////////////////////////////////////////////////
+        line_list = []
+        for line in multiline.geoms:
+            line_list.append([[line.coords[0][0], line.coords[0][1]], [line.coords[1][0], line.coords[1][1]]])
+        np_lines = np.array(line_list)
+
+        line_list = []
+        x = bounds[0]
+        y = bounds[3]
+        point = geometry.Point(x, y)
+        i_all = 0
+        multilines = []
+        direction = True  # True: forward, False: backward
+        dir_last = None  # True: forward, False: backward
+        while True:
+            nearest_line = None
+            distance = 9999999
+            i = 0
+            i_line = 0
+            # Find the nearest line from point
+            for line in np_lines:
+                begin_point = geometry.Point([line[0][0], line[0][1]])
+                end_point = geometry.Point([line[1][0], line[1][1]])
+                if begin_point.distance(point) < distance:
+                    distance = begin_point.distance(point)
+                    nearest_line = line
+                    direction = True
+                    i_line = i
+                if end_point.distance(point) < distance:
+                    distance = end_point.distance(point)
+                    nearest_line = [line[1], line[0]]  # reverse line
+                    direction = False
+                    i_line = i
+                i = i + 1
+
+            print("*****************************************************")
+            if nearest_line is not None:  # if any nearest line available
+                conn_line = geometry.LineString([[point.x, point.y], [nearest_line[0][0], nearest_line[0][1]]])
+                print("conn_line length: {}".format(conn_line.length))
+                # is_cross = self.is_crossing_multiline(multilines, conn_line, obstacle_polygons_obj, border_path_poly)
+                is_cross = self.is_crossing_check(conn_line, obstacle_polygons_obj, border_path_poly)
+                print("is_cross: {}".format(is_cross))
+                # if 0.0 < conn_line.length and not is_cross and dir_last is not None and dir_last != direction:  # if the line is not crossing, connect
+                if not is_cross:  # if the line is not crossing, connect
+                    print("if the line is not crossing, connect")
+                    line_list.append(conn_line)
+                    line_list.append(geometry.LineString(nearest_line))
+                else:  # if the line is crossing, close cell
+                    print("if the line is crossing, close cell")
+                    multilines.append(geometry.MultiLineString(line_list))
+                    line_list = []
+                    line_list.append(geometry.LineString(nearest_line))
+
+                point = geometry.Point([nearest_line[1][0], nearest_line[1][1]])
+                np_lines = np.delete(np_lines, [i_line], 0)
+                dir_last = direction
+                i_all = i_all + 1
+
+            else:
+                break
+        multilines.append(geometry.MultiLineString(line_list))
+        self.multilines = multilines
+
+
+
+        # Create Marker msg for multilines
+        self.multiline_list_to_marker(multilines)
+
+        # Create path from coverage lines
+        path = MapPath()
+        path.type = MapSpec.COVERAGE_PATH
+        path.path_type = 'coverage'
+        path.id = self.last_path_id + 1
+        self.last_path_id = self.last_path_id + 1
+        path.path.header.frame_id = "map"
+        path.path.header.stamp = rospy.Time.now()
+
+        for multiline in multilines:
+            for line in multiline.geoms:
+                angle = self.direction(line.coords)
+                for point in line.coords:
+                    pose = PoseStamped()
+                    pose.header.frame_id = "map"
+                    pose.header.stamp = rospy.Time.now()
+                    pose.pose.position.x = point[0]
+                    pose.pose.position.y = point[1]
+                    pose.pose.position.z = 0.0
+                    pose.pose.orientation = Quaternion(*(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                    path.path.poses.append(pose)
+            self.paths.append(path)
+
+    def is_crossing_multiline(self, multiline_list, geom, polygon_list, polygon):
+        result = False
+        for multiline in multiline_list:
+            for line in multiline.geoms:
+                # if shapely.intersects(geom, line):  # Other lines
+                if line.intersects(geom):  # Other lines
+                    result = True
+                    print("Line cross other line.")
+                    self.marker_test(line=geom)
+                    self.marker_test(line=line)
+                    return result
+                for poly in polygon_list:
+                    if shapely.intersects(poly, geom):  # Obstacle polygons
+                        result = True
+                        print("Line cross obstacle polygon.")
+                        self.marker_test(line=geom)
+                        self.marker_test(polygon=poly)
+                        return result
+                if not polygon.contains(geom):  # Zone border polygon
+                    result = True
+                    print("Line cross border polygon.")
+                    self.marker_test(line=geom, polygon=polygon)
+                    # time.sleep(2)
+                    return result
+
+        return result
+
+    def is_crossing_check(self, geom, polygon_list, polygon):
+        result = False
+        for poly in polygon_list:
+            if shapely.intersects(poly, geom):  # Obstacle polygons
+                result = True
+                print("Line cross obstacle polygon.")
+                self.marker_test(line=geom)
+                self.marker_test(polygon=poly)
+                return result
+        if not polygon.contains(geom):  # Zone border polygon
+            result = True
+            print("Line cross border polygon.")
+            self.marker_test(line=geom, polygon=polygon)
+            # time.sleep(2)
+            return result
+
+        return result
+
+    def marker_test(self, multiline_list=None, line=None, polygon=None):
+        # marker_array = MarkerArray()
+        if polygon is not None:
+            points = []
+            line_start = None
+            for point in shapely.get_coordinates(polygon.exterior):
+                if line_start == None:
+                    line_start = Point32(point[0], point[1], 0)
+                    # print("point_start: ", point)
+                else:
+                    # print("point: ", point)
+                    points.append(line_start)
+                    points.append(Point32(point[0], point[1], 0))
+                    # points.append([line_start, Point32(point[0], point[1], 0)])
+                    line_start = Point32(point[0], point[1], 0)
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = "polygon" + str(len(self.marker_array.markers))
+            # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
+            marker.type = Marker.LINE_LIST
+            marker.id = len(self.marker_array.markers)
+            # Set the scale of the marker
+            marker.scale.x = 0.02
+            marker.scale.y = 0.02
+            marker.scale.z = 0.02
+            # Set the color
+            marker.color.r = random.uniform(0.0, 1.0)
+            marker.color.g = random.uniform(0.0, 1.0)
+            marker.color.b = random.uniform(0.0, 1.0)
+            marker.color.a = 1.0
+            # Set the pose of the marker
+            marker.pose.position.x = 0
+            marker.pose.position.y = 0
+            marker.pose.position.z = 0
+            marker.pose.orientation.x = 0.0
+            marker.pose.orientation.y = 0.0
+            marker.pose.orientation.z = 0.0
+            marker.pose.orientation.w = 1.0
+            marker.points = points
+            self.marker_array.markers.append(marker)
+
+        if line is not None:
+            points = []
+            coords = shapely.get_coordinates(line)
+            points.append(Point32(coords[0][0], coords[0][1], 0))
+            points.append(Point32(coords[1][0], coords[1][1], 0))
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = "line" + str(len(self.marker_array.markers))
+            # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
+            marker.type = Marker.LINE_LIST
+            marker.id = len(self.marker_array.markers) + 1000
+            # Set the scale of the marker
+            marker.scale.x = 0.02
+            marker.scale.y = 0.02
+            marker.scale.z = 0.02
+            # Set the color
+            marker.color.r = random.uniform(0.0, 1.0)
+            marker.color.g = random.uniform(0.0, 1.0)
+            marker.color.b = random.uniform(0.0, 1.0)
+            marker.color.a = 1.0
+            # Set the pose of the marker
+            marker.pose.position.x = 0
+            marker.pose.position.y = 0
+            marker.pose.position.z = 0
+            marker.pose.orientation.x = 0.0
+            marker.pose.orientation.y = 0.0
+            marker.pose.orientation.z = 0.0
+            marker.pose.orientation.w = 1.0
+            marker.points = points
+            self.marker_array.markers.append(marker)
+
+        if multiline_list is not None:
+            i = 0
+            for multiline in multiline_list:
+                points = []
+                for line in multiline.geoms:
+                    # print("line coords: {}".format(shapely.get_coordinates(line)))
+                    coords = shapely.get_coordinates(line)
+                    points.append(Point32(coords[0][0], coords[0][1], 0))
+                    points.append(Point32(coords[1][0], coords[1][1], 0))
+
+                marker = Marker()
+                marker.header.frame_id = "map"
+                marker.header.stamp = rospy.Time.now()
+                marker.ns = "coverage_path" + str(len(self.marker_array.markers))
+                # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
+                marker.type = Marker.LINE_LIST
+                marker.id = len(self.marker_array.markers) + 10000
+                # Set the scale of the marker
+                marker.scale.x = 0.02
+                marker.scale.y = 0.02
+                marker.scale.z = 0.02
+                # Set the color
+                marker.color.r = random.uniform(0.0, 1.0)
+                marker.color.g = random.uniform(0.0, 1.0)
+                marker.color.b = random.uniform(0.0, 1.0)
+                marker.color.a = 1.0
+                # Set the pose of the marker
+                marker.pose.position.x = 0
+                marker.pose.position.y = 0
+                marker.pose.position.z = 0
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+                marker.pose.orientation.w = 1.0
+                marker.points = points
+                self.marker_array.markers.append(marker)
+                i = i + 1
+        self.marker_arr_pub.publish(self.marker_array)
+
+    def multiline_list_to_marker(self, multiline_list):
+        marker_array = MarkerArray()
+        i = 0
+        for multiline in multiline_list:
+            points = []
+            for line in multiline.geoms:
+                # print("line coords: {}".format(shapely.get_coordinates(line)))
+                coords = shapely.get_coordinates(line)
+                points.append(Point32(coords[0][0], coords[0][1], 0))
+                points.append(Point32(coords[1][0], coords[1][1], 0))
+
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = "coverage_path" + str(i)
+            # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
+            marker.type = Marker.LINE_LIST
+            marker.id = 0
+            # Set the scale of the marker
+            marker.scale.x = 0.02
+            marker.scale.y = 0.02
+            marker.scale.z = 0.02
+            # Set the color
+            marker.color.r = random.uniform(0.0, 1.0)
+            marker.color.g = random.uniform(0.0, 1.0)
+            marker.color.b = random.uniform(0.0, 1.0)
+            marker.color.a = 1.0
+            # Set the pose of the marker
+            marker.pose.position.x = 0
+            marker.pose.position.y = 0
+            marker.pose.position.z = 0
+            marker.pose.orientation.x = 0.0
+            marker.pose.orientation.y = 0.0
+            marker.pose.orientation.z = 0.0
+            marker.pose.orientation.w = 1.0
+            marker.points = points
+            marker_array.markers.append(marker)
+            i = i + 1
+        self.coverage_paths_marker_array = marker_array
+
+    def direction(self, line):
+        # point_2.x - point_1.x, point_2.y - point_1.y)
+        x = line[1][0] - line[0][0]
+        y = line[1][1] - line[0][1]
+        diagonal = math.sqrt(x ** 2 + y ** 2)
+        if y < 0:
+            if x >= 0:
+                angle = math.asin(y / diagonal)
+            else:
+                angle = math.acos(x / diagonal) * -1
+        else:
+            if x >= 0:
+                angle = math.asin(y / diagonal)
+            else:
+                angle = math.acos(x / diagonal)
+        return angle
+
+
+class Waypoint(State):
+    def __init__(self, wpoint):
+
+        State.__init__(self, outcomes=['success'])
+
+        # Get an action client
+        self.client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+        self.client.wait_for_server()
+
+        # Define the goal
+        self.goal = MoveBaseGoal()
+        self.goal.target_pose.header.frame_id = 'map'
+        self.goal.target_pose.pose = wpoint.get_pose()
+        # self.goal.target_pose.pose.position.x = x
+        # self.goal.target_pose.pose.position.y = y
+        # self.goal.target_pose.pose.position.z = z
+        # self.goal.target_pose.pose.orientation = Quaternion(*(kdl.Rotation.RPY(roll, pitch, yaw).GetQuaternion()))
+
+    def execute(self, userdata):
+        self.client.send_goal(self.goal)
+        self.client.wait_for_result()
+        aaaaa = self.client.get_result()
+        # print('ddddddddd')
+        # print(aaaaa)
+        return 'success'
+
+
+
+
+
+class MapPolygon():
+    def __init__(self, msg_poly, np_map, msg_map):
+
+        self.msg = msg_poly
+        self.np_map = np.copy(np_map)
+        self.np_poly = np.zeros_like(self.np_map, dtype=np.int8)
+        self.np_poly.fill(100)
+        self.resolution = msg_map.info.resolution
+        self.x_origin = -1 * int(msg_map.info.origin.position.x / self.resolution)
+        self.y_origin = -1 * int(msg_map.info.origin.position.y / self.resolution)
+        self.np_polygon = []
+        self.get_map_layer()
+
+    def polygon_to_np(self):
+        polygon = []
+        for point in self.msg.polygon.polygon.points:
+            x_point = int(point.x / self.resolution)
+            y_point = int(point.y / self.resolution)
+            # print("x: {} y: {}".format(self.x_origin + x_point, self.y_origin + y_point))
+            # self.np_zone[self.y_origin + y_point, self.x_origin + x_point] = 0
+            polygon.append([self.x_origin + x_point, self.y_origin + y_point])
+        self.np_polygon = np.array(polygon)
+
+    def draw_polygon(self):
+        self.polygon_to_np()
+        cv2.fillPoly(self.np_poly, pts=[self.np_polygon], color=0)
+
+    def get_map_layer(self):
+        self.draw_polygon()
+        r = 0
+        for row in self.np_map:
+            c = 0
+            for col in row:
+                if self.np_poly[r, c] == 100:
+                    self.np_map[r, c] = 100
+                c += 1
+            r += 1
+
+
+class MapPolygonList():
+    def __init__(self):
+        self.polygons = []
+
+    def add_poly(self, poly):
+        if self.get_poly(poly.msg.name) is None:
+            self.polygons.append(poly)
+        else:
+            self.update_poly(poly)
+
+
+    def update_poly(self, poly_msg):
+        for i, poly in enumerate(self.polygons):
+            if poly.msg.name == poly_msg.msg.name:
+                self.polygons[i] = poly_msg
+                return True
+        return False
+
+    def get_poly(self, name):
+        for poly in self.polygons:
+            if poly.msg.name == name:
+                return poly
+        return None
+
+    def remove_poly(self, name):
+        for poly in self.polygons:
+            if poly.msg.name == name:
+                self.polygons.remove(poly)
+                return True
+        return False
+
+    def get_poly_list_msg(self):
+        msg = MapEditPolygonList()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        msg.polygon_list = []
+        for poly in self.polygons:
+            msg.polygon_list.append(poly.msg)
+        return msg
+
+    def get_free_poly_np_list(self):
+        polygons = []
+        for poly in self.polygons:
+            if poly.msg.type == "free":
+                polygons.append(poly.np_polygon)
+        return polygons
+
+    def get_obstacles_poly_np_list(self):
+        polygons = []
+        for poly in self.polygons:
+            if poly.msg.type == "obstacle":
+                polygons.append(poly.np_polygon)
+        return polygons
+
+    def get_zone_poly_np_list(self):
+        polygons = []
+        for poly in self.polygons:
+            if poly.msg.type == "zone":
+                polygons.append(poly.np_polygon)
+        return polygons
+
+
+class MapZone:
+
+    def __init__(self, msg_zone, np_map, msg_map, log_publisher):
+        self.log_publisher = log_publisher
+        self.msg = msg_zone
+        self.np_map = np.copy(np_map)
+        self.np_poly = np.zeros_like(self.np_map, dtype=np.int8)
+        self.np_poly.fill(MapSpec.UNKNOWN)
+        self.np_zone = np.zeros_like(self.np_map, dtype=np.int8)
+        self.np_zone.fill(MapSpec.UNKNOWN)
+        self.np_border = np.zeros_like(self.np_map, dtype=np.int8)
+        self.np_border.fill(MapSpec.UNKNOWN)
+        self.np_coverage = np.zeros_like(self.np_map, dtype=np.int8)
+        self.np_coverage.fill(MapSpec.UNKNOWN)
+        self.resolution = msg_map.info.resolution
+        self.origin_x = msg_map.info.origin.position.x
+        self.origin_y = msg_map.info.origin.position.y
+        self.position_rc = [msg_map.info.width / 2, msg_map.info.height / 2]
+        self.x_origin = -1 * int(msg_map.info.origin.position.x / self.resolution)
+        self.y_origin = -1 * int(msg_map.info.origin.position.y / self.resolution)
+        self.np_polygon = []
+        self.get_map_layer()
+        self.compute_area()
+        self.draw_border_paths()
+        self.draw_coverage_path()
+        self.paths_list = MapPathList()
+        self.get_paths()
+
+    def polygon_to_np(self):
+        polygon = []
+        for point in self.msg.polygon.polygon.points:
+            x_point = int(point.x / self.resolution)
+            y_point = int(point.y / self.resolution)
+            # print("x: {} y: {}".format(self.x_origin + x_point, self.y_origin + y_point))
+            # self.np_zone[self.y_origin + y_point, self.x_origin + x_point] = 0
+            polygon.append([self.x_origin + x_point, self.y_origin + y_point])
+        self.np_polygon = np.array(polygon)
+
+    def draw_poly(self):
+        self.polygon_to_np()
+        cv2.fillPoly(self.np_poly, pts=[self.np_polygon], color=MapSpec.FREE)
+
+    def compute_area(self):
+        self.msg.area = int(np.count_nonzero(self.np_zone == MapSpec.FREE) * self.resolution * self.resolution)
+
+
+    def get_map_layer(self):
+        self.draw_poly()
+        r = 0
+        for row in self.np_map:
+            c = 0
+            for col in row:
+                if self.np_poly[r, c] == MapSpec.UNKNOWN:
+                    self.np_zone[r, c] = MapSpec.OBSTACLE
+                else:
+                    self.np_zone[r, c] = self.np_map[r, c]
+                c += 1
+            r += 1
+
+    def draw_border_path(self, color):
+        arr_result = np.zeros_like(self.np_border, dtype=np.int8)
+        arr_result.fill(MapSpec.UNKNOWN)
+        # arr_result = np.where(self.np_zone == MapSpec.OBSTACLE, self.np_zone, MapSpec.UNKNOWN)
+        r = 0
+        print(color)
+        reliable_types = [MapSpec.BORDER_PATH, MapSpec.BORDER_PATH2, MapSpec.BORDER_PATH3,
+                          MapSpec.BORDER_PATH_INFILL, MapSpec.OBSTACLE]
+        for row in self.np_border:
+            c = 0
+            for col in row:
+                if col != 0:
+                    if self.np_border[r, c] in reliable_types:
+                        arr_result[r - 1:r + 2, c - 1:c + 2] = np.where(self.np_border[r - 1:r + 2, c - 1:c + 2] == MapSpec.FREE,
+                                                                        color,
+                                                                        self.np_border[r - 1:r + 2, c - 1:c + 2])
+                c = c + 1
+            r = r + 1
+        arr_result = self.remove_blind(arr_result, color, MapSpec.BORDER_PATH_INFILL)
+        arr_result = np.where(arr_result == MapSpec.UNKNOWN, MapSpec.FREE, arr_result)
+        print("Border path drawn")
+        self.np_border = np.copy(arr_result)
+
+    def draw_border_paths(self):
+        print("Draw border paths: ", self.msg.border_paths)
+        self.log_publisher("Draw border paths".format())
+        self.np_border = np.copy(self.np_zone)
+        if self.msg.border_paths == 1:
+            self.log_publisher("Draw border path 1.".format())
+            self.draw_border_path(MapSpec.BORDER_PATH)
+        if self.msg.border_paths == 2:
+            self.log_publisher("Draw border path 1.".format())
+            self.draw_border_path(MapSpec.BORDER_PATH)
+            for i in range(0, int(self.msg.paths_distance/(self.resolution*100))):
+                self.log_publisher("Draw border path 2 infill {}.".format(i))
+                self.draw_border_path(MapSpec.BORDER_PATH_INFILL)
+            self.log_publisher("Draw border path 2.".format())
+            self.draw_border_path(MapSpec.BORDER_PATH2)
+        if self.msg.border_paths == 3:
+            self.log_publisher("Draw border path 1.".format())
+            self.draw_border_path(MapSpec.BORDER_PATH)
+            for i in range(0, int(self.msg.paths_distance/(self.resolution*100))):
+                self.log_publisher("Draw border path 2 infill {}.".format(i))
+                self.draw_border_path(MapSpec.BORDER_PATH_INFILL)
+            self.log_publisher("Draw border path 2.".format())
+            self.draw_border_path(MapSpec.BORDER_PATH2)
+            for i in range(0, int(self.msg.paths_distance/(self.resolution*100))):
+                self.log_publisher("Draw border path 3 infill {}.".format(i))
+                self.draw_border_path(MapSpec.BORDER_PATH_INFILL)
+            self.log_publisher("Draw border path 3.".format())
+            self.draw_border_path(MapSpec.BORDER_PATH3)
+
+
+    def remove_blind(self, arr, type, replace):
+        # self.log_publisher("Remove blind: " + str(type) + " replace: " + str(replace))
+        num_of_type = 0
+        for r in range(0, arr.shape[0]):
+            c = 0
+            for c in range(0, arr.shape[1]):
+                if arr[r, c] == type:
+                    for cell in arr[r - 1:r + 2, c - 1:c + 2].flatten():
+                        if cell == MapSpec.UNKNOWN:
+                            num_of_type = num_of_type + 1
+                    if num_of_type == 0:
+                        arr[r, c] = replace
+                    num_of_type = 0
+                c = c + 1
+            r = r + 1
+        return arr
+
+    def draw_coverage_path(self):
+        angle = self.msg.coverage_angle
+        print("Map angle: ", angle)
+        self.log_publisher("Map coverage angle: " + str(angle))
+        distance = int(round(self.msg.paths_distance / (self.resolution * 100), 0))
+        print("Distance: ", distance)
+        img = np.zeros_like(self.np_border, dtype=np.int8)
+        img.fill(MapSpec.UNKNOWN)
+        # img = self.np_filled
+        img = cv2.normalize(src=img, dst=None, alpha=-1, beta=100, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8S)
+        angle = float(angle)
+        y_max, x_max = img.shape
+        line_count = 0
+        if (y_max > x_max):
+            line_count = int(y_max) * 2
+        else:
+            line_count = int(x_max) * 2
+
+        if angle > 45 and angle < 90:
+            x, y = 0.0, 0.0
+            length = x / math.cos(math.radians(angle))
+            x0 = 0.0
+            y0 = y + length * math.sin(math.radians(angle))
+            for i in range(line_count):
+                x = x + distance
+                length = x / math.cos(math.radians(angle))
+                y0 = y + length * math.sin(math.radians(angle))
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 70, 1)
+        if angle > 0 and angle <= 45:
+            x, y = 0.0, 0.0
+            length = y / math.sin(math.radians(angle))
+            x0 = x + length * math.cos(math.radians(angle))
+            y0 = 0.0
+            for i in range(line_count):
+                y = y + distance
+                length = y / math.sin(math.radians(angle))
+                x0 = x + length * math.cos(math.radians(angle))
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 70, 1)
+        if angle >= 135 and angle < 180:
+            x, y = x_max, 0.0
+            length = y / math.cos(math.radians(angle))
+            x0 = x + length * math.sin(math.radians(angle))
+            y0 = 0.0
+            for i in range(line_count):
+                y = y + distance
+                length = y / math.sin(math.radians(angle))
+                x0 = x + length * math.cos(math.radians(angle))
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 70, 1)
+        if angle > 90 and angle < 135:
+            x, y = 0.0, y_max
+            length = x / math.cos(math.radians(angle))  # We better verify that math.cos(math.radians(angle)) != 0
+            x0 = 0.0
+            y0 = y + length * math.sin(math.radians(angle))
+            for i in range(line_count):
+                x = x + distance
+                length = x / math.cos(math.radians(angle))
+                y0 = y + length * math.sin(math.radians(angle))
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 70, 1)
+        if angle == 90:
+            x, y = 0.0, 0.0
+            x0 = 0.0
+            y0 = y_max
+            for i in range(line_count):
+                x = x + distance
+                x0 = x0 + distance
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 70, 1)
+        if angle == 0 or angle == 180:
+            x, y = 0.0, 0.0
+            x0 = x_max
+            y0 = 0.0
+            for i in range(line_count):
+                y = y + distance
+                y0 = y0 + distance
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 70, 1)
+        np.set_printoptions(threshold=sys.maxsize)
+        # print(img)
+        self.np_coverage = img
+        # self.np_show = img
+        # cv2.imshow("img", img)
+        # cv2.waitKey(0)
+        # cv2.destroyAllWindows()
+
+    # def border_line_to_path(self, map_l, start_point, path_id):
+    def border_line_to_path(self, start_point, path_id):
+        self.log_publisher("Border line to path.".format())
+        path = MapPath()
+        # path.type = map_l.border_path_map[start_point[0], start_point[1]]
+        path.type = self.np_border[start_point[0], start_point[1]]
+        path.id = path_id
+        # next_p_r = start_point[0]
+        # next_p_c = start_point[1]
+        next_p_r = start_point[0]
+        next_p_c = start_point[1]
+        available_points = True
+        id = 0
+        while available_points:
+            point = MapPoint()
+            point.id = id
+            # point.map = map_l
+            point.resolution = self.resolution
+            point.origin_x = self.origin_x
+            point.origin_y = self.origin_y
+            point.r = next_p_r
+            point.c = next_p_c
+            point.position_rc = [point.r, point.c]
+            point.get_neighbours_types(self.np_border)
+            self.np_border[point.r, point.c] = np.array(249).astype(dtype=np.int8)
+            direction = 'nn'
+            try:
+                direction = list(point.neigh.keys())[list(point.neigh.values()).index(point.type)]
+            except:
+                # print("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+                pass
+            # direction = list(point.neigh.keys())[list(point.neigh.values()).index(point.type)]
+            # list(config_order.keys())[list(config_order.values()).index(element)]
+            # print(point)
+            if direction == 'up':
+                next_p_r = point.r - 1
+                next_p_c = point.c
+                point.direction = 'UP'
+            if direction == 'down':
+                next_p_r = point.r + 1
+                next_p_c = point.c
+                point.direction = 'DOWN'
+            if direction == 'left':
+                next_p_r = point.r
+                next_p_c = point.c - 1
+                point.direction = 'LEFT'
+            if direction == 'right':
+                next_p_r = point.r
+                next_p_c = point.c + 1
+                point.direction = 'RIGHT'
+            if direction == 'nn':
+                available_points = False
+                path.points[0].conn_from = point
+                if path.points[0].r < point.r:
+                    point.direction = 'UP'
+                if path.points[0].r > point.r:
+                    point.direction = 'DOWN'
+                if path.points[0].c < point.c:
+                    point.direction = 'LEFT'
+                if path.points[0].c < point.c:
+                    point.direction = 'RIGHT'
+            if point.id != 0:
+                point.conn_from = path.points[-1]
+                path.points[-1].conn_next = point
+            path.points.append(point)
+            id = id + 1
+        return path
+
+    def get_nearest_point(self, position, point_types=[]):
+        distance = 9999999999
+        result = []
+        r = 0
+        for row in self.np_border:
+            c = 0
+            for col in row:
+                if self.np_border[r, c] in point_types:
+                    x = position[0] - r
+                    y = position[1] - c
+                    if np.sqrt(x ** 2 + y ** 2) < distance:
+                        distance = np.sqrt(x ** 2 + y ** 2)
+                        result = [r, c]
+                c = c + 1
+            r = r + 1
+        return result
+
+
+    def get_paths(self):
+        ######## Create paths
+        self.paths_list.paths = []
+        print("Create navigation border path...")
+        self.log_publisher("Polygons from paths.".format())
+        path_types = [MapSpec.BORDER_PATH, MapSpec.BORDER_PATH2, MapSpec.BORDER_PATH3]
+        path_id = 0
+        for path_type in path_types:
+            while True:
+                start_point = self.get_nearest_point(self.position_rc, [path_type])
+                if len(start_point) == 0:
+                    break
+                path = self.border_line_to_path(start_point, path_id)
+                path.make_polygon_from_points(self.resolution)
+                self.paths_list.paths.append(path)
+                self.paths_list.last_path_id = path_id
+                path_id = path_id + 1
+
+                # draw_arr(mapa.border_path_map)
+        print("leeeeeeeeeeeeeeeen: {}".format(len(self.paths_list.paths)))
+        self.log_publisher("Set path type.".format())
+        self.paths_list.set_path_type()
+
+
+
+        for path in self.paths_list.paths:
+            # path.points.append(path.points[0]) ## close loop
+
+            path.points[-1].conn_next = path.points[0]
+
+            for point in path.points:
+                # print 'in: {} out: {}'.format(point.conn_from.direction, point.direction)
+                point.set_yaw_to_next()
+                # print("x: {} y: {} theta: {}".format(point.r, point.c, point.theta_next))
+                self.np_border[point.r, point.c] = path.type
+                if point.id == 0:
+                    self.np_border[point.r, point.c] = 40
+
+        self.paths_list.make_infill_line(self.msg.coverage_angle, self.msg.paths_distance)
+
+class MapZoneList():
+
+    def __init__(self):
+        self.zones = []
+
+    def add_zone(self, zone):
+        if self.get_zone(zone.msg.name) is None:
+            self.zones.append(zone)
+        else:
+            self.update_zone(zone)
+
+    def get_zone(self, name):
+        for zone in self.zones:
+            if zone.msg.name == name:
+                return zone
+        return None
+
+    def update_zone(self, zone_msg):
+        for i, zone in enumerate(self.zones):
+            if zone.msg.name == zone_msg.msg.name:
+                self.zones[i] = zone_msg
+                return True
+        return False
+
+    def remove_zone(self, name):
+        for zone in self.zones:
+            if zone.msg.name == name:
+                self.zones.remove(zone)
+                return True
+        return False
+
+    def get_zone_list_msg(self):
+        msg = MapEditZoneList()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        msg.zone_list = []
+        for zone in self.zones:
+            msg.zone_list.append(zone.msg)
+        return msg
+
+
+class MapLayer():
+    def __init__(self):
+        self.np_map = None
+        self.type = None
+        self.poly_color = None
+        self.np_layer = None
+
+    def init_layer(self, np_map, layer_type, poly_color):
+        self.np_map = np_map
+        self.type = layer_type
+        self.poly_color = poly_color
+        if self.type == MapSpec.LAYER_FREE or self.type == MapSpec.LAYER_ORIGINAL:
+            self.np_layer = np.copy(self.np_map)
+        else:
+            self.np_layer = np.zeros_like(self.np_map, dtype=np.int8)
+            self.np_layer.fill(MapSpec.UNKNOWN)
+
+    def layer_from_color(self, np_map, color, draw_color=None):
+        if draw_color is None:
+            draw_color = color
+        r = 0
+        for row in np_map:
+            c = 0
+            for col in row:
+                if np_map[r, c] == color:
+                    self.np_layer[r, c] = draw_color
+                c += 1
+            r += 1
+
+    def reset_layer(self):
+        if self.type == MapSpec.LAYER_FREE or self.type == MapSpec.LAYER_ORIGINAL:
+            self.np_layer = np.copy(self.np_map)
+        else:
+            self.np_layer = np.zeros_like(self.np_map, dtype=np.int8)
+            self.np_layer.fill(MapSpec.UNKNOWN)
+
+    def draw_fill_polygon(self, np_poly):
+        cv2.fillPoly(self.np_layer, pts=[np_poly], color=self.poly_color)
+
+    def draw_fill_polygon_color(self, np_poly, color):
+        cv2.fillPoly(self.np_layer, pts=[np_poly], color=color)
+
+    def increase_obstacles(self):
+        arr_result = np.zeros_like(self.np_layer, dtype=np.int8)
+        arr_result.fill(MapSpec.UNKNOWN)
+        arr_result = np.where(self.np_map == MapSpec.UNKNOWN, self.poly_color, arr_result)
+        r = 0
+        print(self.poly_color)
+        for row in self.np_layer:
+            c = 0
+            for col in row:
+                if col != 0:
+                    if self.np_layer[r, c] == MapSpec.OBSTACLE:
+                        arr_result[r - 1:r + 2, c - 1:c + 2] = np.where(self.np_layer[r - 1:r + 2, c - 1:c + 2] == MapSpec.UNKNOWN,
+                                                                        self.poly_color,
+                                                                        self.np_layer[r - 1:r + 2, c - 1:c + 2])
+                c = c + 1
+            r = r + 1
+        print("Obstacle incerased")
+        self.np_layer = np.copy(arr_result)
+
+
+class MapLayerList:
+    def __init__(self):
+        self.layer_original = MapLayer()
+        self.layer_free = MapLayer()
+        self.layer_assembled = MapLayer()
+        self.layer_free_poly = MapLayer()
+        self.layer_obstacles_poly = MapLayer()
+        self.layer_increase_obstacles = MapLayer()
+        self.layer_assembled_light = MapLayer()
+
+    def init_layers(self, np_map):
+        self.layer_original.init_layer(np_map, MapSpec.LAYER_ORIGINAL, MapSpec.UNKNOWN)
+        self.layer_free.init_layer(np_map, MapSpec.LAYER_FREE, MapSpec.UNKNOWN)
+        self.layer_free_poly.init_layer(np_map, MapSpec.LAYER_FREE_POLY, MapSpec.FREE)
+        self.layer_obstacles_poly.init_layer(np_map, MapSpec.LAYER_OBSTACLES_POLY, MapSpec.OBSTACLE)
+        self.layer_increase_obstacles.init_layer(np_map, MapSpec.LAYER_INFLATION, MapSpec.OBSTACLE)
+        self.layer_assembled_light.init_layer(np_map, MapSpec.LAYER_ASSEMBLED, MapSpec.UNKNOWN)
+        self.layer_assembled_light.np_layer = np.copy(self.layer_assembled_light.np_map)
+
+        self.layer_assembled.init_layer(np_map, MapSpec.LAYER_ASSEMBLED, MapSpec.UNKNOWN)
+
+    def draw_layer_to_assembled(self, layer):
+        r = 0
+        for row in layer.np_layer:
+            c = 0
+            for col in row:
+                if layer.np_layer[r, c] == layer.poly_color:
+                    self.layer_assembled.np_layer[r, c] = layer.poly_color
+                c += 1
+            r += 1
+
+    def draw_layer_to_assembled_light(self, layer):
+        r = 0
+        for row in layer.np_layer:
+            c = 0
+            for col in row:
+                if layer.np_layer[r, c] == layer.poly_color:
+                    self.layer_assembled_light.np_layer[r, c] = layer.poly_color
+                c += 1
+            r += 1
+
+    def assemble_map_light(self, map_free_poly_list, map_obstacles_poly_list):
+        # free layer
+        self.layer_assembled_light.np_layer = np.copy(self.layer_free.np_layer)
+
+        # free poly layer
+        self.layer_free_poly.reset_layer()
+        for poly in map_free_poly_list:
+            self.layer_free_poly.draw_fill_polygon(poly)
+        self.draw_layer_to_assembled_light(self.layer_free_poly)
+
+        # obstacles layer
+        self.layer_obstacles_poly.reset_layer()
+        for poly in map_obstacles_poly_list:
+            self.layer_obstacles_poly.draw_fill_polygon(poly)
+        self.draw_layer_to_assembled_light(self.layer_obstacles_poly)
+
+    def assemble_map(self, map_free_poly_list, map_obstacles_poly_list):
+
+        # assemble light layer
+        self.assemble_map_light(map_free_poly_list, map_obstacles_poly_list)
+        self.layer_assembled.np_layer = np.copy(self.layer_assembled_light.np_layer)
+
+
+
+        # inflation layer
+        self.draw_layer_to_assembled(self.layer_increase_obstacles)
+
+
+
+
+
+class MapEditor():
+
+    def __init__(self):
+        self.initial_map = OccupancyGrid()
+        self.map_layers = MapLayerList()
+        self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.callback_map)
+        self.map_angle_sub = rospy.Subscriber("coverage_paths", Int16, self.callback_map_angle)
+        self.map_fill_unk_sub = rospy.Subscriber("fill_unknown", Int16, self.callback_free_fill_unk)
+        self.map_increase_obstacles_sub = rospy.Subscriber("increase_obstacles", Int16, self.callback_increase_obstacles)
+        self.map_assemble_sub = rospy.Subscriber("assemble_map", Int16, self.callback_map_assemble)
+        self.map_show_map_layer_sub = rospy.Subscriber("show_map_layer", String, self.callback_show_map_layer)
+        # self.map_border_paths_sub = rospy.Subscriber("border_paths", Int16, self.callback_map_border_paths)
+        self.map_publish_polygon_sub = rospy.Subscriber("publish_polygon", PolygonStamped, self.callback_map_publish_polygon)
+        self.map_save_poly_sub = rospy.Subscriber("save_polygon", MapEditPolygon, self.callback_map_save_poly)
+        self.map_reload_sub = rospy.Subscriber("reload", Bool, self.callback_map_reload)
+        self.map_remove_poly_sub = rospy.Subscriber("remove_polygon", String, self.callback_map_remove_poly)
+        self.map_save_zone_sub = rospy.Subscriber("save_zone", MapEditZone, self.callback_map_save_zone)
+        self.map_remove_zone_sub = rospy.Subscriber("remove_zone", String, self.callback_map_remove_zone)
+        # self.map_tools = Map()
+        self.map_show_pub = rospy.Publisher("map_show", OccupancyGrid, queue_size=1)
+        self.map_poly_list_pub = rospy.Publisher("polygon_list", MapEditPolygonList, queue_size=1)
+        self.map_zone_list_pub = rospy.Publisher("zone_list", MapEditZoneList, queue_size=1)
+        self.poly_show_pub = rospy.Publisher("poly_show", PolygonStamped, queue_size=20)
+        self.path_show_pub = rospy.Publisher("path_show", Path, queue_size=1)
+        self.marker_pub = rospy.Publisher("/vis_marker", Marker, queue_size=2)
+        self.marker_arr_pub = rospy.Publisher("/vis_marker_arr", MarkerArray, queue_size=2)
+        self.log_pub = rospy.Publisher("log", String, queue_size=1)
+        self.increase_obstacles_count = 0
+        self.free_fill_count = 0
+        self.np_show = None
+        self.layer_to_show = MapSpec.LAYER_ASSEMBLED
+        self.np_initial_map = None
+        self.distance = 5
+        self.np_filled = None
+        self.np_obstacles = None
+        self.np_coverage_path = None
+        self.np_border_path = None
+        self.np_polygons = None
+        self.map_poly_list = MapPolygonList()
+        self.map_zone_list = MapZoneList()
+        self.unusable = 100
+        self.border_path1 = 125
+        self.border_path2 = 124
+        self.border_path_infill = 50
+
+    def marker_arr_publisher(self):
+        zone = self.map_zone_list.get_zone(name='Zone')
+        if zone is not None:
+            self.marker_arr_pub.publish(zone.paths_list.coverage_paths_marker_array)
+
+    def marker_publisher(self):
+        points = []
+        zone = self.map_zone_list.get_zone(name='Zone')
+        if zone is not None:
+            # print(zone.paths)
+            # poly = zone.paths[1].polygon
+            # print("Paths_len: {}".format(len(zone.paths_list.paths)))
+            for path in zone.paths_list.paths:
+                # print("Path_type: {}".format(path.path_type))
+                if path.path_type in ['border', 'obstacle']:
+                    # line_start = Point32(path.polygon.exterior.coords[0][0], path.polygon.exterior.coords[0][1], 0)
+                    # print("Path_type in: {}".format(path.path_type))
+                    # print("TEST: {}".format(shapely.get_coordinates(path.polygon.exterior)))
+                    # points.append(shapely.get_coordinates(path.polygon.exterior))
+                    line_start = None
+                    for point in shapely.get_coordinates(path.polygon.exterior):
+                        if line_start == None:
+                            line_start = Point32(point[0], point[1], 0)
+                            # print("point_start: ", point)
+                        else:
+                            # print("point: ", point)
+                            points.append(line_start)
+                            points.append(Point32(point[0], point[1], 0))
+                            # points.append([line_start, Point32(point[0], point[1], 0)])
+                            line_start = Point32(point[0], point[1], 0)
+
+        # print(points)
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "my_namespace"
+        # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
+        marker.type = Marker.LINE_LIST
+        marker.id = 0
+        # Set the scale of the marker
+        marker.scale.x = 0.02
+        marker.scale.y = 0.02
+        marker.scale.z = 0.02
+        # Set the color
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+        # Set the pose of the marker
+        marker.pose.position.x = 0
+        marker.pose.position.y = 0
+        marker.pose.position.z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+        marker.points = points
+        self.marker_pub.publish(marker)
+
+    def path_show_publisher(self):
+        if self.map_zone_list.get_zone("Zone") is not None:
+            for path in self.map_zone_list.get_zone("Zone").paths_list.paths:
+                print("*************************************")
+                print("Path type: {}".format(path.type))
+                print("Path len: {}".format(path.path.poses.__len__()))
+                if path.type == MapSpec.COVERAGE_PATH:
+                    self.path_show_pub.publish(path.path)
+
+
+    def poly_show_publisher(self, name):
+        # msg = PolygonStamped()
+        # msg.header.stamp = rospy.Time.now()
+        # msg.header.frame_id = "map"
+        # msg_poly = Polygon()
+        if self.map_zone_list.get_zone(name) is not None:
+            zone = self.map_zone_list.get_zone(name)
+            # print(zone.paths)
+            # poly = zone.paths[1].polygon
+            for path in zone.paths_list.paths:
+                if path.path_type in ['border', 'obstacle']:
+                    msg = PolygonStamped()
+                    msg.header.stamp = rospy.Time.now()
+                    msg.header.frame_id = "map"
+                    msg_poly = Polygon()
+                    # print(path.polygon)
+                    for point in path.polygon.exterior.coords:
+                        # print(point)
+                        msg_poly.points.append(Point32(point[0], point[1], 0))
+                    msg.polygon = msg_poly
+                    # self.poly_show_pub.publish(msg)
+                    # time.sleep(0.5)
+
+    def log_pub_publisher(self, log_txt):
+        msg = String()
+        msg.data = log_txt
+        self.log_pub.publish(msg)
+
+    def map_poly_list_publisher(self):
+        self.map_poly_list_pub.publish(self.map_poly_list.get_poly_list_msg())
+
+    def map_zone_list_publisher(self):
+        print(self.map_zone_list)
+        self.map_zone_list_pub.publish(self.map_zone_list.get_zone_list_msg())
+
+    def map_publisher(self, np_arr):
+        map_msg = OccupancyGrid()
+        map_msg.header.stamp = rospy.Time.now()
+        map_msg.header.frame_id = "map"
+        map_msg.info = self.initial_map.info
+        # np_arr = np.fliplr(np_arr)
+        # np_arr = np.rot90(np_arr, 1)
+        # print(np_arr.shape)
+        np.set_printoptions(threshold=sys.maxsize)
+        # print(np_arr)
+        map_msg.info.width = np_arr.shape[1]
+        map_msg.info.height = np_arr.shape[0]
+        # self.map_tools.draw_and_save_img(np_arr, "Array")
+        np_arr = np_arr.reshape((np_arr.size,))
+        # print(np_arr)
+        # for i in range(np_arr.size):
+        #     if np_arr[i] > 253:
+        #         np_arr[i] = np.array(-1).astype(np.int8)
+        map_msg.data = np_arr.tolist()
+        # print(map_msg.info)
+        self.map_show_pub.publish(map_msg)
+
+    def callback_map_remove_zone(self, msg):
+        self.map_zone_list.remove_zone(msg.data)
+        self.map_zone_list_publisher()
+        self.log_pub_publisher("Zone {} removed.".format(msg.data))
+        # Assemble map light
+        self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        self.np_show = self.map_layers.layer_assembled_light.np_layer
+
+    def callback_map_save_zone(self, msg):
+        self.log_pub_publisher("Prepare zone {}.".format(msg.name))
+        map_zone = MapZone(msg, self.map_layers.layer_assembled.np_layer, self.initial_map, self.log_pub_publisher)
+        self.map_zone_list.add_zone(map_zone)
+        self.map_zone_list_publisher()
+        # Assemble map
+        # self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        # self.np_show = self.map_layers.layer_assembled.np_layer
+        self.log_pub_publisher("Zone {} saved.".format(msg.name))
+        # Assemble map light
+        # self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        self.np_show = map_zone.np_border
+
+    def callback_map_remove_poly(self, msg):
+        self.map_poly_list.remove_poly(msg.data)
+        self.map_poly_list_publisher()
+        self.log_pub_publisher("Polygon {} removed.".format(msg.data))
+        # Assemble map light
+        self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        self.np_show = self.map_layers.layer_assembled_light.np_layer
+
+    def callback_map_save_poly(self, msg):
+        map_poly = MapPolygon(msg, self.np_filled, self.initial_map)
+        self.map_poly_list.add_poly(map_poly)
+        self.map_poly_list_publisher()
+        # Assemble map
+        # self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        # self.np_show = self.map_layers.layer_assembled.np_layer
+        self.log_pub_publisher("Polygon {} saved.".format(msg.name))
+        # Assemble map light
+        self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        self.np_show = self.map_layers.layer_assembled_light.np_layer
+
+    def callback_map_reload(self, msg):
+        self.map_poly_list_publisher()
+        self.map_zone_list_publisher()
+
+    def callback_map_publish_polygon(self, msg):
+        # print("Publish polygon: ", msg)
+        print(self.initial_map.info.origin)
+        resolution = self.initial_map.info.resolution
+        print("x: {} y: {}".format(int(self.initial_map.info.origin.position.x/resolution), int(self.initial_map.info.origin.position.y/resolution)))
+        print(np.shape(self.np_show))
+        print("Resolution: ", resolution)
+        x_origin = -1 * int(self.initial_map.info.origin.position.x / resolution)
+        y_origin = -1 * int(self.initial_map.info.origin.position.y / resolution)
+        print("x: {} y: {}".format(x_origin, y_origin))
+        # for point in msg.polygon.points:
+        #     print("x: {} y: {}".format(point.x, point.y))
+        polygon = []
+        for point in msg.polygon.points:
+            x_point = int(point.x/resolution)
+            y_point = int(point.y/resolution)
+            print("x: {} y: {}".format(x_origin + x_point, y_origin + y_point))
+            if self.np_show is not None:
+                self.np_show[y_origin + y_point, x_origin + x_point] = 100
+                polygon.append([x_origin + x_point, y_origin + y_point])
+        self.np_polygon = np.array(polygon)
+
+        if self.np_show is not None:
+            self.np_show[0, 0] = 100
+            self.np_show[y_origin, x_origin] = 100
+            cv2.fillPoly(self.np_show, pts=[self.np_polygon], color=(100))
+
+
+    def callback_map_assemble(self, msg):
+        print("Assemble map: ", msg.data)
+
+        self.increase_obstacles()
+        self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        self.np_show = self.map_layers.layer_assembled.np_layer
+        self.log_pub_publisher("Map assembled.")
+
+
+    def callback_show_map_layer(self, msg):
+        print("Show map layer: ", msg.data)
+        if msg.data == "filled":
+            self.np_show = self.map_layers.layer_free.np_layer
+        elif msg.data == "obstacle_margin":
+            self.np_show = self.map_layers.layer_increase_obstacles.np_layer
+        elif msg.data == "obstacles_poly":
+            self.np_show = self.map_layers.layer_obstacles_poly.np_layer
+        elif msg.data == "free_poly":
+            self.np_show = self.map_layers.layer_free_poly.np_layer
+        elif msg.data == "coverage_path":
+            self.np_show = self.np_coverage_path
+        elif msg.data == "border_path":
+            self.np_show = self.np_border_path
+        elif msg.data == "original":
+            self.np_show = self.map_layers.layer_original.np_map
+        elif msg.data == "assembled":
+            self.np_show = self.map_layers.layer_assembled.np_layer
+
+    def fill_unknown(self, arr):
+        arr_result = np.zeros_like(arr)
+        # arr_result[-1:1, -1:1] = fill_val
+        r = 0
+        for row in arr:
+            c = 0
+            for col in row:
+                arr_result[r, c] = col
+                if r > 1 and c > 1 and r < len(arr) - 1 and c < len(row) - 1:
+                    if col == -1:
+                        fill = 0
+                        if arr[r - 1, c] == 0:
+                            fill += 1
+                        if arr[r + 1, c] == 0:
+                            fill += 1
+                        if arr[r, c - 1] == 0:
+                            fill += 1
+                        if arr[r, c + 1] == 0:
+                            fill += 1
+                        if fill >= 2:
+                            arr_result[r, c] = 0
+                c = c + 1
+            r = r + 1
+        return arr_result
+
+    def free_fill_unk(self):
+        print("Fill unknown cells: ", self.free_fill_count)
+        self.map_layers.layer_free.reset_layer()
+        for i in range(0, self.free_fill_count):
+            self.log_pub_publisher("Fill free round {}/{}".format(i+1, self.free_fill_count))
+            self.map_layers.layer_free.np_layer = self.fill_unknown(self.map_layers.layer_free.np_layer)
+
+    def callback_free_fill_unk(self, msg):
+        self.free_fill_count += msg.data
+        print("Fill unknown cells: ", msg.data)
+        if msg.data == 0:
+            self.free_fill_count = 0
+        elif msg.data == 999:
+            self.free_fill_count = MapSpec.FILL_UNKNOWN_ITERATION
+        else:
+            self.free_fill_count = msg.data
+        self.free_fill_unk()
+
+        # Refresh inflation layer with new free layer
+        self.map_layers.layer_increase_obstacles.np_map = self.map_layers.layer_free.np_layer
+        self.reset_inflation_layer()
+
+        # Assemble map
+        # self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        # self.np_show = self.map_layers.layer_assembled.np_layer
+        self.log_pub_publisher("Fill free finished.")
+        # Assemble map light
+        self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        self.np_show = self.map_layers.layer_assembled_light.np_layer
+
+    def reset_inflation_layer(self):
+        self.map_layers.layer_increase_obstacles.reset_layer()
+
+        # draw obstacles from map and poly
+        self.map_layers.layer_increase_obstacles.layer_from_color(self.map_layers.layer_free.np_layer, MapSpec.OBSTACLE)
+
+        # draw free poly as unknown to to remove unwanted obstacles
+        self.map_layers.layer_increase_obstacles.layer_from_color(self.map_layers.layer_free_poly.np_layer, MapSpec.FREE, MapSpec.UNKNOWN)
+        # for poly in self.map_poly_list.get_free_poly_np_list():
+        #     self.map_layers.layer_increase_obstacles.draw_fill_polygon_color(poly, MapSpec.UNKNOWN)
+
+        # draw obstacles poly
+        self.map_layers.layer_increase_obstacles.layer_from_color(self.map_layers.layer_obstacles_poly.np_layer, MapSpec.OBSTACLE)
+        # for poly in self.map_poly_list.get_obstacles_poly_np_list():
+        #     self.map_layers.layer_increase_obstacles.draw_fill_polygon_color(poly, MapSpec.OBSTACLE)
+
+        # set actual map
+        self.map_layers.layer_increase_obstacles.np_map = self.map_layers.layer_assembled_light.np_layer
+
+    def increase_obstacles (self):
+        print("Increase obstacles: ", self.increase_obstacles_count)
+        self.reset_inflation_layer()
+        for i in range(0, self.increase_obstacles_count):
+            self.log_pub_publisher("Draw obstacle margin round {}/{}".format(i + 1, self.increase_obstacles_count))
+            self.map_layers.layer_increase_obstacles.increase_obstacles()
+
+    def callback_increase_obstacles (self, msg):
+        print("Increase obstacles: ", msg.data)
+        if msg.data == 0:
+            self.increase_obstacles_count = 0
+        elif msg.data == 999:
+            self.increase_obstacles_count = int((MapSpec.ROBOT_RADIUS + MapSpec.OBSTACLE_RESERVE)/self.initial_map.info.resolution)
+        else:
+            self.increase_obstacles_count = msg.data
+        self.increase_obstacles()
+        self.log_pub_publisher("Draw obstacle margin finished.")
+        # Assemble map
+        self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        self.np_show = self.map_layers.layer_assembled.np_layer
+        # Assemble map light
+        # self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
+        # self.np_show = self.map_layers.layer_assembled_light.np_layer
+
+    def callback_map(self, msg):
+        self.initial_map = msg
+        self.map_sub.unregister()
+        print('Map received')
+        rospy.loginfo("[{}] Width: {} ".format(rospy.get_caller_id(), self.initial_map.info.width))
+        rospy.loginfo(rospy.get_caller_id() + " Heigth: %s", self.initial_map.info.height)
+        rospy.loginfo(rospy.get_caller_id() + " Resolution: %s", self.initial_map.info.resolution)
+        rospy.loginfo(rospy.get_caller_id() + " Map load time: %s", self.initial_map.info.map_load_time)
+        rospy.loginfo(rospy.get_caller_id() + " Width in (m): %s", self.initial_map.info.width * self.initial_map.info.resolution)
+        rospy.loginfo(rospy.get_caller_id() + " Heigth in (m): %s", self.initial_map.info.height * self.initial_map.info.resolution)
+        # obstacle_distance = int(round((MapSpec.ROBOT_RADIUS + MapSpec.OBSTACLE_RESERVE) / self.initial_map.info.resolution))
+        # cover_distance = int(round(MapSpec.COVERAGE_DIAMETER / self.initial_map.info.resolution))
+        # position_rc = [self.initial_map.info.width / 2, self.initial_map.info.height / 2]
+        print("Prepare array...")
+        arr = np.array(self.initial_map.data, dtype=np.int8)
+        arr = arr.reshape((self.initial_map.info.height, self.initial_map.info.width))
+        self.np_initial_map = arr
+        self.np_show = arr
+        self.np_filled = arr
+        self.np_obstacles = arr
+        np.set_printoptions(threshold=sys.maxsize)
+        # print(self.np_show)
+        self.map_layers.init_layers(arr)
+
+    def callback_map_angle(self, msg):
+        print("Map angle: ", msg.data)
+        img = self.np_filled
+        img = cv2.normalize(src=img, dst=None, alpha=-1, beta=100, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8S)
+        angle = float(msg.data)
+        y_max, x_max = img.shape
+        line_count = 0
+        if (y_max > x_max):
+            line_count = int(y_max) * 2
+        else:
+            line_count = int(x_max) * 2
+
+        if angle > 45 and angle < 90:
+            x, y = 0.0, 0.0
+            length = x / math.cos(math.radians(angle))
+            x0 = 0.0
+            y0 = y + length * math.sin(math.radians(angle))
+            for i in range(line_count):
+                x = x + self.distance
+                length = x / math.cos(math.radians(angle))
+                y0 = y + length * math.sin(math.radians(angle))
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 101, 1)
+        if angle > 0 and angle <= 45:
+            x, y = 0.0, 0.0
+            length = y / math.sin(math.radians(angle))
+            x0 = x + length * math.cos(math.radians(angle))
+            y0 = 0.0
+            for i in range(line_count):
+                y = y + self.distance
+                length = y / math.sin(math.radians(angle))
+                x0 = x + length * math.cos(math.radians(angle))
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 101, 1)
+        if angle >= 135 and angle < 180:
+            x, y = x_max, 0.0
+            length = y / math.cos(math.radians(angle))
+            x0 = x + length * math.sin(math.radians(angle))
+            y0 = 0.0
+            for i in range(line_count):
+                y = y + self.distance
+                length = y / math.sin(math.radians(angle))
+                x0 = x + length * math.cos(math.radians(angle))
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 101, 1)
+        if angle > 90 and angle < 135:
+            x, y = 0.0, y_max
+            length = x / math.cos(math.radians(angle))  # We better verify that math.cos(math.radians(angle)) != 0
+            x0 = 0.0
+            y0 = y + length * math.sin(math.radians(angle))
+            for i in range(line_count):
+                x = x + self.distance
+                length = x / math.cos(math.radians(angle))
+                y0 = y + length * math.sin(math.radians(angle))
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 101, 1)
+        if angle == 90:
+            x, y = 0.0, 0.0
+            x0 = 0.0
+            y0 = y_max
+            for i in range(line_count):
+                x = x + self.distance
+                x0 = x0 + self.distance
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 101, 1)
+        if angle == 0 or angle == 180:
+            x, y = 0.0, 0.0
+            x0 = x_max
+            y0 = 0.0
+            for i in range(line_count):
+                y = y + self.distance
+                y0 = y0 + self.distance
+                cv2.line(img, (int(x0), int(y0)), (int(x), int(y)), 101, 1)
+        np.set_printoptions(threshold=sys.maxsize)
+        # print(img)
+        self.np_coverage_path = img
+        self.np_show = img
+
+
+def map_test():
+    rospy.init_node('map_edit', anonymous=True)
+    rospy.loginfo("Initialising map_edit node...")
+    current_time = rospy.Time.now()
+    rate = rospy.Rate(2)  # 1hz
+    map_edit = MapEditor()
+
+    while not rospy.is_shutdown():
+        if map_edit.np_show is not None:
+            map_edit.map_publisher(map_edit.np_show)
+        map_edit.poly_show_publisher("Zone")
+        map_edit.path_show_publisher()
+        map_edit.marker_publisher()
+        map_edit.marker_arr_publisher()
+        rate.sleep()
+
+if __name__ == '__main__':
+    map_test()

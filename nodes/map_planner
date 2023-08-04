@@ -18,6 +18,20 @@ from geometry_msgs.msg import PolygonStamped, Polygon, Point32
 from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList
 from visualization_msgs.msg import Marker, MarkerArray
 import math
+import pickle
+import resource
+import sys
+
+print(resource.getrlimit(resource.RLIMIT_STACK))
+print(sys.getrecursionlimit())
+sys.setrecursionlimit(50000)
+print(sys.getrecursionlimit())
+
+
+class MapLog:
+
+    LOG_TEXT = "Initiated"
+    LOG_PREVIOUS = ""
 
 
 class MapSpec:
@@ -203,46 +217,47 @@ class MapPathList:
         self.multilines = []
         self.last_path_id = 0
         self.coverage_paths_marker_array = MarkerArray()
-        self.marker_arr_pub = rospy.Publisher("/marker_test", MarkerArray, queue_size=2)
+        # self.marker_arr_pub = rospy.Publisher("/marker_test", MarkerArray, queue_size=2)
         self.marker_array = MarkerArray()
 
-    def marker_publisher(self):
-        points = []
-        zone = self.map_zone_list.get_zone(name='Zone')
-        if zone is not None:
-            for path in zone.paths_list.paths:
-                if path.path_type in ['border', 'obstacle']:
-                    line_start = None
-                    for point in shapely.get_coordinates(path.polygon.exterior):
-                        if line_start == None:
-                            line_start = Point32(point[0], point[1], 0)
-                        else:
-                            points.append(line_start)
-                            points.append(Point32(point[0], point[1], 0))
-                            line_start = Point32(point[0], point[1], 0)
 
-        marker = Marker()
-        marker.header.frame_id = "map"
-        marker.header.stamp = rospy.Time.now()
-        marker.ns = "my_namespace"
-        marker.type = Marker.LINE_LIST
-        marker.id = 0
-        marker.scale.x = 0.02
-        marker.scale.y = 0.02
-        marker.scale.z = 0.02
-        marker.color.r = 0.0
-        marker.color.g = 1.0
-        marker.color.b = 1.0
-        marker.color.a = 1.0
-        marker.pose.position.x = 0
-        marker.pose.position.y = 0
-        marker.pose.position.z = 0
-        marker.pose.orientation.x = 0.0
-        marker.pose.orientation.y = 0.0
-        marker.pose.orientation.z = 0.0
-        marker.pose.orientation.w = 1.0
-        marker.points = points
-        self.marker_pub.publish(marker)
+    # def marker_publisher(self):
+    #     points = []
+    #     zone = self.map_zone_list.get_zone(name='Zone')
+    #     if zone is not None:
+    #         for path in zone.paths_list.paths:
+    #             if path.path_type in ['border', 'obstacle']:
+    #                 line_start = None
+    #                 for point in shapely.get_coordinates(path.polygon.exterior):
+    #                     if line_start == None:
+    #                         line_start = Point32(point[0], point[1], 0)
+    #                     else:
+    #                         points.append(line_start)
+    #                         points.append(Point32(point[0], point[1], 0))
+    #                         line_start = Point32(point[0], point[1], 0)
+    #
+    #     marker = Marker()
+    #     marker.header.frame_id = "map"
+    #     marker.header.stamp = rospy.Time.now()
+    #     marker.ns = "my_namespace"
+    #     marker.type = Marker.LINE_LIST
+    #     marker.id = 0
+    #     marker.scale.x = 0.02
+    #     marker.scale.y = 0.02
+    #     marker.scale.z = 0.02
+    #     marker.color.r = 0.0
+    #     marker.color.g = 1.0
+    #     marker.color.b = 1.0
+    #     marker.color.a = 1.0
+    #     marker.pose.position.x = 0
+    #     marker.pose.position.y = 0
+    #     marker.pose.position.z = 0
+    #     marker.pose.orientation.x = 0.0
+    #     marker.pose.orientation.y = 0.0
+    #     marker.pose.orientation.z = 0.0
+    #     marker.pose.orientation.w = 1.0
+    #     marker.points = points
+    #     self.marker_pub.publish(marker)
 
     def set_path_type(self):
 
@@ -269,6 +284,7 @@ class MapPathList:
 
     def make_coverage_lines(self, angle, line_distance, margin=0.10):
 
+        MapLog.LOG_TEXT = "make_coverage_lines"
         # get boundary of border polygon
         for path in self.paths:
             if path.type == MapSpec.BORDER_PATH and path.path_type == 'border':
@@ -438,7 +454,7 @@ class MapPathList:
                     pose.pose.position.z = 0.0
                     pose.pose.orientation = Quaternion(*(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
                     path.path.poses.append(pose)
-            self.paths.append(path)
+        self.paths.append(path)
 
     def is_crossing_multiline(self, multiline_list, geom, polygon_list, polygon):
         result = False
@@ -576,7 +592,7 @@ class MapPathList:
                 marker.points = points
                 self.marker_array.markers.append(marker)
                 i = i + 1
-        self.marker_arr_pub.publish(self.marker_array)
+        # self.marker_arr_pub.publish(self.marker_array)
 
     def multiline_list_to_marker(self, multiline_list):
         marker_array = MarkerArray()
@@ -729,8 +745,9 @@ class MapPolygonList():
 
 class MapZone:
 
-    def __init__(self, msg_zone, np_map, msg_map, log_publisher):
-        self.log_publisher = log_publisher
+    # def __init__(self, msg_zone, np_map, msg_map, log_publisher):
+    def __init__(self, msg_zone, np_map, msg_map):
+        # self.log_pub = rospy.Publisher("log", String, queue_size=1)
         self.msg = msg_zone
         self.np_map = np.copy(np_map)
         self.np_poly = np.zeros_like(self.np_map, dtype=np.int8)
@@ -753,6 +770,12 @@ class MapZone:
         self.draw_border_paths()
         self.paths_list = MapPathList()
         self.get_paths()
+
+    def log_publisher(self, log_txt):
+        # msg = String()
+        # msg.data = log_txt
+        # self.log_pub.publish(msg)
+        MapLog.LOG_TEXT = log_txt
 
     def polygon_to_np(self):
         polygon = []
@@ -1165,6 +1188,7 @@ class MapEditor():
         self.map_remove_poly_sub = rospy.Subscriber("remove_polygon", String, self.callback_map_remove_poly)
         self.map_save_zone_sub = rospy.Subscriber("save_zone", MapEditZone, self.callback_map_save_zone)
         self.map_remove_zone_sub = rospy.Subscriber("remove_zone", String, self.callback_map_remove_zone)
+        self.selected_zone_sub = rospy.Subscriber("selected_zone", String, self.callback_selected_zone)
         self.map_show_pub = rospy.Publisher("map_show", OccupancyGrid, queue_size=1)
         self.map_poly_list_pub = rospy.Publisher("polygon_list", MapEditPolygonList, queue_size=1)
         self.map_zone_list_pub = rospy.Publisher("zone_list", MapEditZoneList, queue_size=1)
@@ -1180,15 +1204,34 @@ class MapEditor():
         self.distance = 5
         self.map_poly_list = MapPolygonList()
         self.map_zone_list = MapZoneList()
+        self.current_zone = None
+        self.timer_pub_log = rospy.Timer(rospy.Duration(1.0 / 10), self.log_pub_msg_publisher)
+
+    def save_running_data(self):
+        with open('/home/vitulus/.vitulus/running/map_layers.pkl', 'wb') as output:
+            pickle.dump(self.map_layers, output, pickle.HIGHEST_PROTOCOL)
+        with open('/home/vitulus/.vitulus/running/map_poly_list.pkl', 'wb') as output:
+            pickle.dump(self.map_poly_list, output, pickle.HIGHEST_PROTOCOL)
+        with open('/home/vitulus/.vitulus/running/map_zone_list.pkl', 'wb') as output:
+            pickle.dump(self.map_zone_list, output, pickle.HIGHEST_PROTOCOL)
+
+    def load_running_data(self):
+        with open('/home/vitulus/.vitulus/running/map_layers.pkl', 'rb') as input:
+            self.map_layers = pickle.load(input)
+        with open('/home/vitulus/.vitulus/running/map_poly_list.pkl', 'rb') as input:
+            self.map_poly_list = pickle.load(input)
+        with open('/home/vitulus/.vitulus/running/map_zone_list.pkl', 'rb') as input:
+            self.map_zone_list = pickle.load(input)
+
 
     def marker_arr_publisher(self):
-        zone = self.map_zone_list.get_zone(name='Zone')
+        zone = self.current_zone
         if zone is not None:
             self.marker_arr_pub.publish(zone.paths_list.coverage_paths_marker_array)
 
     def marker_publisher(self):
         points = []
-        zone = self.map_zone_list.get_zone(name='Zone')
+        zone = self.current_zone
         if zone is not None:
             for path in zone.paths_list.paths:
                 if path.path_type in ['border', 'obstacle']:
@@ -1224,18 +1267,27 @@ class MapEditor():
         self.marker_pub.publish(marker)
 
     def path_show_publisher(self):
-        if self.map_zone_list.get_zone("Zone") is not None:
-            for path in self.map_zone_list.get_zone("Zone").paths_list.paths:
-                print("*************************************")
-                print("Path type: {}".format(path.type))
-                print("Path len: {}".format(path.path.poses.__len__()))
+        if self.current_zone is not None:
+            for path in self.current_zone.paths_list.paths:
+                # print("*************************************")
+                # print("Path type: {}".format(path.type))
+                # print("Path len: {}".format(path.path.poses.__len__()))
                 if path.type == MapSpec.COVERAGE_PATH:
                     self.path_show_pub.publish(path.path)
+                    # print("*************************************")
+                    # print("Path type: {}".format(path.type))
+                    # print("Path path_type: {}".format(path.path_type))
+                    # print("Path len: {}".format(path.path.poses.__len__()))
+        else:
+            msg = Path()
+            msg.header.stamp = rospy.Time.now()
+            msg.header.frame_id = "map"
+            self.path_show_pub.publish(msg)
 
 
-    def poly_show_publisher(self, name):
-        if self.map_zone_list.get_zone(name) is not None:
-            zone = self.map_zone_list.get_zone(name)
+    def poly_show_publisher(self):
+        if self.current_zone is not None:
+            zone = self.current_zone
             for path in zone.paths_list.paths:
                 if path.path_type in ['border', 'obstacle']:
                     msg = PolygonStamped()
@@ -1247,9 +1299,17 @@ class MapEditor():
                     msg.polygon = msg_poly
 
     def log_pub_publisher(self, log_txt):
-        msg = String()
-        msg.data = log_txt
-        self.log_pub.publish(msg)
+        # msg = String()
+        # msg.data = log_txt
+        # self.log_pub.publish(msg)
+        MapLog.LOG_TEXT = log_txt
+
+    def log_pub_msg_publisher(self, event=False):
+        if MapLog.LOG_PREVIOUS != MapLog.LOG_TEXT:
+            msg = String()
+            msg.data = MapLog.LOG_TEXT
+            self.log_pub.publish(msg)
+            MapLog.LOG_PREVIOUS = MapLog.LOG_TEXT
 
     def map_poly_list_publisher(self):
         self.map_poly_list_pub.publish(self.map_poly_list.get_poly_list_msg())
@@ -1272,6 +1332,17 @@ class MapEditor():
         map_msg.data = np_arr.tolist()
         self.map_show_pub.publish(map_msg)
 
+    def callback_selected_zone(self, msg):
+        if msg.data == "cancel**cancel**":
+            self.np_show = self.map_layers.layer_assembled.np_layer
+            self.current_zone = None
+        else:
+            zone = self.map_zone_list.get_zone(msg.data)
+            if zone is not None:
+                self.current_zone = zone
+                self.log_pub_publisher("Zone {} selected.".format(msg.data))
+                self.np_show = self.map_layers.layer_assembled.np_layer
+
     def callback_map_remove_zone(self, msg):
         self.map_zone_list.remove_zone(msg.data)
         self.map_zone_list_publisher()
@@ -1282,11 +1353,14 @@ class MapEditor():
 
     def callback_map_save_zone(self, msg):
         self.log_pub_publisher("Prepare zone {}.".format(msg.name))
-        map_zone = MapZone(msg, self.map_layers.layer_assembled.np_layer, self.initial_map, self.log_pub_publisher)
+        # map_zone = MapZone(msg, self.map_layers.layer_assembled.np_layer, self.initial_map, self.log_pub_publisher)
+        map_zone = MapZone(msg, self.map_layers.layer_assembled.np_layer, self.initial_map)
         self.map_zone_list.add_zone(map_zone)
         self.map_zone_list_publisher()
-        self.np_show = map_zone.np_border
+        # self.np_show = map_zone.np_border
+        self.current_zone = None
         self.log_pub_publisher("Zone {} saved.".format(msg.name))
+        self.save_running_data()
 
     def callback_map_remove_poly(self, msg):
         self.map_poly_list.remove_poly(msg.data)
@@ -1295,6 +1369,7 @@ class MapEditor():
         # Assemble map light
         self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled_light.np_layer
+        self.save_running_data()
 
     def callback_map_save_poly(self, msg):
         map_poly = MapPolygon(msg, self.map_layers.layer_original.np_map, self.initial_map)
@@ -1304,6 +1379,7 @@ class MapEditor():
         self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled_light.np_layer
         self.log_pub_publisher("Polygon {} saved.".format(msg.name))
+        self.save_running_data()
 
     def callback_map_reload(self, msg):
         self.map_poly_list_publisher()
@@ -1333,6 +1409,7 @@ class MapEditor():
         self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled.np_layer
         self.log_pub_publisher("Map assembled.")
+        self.save_running_data()
 
     def callback_show_map_layer(self, msg):
         print("Show map layer: ", msg.data)
@@ -1344,15 +1421,20 @@ class MapEditor():
             self.np_show = self.map_layers.layer_obstacles_poly.np_layer
         elif msg.data == "free_poly":
             self.np_show = self.map_layers.layer_free_poly.np_layer
-        # elif msg.data == "coverage_path":
-        #     self.np_show = self.np_coverage_path
+        elif msg.data == "assembled_lite":
+            self.np_show = self.map_layers.layer_assembled_light.np_layer
         # elif msg.data == "border_path":
         #     self.np_show = self.np_border_path
         elif msg.data == "original":
             self.np_show = self.map_layers.layer_original.np_map
         elif msg.data == "assembled":
             self.np_show = self.map_layers.layer_assembled.np_layer
-
+        elif msg.data == "zone_map":
+            if self.current_zone is not None:
+                self.np_show = self.current_zone.np_zone
+        elif msg.data == "zone_border_path":
+            if self.current_zone is not None:
+                self.np_show = self.current_zone.np_border
     def free_fill_unk(self):
         self.map_layers.layer_free.reset_layer()
         for i in range(0, self.free_fill_count):
@@ -1375,6 +1457,7 @@ class MapEditor():
         self.map_layers.assemble_map_light(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled_light.np_layer
         self.log_pub_publisher("Fill free finished.")
+        self.save_running_data()
 
     def reset_inflation_layer(self):
         self.map_layers.layer_increase_obstacles.reset_layer()
@@ -1405,6 +1488,7 @@ class MapEditor():
         self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled.np_layer
         self.log_pub_publisher("Draw obstacle margin finished.")
+        self.save_running_data()
 
     def callback_map(self, msg):
         self.initial_map = msg
@@ -1418,8 +1502,19 @@ class MapEditor():
         rospy.loginfo(rospy.get_caller_id() + " Heigth in (m): %s", self.initial_map.info.height * self.initial_map.info.resolution)
         arr = np.array(self.initial_map.data, dtype=np.int8)
         arr = arr.reshape((self.initial_map.info.height, self.initial_map.info.width))
-        np.set_printoptions(threshold=sys.maxsize)
-        self.map_layers.init_layers(arr)
+        # self.np_show = arr
+        # self.map_layers.init_layers(arr)
+        # self.map_poly_list = MapPolygonList()
+        # self.map_zone_list = MapZoneList()
+        try:
+            self.load_running_data()
+            rospy.loginfo('Planner data loaded')
+        except:
+            self.map_layers.init_layers(arr)
+            self.map_poly_list = MapPolygonList()
+            self.map_zone_list = MapZoneList()
+            rospy.loginfo('New planner data created')
+        self.np_show = self.map_layers.layer_original.np_layer
 
 def map_test():
     rospy.init_node('map_edit', anonymous=True)
@@ -1430,10 +1525,11 @@ def map_test():
     while not rospy.is_shutdown():
         if map_edit.np_show is not None:
             map_edit.map_publisher(map_edit.np_show)
-        map_edit.poly_show_publisher("Zone")
+        map_edit.poly_show_publisher()
         map_edit.path_show_publisher()
         map_edit.marker_publisher()
         map_edit.marker_arr_publisher()
+        # map_edit.log_pub_msg_publisher()
         rate.sleep()
 
 if __name__ == '__main__':

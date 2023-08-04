@@ -1047,7 +1047,6 @@ class MapLayer():
         arr_result.fill(MapSpec.UNKNOWN)
         arr_result = np.where(self.np_map == MapSpec.UNKNOWN, self.poly_color, arr_result)
         r = 0
-        print(self.poly_color)
         for row in self.np_layer:
             c = 0
             for col in row:
@@ -1058,8 +1057,33 @@ class MapLayer():
                                                                         self.np_layer[r - 1:r + 2, c - 1:c + 2])
                 c = c + 1
             r = r + 1
-        print("Obstacle incerased")
         self.np_layer = np.copy(arr_result)
+
+    def fill_unknown(self):
+        arr_result = np.zeros_like(self.np_layer, dtype=np.int8)
+        arr = self.np_layer
+        r = 0
+        for row in arr:
+            c = 0
+            for col in row:
+                arr_result[r, c] = col
+                if r > 1 and c > 1 and r < len(arr) - 1 and c < len(row) - 1:
+                    if col == -1:
+                        fill = 0
+                        if arr[r - 1, c] == 0:
+                            fill += 1
+                        if arr[r + 1, c] == 0:
+                            fill += 1
+                        if arr[r, c - 1] == 0:
+                            fill += 1
+                        if arr[r, c + 1] == 0:
+                            fill += 1
+                        if fill >= 2:
+                            arr_result[r, c] = 0
+                c = c + 1
+            r = r + 1
+        self.np_layer = arr_result
+
 
 
 class MapLayerList:
@@ -1153,19 +1177,9 @@ class MapEditor():
         self.free_fill_count = 0
         self.np_show = None
         self.layer_to_show = MapSpec.LAYER_ASSEMBLED
-        self.np_initial_map = None
         self.distance = 5
-        self.np_filled = None
-        self.np_obstacles = None
-        self.np_coverage_path = None
-        self.np_border_path = None
-        self.np_polygons = None
         self.map_poly_list = MapPolygonList()
         self.map_zone_list = MapZoneList()
-        # self.unusable = 100
-        # self.border_path1 = 125
-        # self.border_path2 = 124
-        # self.border_path_infill = 50
 
     def marker_arr_publisher(self):
         zone = self.map_zone_list.get_zone(name='Zone')
@@ -1283,7 +1297,7 @@ class MapEditor():
         self.np_show = self.map_layers.layer_assembled_light.np_layer
 
     def callback_map_save_poly(self, msg):
-        map_poly = MapPolygon(msg, self.np_filled, self.initial_map)
+        map_poly = MapPolygon(msg, self.map_layers.layer_original.np_map, self.initial_map)
         self.map_poly_list.add_poly(map_poly)
         self.map_poly_list_publisher()
         # Assemble map light
@@ -1296,20 +1310,13 @@ class MapEditor():
         self.map_zone_list_publisher()
 
     def callback_map_publish_polygon(self, msg):
-        # print("Publish polygon: ", msg)
-        print(self.initial_map.info.origin)
         resolution = self.initial_map.info.resolution
-        print("x: {} y: {}".format(int(self.initial_map.info.origin.position.x/resolution), int(self.initial_map.info.origin.position.y/resolution)))
-        print(np.shape(self.np_show))
-        print("Resolution: ", resolution)
         x_origin = -1 * int(self.initial_map.info.origin.position.x / resolution)
         y_origin = -1 * int(self.initial_map.info.origin.position.y / resolution)
-        print("x: {} y: {}".format(x_origin, y_origin))
         polygon = []
         for point in msg.polygon.points:
             x_point = int(point.x/resolution)
             y_point = int(point.y/resolution)
-            print("x: {} y: {}".format(x_origin + x_point, y_origin + y_point))
             if self.np_show is not None:
                 self.np_show[y_origin + y_point, x_origin + x_point] = 100
                 polygon.append([x_origin + x_point, y_origin + y_point])
@@ -1322,7 +1329,6 @@ class MapEditor():
 
 
     def callback_map_assemble(self, msg):
-        print("Assemble map: ", msg.data)
         self.increase_obstacles()
         self.map_layers.assemble_map(self.map_poly_list.get_free_poly_np_list(), self.map_poly_list.get_obstacles_poly_np_list())
         self.np_show = self.map_layers.layer_assembled.np_layer
@@ -1338,49 +1344,23 @@ class MapEditor():
             self.np_show = self.map_layers.layer_obstacles_poly.np_layer
         elif msg.data == "free_poly":
             self.np_show = self.map_layers.layer_free_poly.np_layer
-        elif msg.data == "coverage_path":
-            self.np_show = self.np_coverage_path
-        elif msg.data == "border_path":
-            self.np_show = self.np_border_path
+        # elif msg.data == "coverage_path":
+        #     self.np_show = self.np_coverage_path
+        # elif msg.data == "border_path":
+        #     self.np_show = self.np_border_path
         elif msg.data == "original":
             self.np_show = self.map_layers.layer_original.np_map
         elif msg.data == "assembled":
             self.np_show = self.map_layers.layer_assembled.np_layer
 
-    def fill_unknown(self, arr):
-        arr_result = np.zeros_like(arr)
-        r = 0
-        for row in arr:
-            c = 0
-            for col in row:
-                arr_result[r, c] = col
-                if r > 1 and c > 1 and r < len(arr) - 1 and c < len(row) - 1:
-                    if col == -1:
-                        fill = 0
-                        if arr[r - 1, c] == 0:
-                            fill += 1
-                        if arr[r + 1, c] == 0:
-                            fill += 1
-                        if arr[r, c - 1] == 0:
-                            fill += 1
-                        if arr[r, c + 1] == 0:
-                            fill += 1
-                        if fill >= 2:
-                            arr_result[r, c] = 0
-                c = c + 1
-            r = r + 1
-        return arr_result
-
     def free_fill_unk(self):
-        print("Fill unknown cells: ", self.free_fill_count)
         self.map_layers.layer_free.reset_layer()
         for i in range(0, self.free_fill_count):
             self.log_pub_publisher("Fill free round {}/{}".format(i+1, self.free_fill_count))
-            self.map_layers.layer_free.np_layer = self.fill_unknown(self.map_layers.layer_free.np_layer)
+            self.map_layers.layer_free.fill_unknown()
 
     def callback_free_fill_unk(self, msg):
         self.free_fill_count += msg.data
-        print("Fill unknown cells: ", msg.data)
         if msg.data == 0:
             self.free_fill_count = 0
         elif msg.data == 999:
@@ -1388,7 +1368,6 @@ class MapEditor():
         else:
             self.free_fill_count = msg.data
         self.free_fill_unk()
-
         # Refresh inflation layer with new free layer
         self.map_layers.layer_increase_obstacles.np_map = self.map_layers.layer_free.np_layer
         self.reset_inflation_layer()
@@ -1409,14 +1388,12 @@ class MapEditor():
         self.map_layers.layer_increase_obstacles.np_map = self.map_layers.layer_assembled_light.np_layer
 
     def increase_obstacles (self):
-        print("Increase obstacles: ", self.increase_obstacles_count)
         self.reset_inflation_layer()
         for i in range(0, self.increase_obstacles_count):
             self.log_pub_publisher("Draw obstacle margin round {}/{}".format(i + 1, self.increase_obstacles_count))
             self.map_layers.layer_increase_obstacles.increase_obstacles()
 
-    def callback_increase_obstacles (self, msg):
-        print("Increase obstacles: ", msg.data)
+    def callback_increase_obstacles(self, msg):
         if msg.data == 0:
             self.increase_obstacles_count = 0
         elif msg.data == 999:
@@ -1432,20 +1409,15 @@ class MapEditor():
     def callback_map(self, msg):
         self.initial_map = msg
         self.map_sub.unregister()
-        print('Map received')
+        rospy.loginfo('Map received')
         rospy.loginfo("[{}] Width: {} ".format(rospy.get_caller_id(), self.initial_map.info.width))
         rospy.loginfo(rospy.get_caller_id() + " Heigth: %s", self.initial_map.info.height)
         rospy.loginfo(rospy.get_caller_id() + " Resolution: %s", self.initial_map.info.resolution)
         rospy.loginfo(rospy.get_caller_id() + " Map load time: %s", self.initial_map.info.map_load_time)
         rospy.loginfo(rospy.get_caller_id() + " Width in (m): %s", self.initial_map.info.width * self.initial_map.info.resolution)
         rospy.loginfo(rospy.get_caller_id() + " Heigth in (m): %s", self.initial_map.info.height * self.initial_map.info.resolution)
-        print("Prepare array...")
         arr = np.array(self.initial_map.data, dtype=np.int8)
         arr = arr.reshape((self.initial_map.info.height, self.initial_map.info.width))
-        self.np_initial_map = arr
-        self.np_show = arr
-        self.np_filled = arr
-        self.np_obstacles = arr
         np.set_printoptions(threshold=sys.maxsize)
         self.map_layers.init_layers(arr)
 

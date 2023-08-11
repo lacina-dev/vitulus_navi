@@ -21,6 +21,8 @@ import math
 import pickle
 import resource
 import sys
+import geopandas as gpd
+import matplotlib.pyplot as plt
 
 print(resource.getrlimit(resource.RLIMIT_STACK))
 print(sys.getrecursionlimit())
@@ -45,12 +47,14 @@ class MapSpec:
     OBSTACLE = 100
     BORDER_PATH = 120
     BORDER_PATH_POINT = 130
-    BORDER_PATH2 = 121
+    BORDER_PATH2 = 121  # 121
     BORDER_PATH2_POINT = 131
     BORDER_PATH3 = 122
     BORDER_PATH3_POINT = 132
-    BORDER_PATH_INFILL = 50
+    BORDER_PATH_INFILL = 125
     COVERAGE_PATH = 190
+    BORDER_PATH_DONE = 249
+    BORDER_PATH_BEGIN = 40
 
     LAYER_ORIGINAL = 0
     LAYER_FREE = 1
@@ -63,6 +67,11 @@ class MapSpec:
     LAYER_ZONE = 8
     LAYER_BORDER_PATH = 9
     LAYER_COVERAGE_PATH = 10
+
+    PATH_TYPE_BORDER = 0
+    PATH_TYPE_OBSTACLE = 1
+    PATH_TYPE_COVERAGE = 2
+    PATH_TYPE_UNAVAILABLE = 3
 
 
 class MapPoint:
@@ -135,17 +144,17 @@ class MapPoint:
         self.neigh['down'] = map[self.r + 1, self.c]
         self.neigh['left'] = map[self.r, self.c - 1]
         self.neigh['right'] = map[self.r, self.c + 1]
-        if self.neigh['up'] in [self.type, 249] and self.neigh['down'] in [self.type, 249]:
+        if self.neigh['up'] in [self.type, MapSpec.BORDER_PATH_DONE] and self.neigh['down'] in [self.type, MapSpec.BORDER_PATH_DONE]:
             self.shape = "VR"
-        if self.neigh['left'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+        if self.neigh['left'] in [self.type, MapSpec.BORDER_PATH_DONE] and self.neigh['right'] in [self.type, MapSpec.BORDER_PATH_DONE]:
             self.shape = "HR"
-        if self.neigh['up'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+        if self.neigh['up'] in [self.type, MapSpec.BORDER_PATH_DONE] and self.neigh['right'] in [self.type, MapSpec.BORDER_PATH_DONE]:
             self.shape = "DL"
-        if self.neigh['up'] in [self.type, 249] and self.neigh['left'] in [self.type, 249]:
+        if self.neigh['up'] in [self.type, MapSpec.BORDER_PATH_DONE] and self.neigh['left'] in [self.type, MapSpec.BORDER_PATH_DONE]:
             self.shape = "DR"
-        if self.neigh['down'] in [self.type, 249] and self.neigh['right'] in [self.type, 249]:
+        if self.neigh['down'] in [self.type, MapSpec.BORDER_PATH_DONE] and self.neigh['right'] in [self.type, MapSpec.BORDER_PATH_DONE]:
             self.shape = "UL"
-        if self.neigh['down'] in [self.type, 249] and self.neigh['left'] in [self.type, 249]:
+        if self.neigh['down'] in [self.type, MapSpec.BORDER_PATH_DONE] and self.neigh['left'] in [self.type, MapSpec.BORDER_PATH_DONE]:
             self.shape = "UR"
 
     def get_pose(self):
@@ -185,40 +194,63 @@ class MapPath:
         self.points = []
         self.interval = 1
         self.polygon = geometry.Polygon()
+        self.polygon_original = geometry.Polygon()
         self.poly_coords = []
         self.area = 0
-        self.centroid = []
+        self.centroid = None
         self.path = Path()
+        self.group = 0
 
-    def make_polygon_from_points(self, resolution, simplify_limit=0.10, preserve_topology=True):
+    # def make_polygon_from_points(self, resolution, simplify_limit=0.10, preserve_topology=True):
+    def make_polygon_from_points(self, resolution, simplify_limit=0.00, preserve_topology=True):
 
         self.poly_coords = []
         for point in self.points:
             pose, pose_stamped, yaw = point.get_pose()
             self.poly_coords.append((pose.position.x + (resolution/2), pose.position.y + (resolution/2)))
-        self.polygon = geometry.Polygon(self.poly_coords)
-        print("**********************************************")
-        print("path id: {}".format(self.id))
-        print("Points: {}".format(len(self.polygon.exterior.coords)))
-        print("Area: {}".format(self.polygon.area))
-        print("Simplification...")
-        self.polygon = self.polygon.simplify(simplify_limit, preserve_topology=preserve_topology)
-        print("Points: {}".format(len(self.polygon.exterior.coords)))
-        print("Area: {}".format(self.polygon.area))
+        self.polygon_original = geometry.Polygon(self.poly_coords)
+        # print("**********************************************")
+        # print("path id: {}".format(self.id))
+        # print("Points: {}".format(len(self.polygon.exterior.coords)))
+        # print("Area: {}".format(self.polygon.area))
+        # print("Simplification...")
+        self.polygon = self.polygon_original.simplify(simplify_limit, preserve_topology=preserve_topology)
+        # print("Points: {}".format(len(self.polygon.exterior.coords)))
+        # print("Area: {}".format(self.polygon.area))
         self.area = self.polygon.area
+        centroid = self.polygon.centroid
         self.path.header.frame_id = 'map'
         self.path.header.stamp = rospy.Time.now()
 
 
 class MapPathList:
 
-    def __init__(self):
+    def __init__(self, np_template, resolution, x_origin, y_origin):
         self.paths = []
         self.multilines = []
         self.last_path_id = 0
+        self.np_template = np_template
+        self.resolution = resolution
+        self.x_origin = x_origin
+        self.y_origin = y_origin
         self.coverage_paths_marker_array = MarkerArray()
         # self.marker_arr_pub = rospy.Publisher("/marker_test", MarkerArray, queue_size=2)
         self.marker_array = MarkerArray()
+        self.obstacle_polygons = []
+        self.obstacle_polygons_obj = []
+        self.obstacle_polygons_cut = []
+        self.border_path_poly = None
+        self.border_path_poly_cut = None
+        self.zone_path_poly = None
+        self.zone_path_poly_cut = None
+        self.bounds = None
+        self.poly_of_border_zone = None
+        self.border_path_level = 0
+        self.mowed_area = 0.0
+        self.zone_path_poly_cut_list = []
+        self.zone_path_poly_list = []
+        self.border_path_poly_cut_list = []
+        self.border_path_poly_list = []
 
 
     # def marker_publisher(self):
@@ -259,8 +291,90 @@ class MapPathList:
     #     marker.points = points
     #     self.marker_pub.publish(marker)
 
-    def set_path_type(self):
+    def group_paths(self):
+        MapLog.LOG_TEXT = "Group border and obstacle paths by polygons..."
+        group = 2
+        for path in self.paths:
+            if path.path_type == MapSpec.PATH_TYPE_BORDER:  # all border to group 1
+                path.group = 1
+            if path.path_type == MapSpec.PATH_TYPE_OBSTACLE: # every obstacle from first border path to groups 2, 3, 4...
+                if path.type == MapSpec.BORDER_PATH:
+                    path.group = group
+                    group += 1
+        # asset obstacles from other border paths to groups by distance of centroids
+        min_dist = 0.3
+        for path in self.paths:
+            if path.path_type == MapSpec.PATH_TYPE_OBSTACLE:
+                if path.type in [MapSpec.BORDER_PATH2, MapSpec.BORDER_PATH3]:
 
+                    for assigned_path in self.paths:
+                        if assigned_path.path_type == MapSpec.PATH_TYPE_OBSTACLE:
+                            if assigned_path.type == MapSpec.BORDER_PATH:
+                                dist = assigned_path.polygon.centroid.distance(path.polygon.centroid)
+                                print("Dist: {}".format(dist))
+                                if dist < min_dist:
+                                    path.group = assigned_path.group
+
+        for path in self.paths:
+            print("Path id: {}, type: {}, path_type: {}, group: {}, area: {}".format(path.id, path.type, path.path_type, path.group, path.area))
+
+    def polygon_type_by_map(self, polygon, np_map):
+        polygon_type = None
+        np_poly = np.zeros_like(np_map, dtype=np.int8)
+        np_poly.fill(-1)
+        pol = []
+        for point in polygon.exterior.coords:
+            pol.append([self.x_origin + int(point[0] / self.resolution), self.y_origin + int(point[1] / self.resolution)])
+        pol = np.array(pol)
+        cv2.fillPoly(np_poly, pts=[pol], color=100)
+        avg_val = 0
+        i = 0
+        r = 0
+        for row in np_map:
+            c = 0
+            for col in row:
+                if np_poly[r, c] == 100:  # inside polygon
+                    val = np_map[r, c]
+                    if val not in [MapSpec.BORDER_PATH, MapSpec.BORDER_PATH2, MapSpec.BORDER_PATH3,
+                                   MapSpec.BORDER_PATH_INFILL, MapSpec.BORDER_PATH_POINT, MapSpec.BORDER_PATH2_POINT,
+                                   MapSpec.BORDER_PATH3_POINT, MapSpec.BORDER_PATH_DONE, MapSpec.BORDER_PATH_BEGIN]:
+                        # print(val)
+                        avg_val += val
+                        i += 1
+                c += 1
+            r += 1
+        if i > 0:
+            avg_val = avg_val / i
+        print("Avg val: {}".format(avg_val))
+
+        # cv2.namedWindow("map", cv2.WINDOW_GUI_NORMAL)
+        # cv2.imshow("map", np_poly)  # show numpy array
+        # cv2.waitKey(0)  # wait for ay key to exit window
+        # cv2.destroyAllWindows()  # close all windows
+        if avg_val > 98:
+            polygon_type = MapSpec.PATH_TYPE_OBSTACLE
+        if avg_val < 98:
+            polygon_type = MapSpec.PATH_TYPE_BORDER
+        return polygon_type
+
+    def show_poly_image(self, polygon):
+        np_poly = np.zeros_like(self.np_template, dtype=np.int8)
+        np_poly.fill(-1)
+        pol = []
+        for point in polygon.exterior.coords:
+            pol.append([self.x_origin + int(point[0] / self.resolution), self.y_origin + int(point[1] / self.resolution)])
+        pol = np.array(pol)
+        cv2.fillPoly(np_poly, pts=[pol], color=255)
+        cv2.namedWindow("poly", cv2.WINDOW_GUI_NORMAL)
+        cv2.imshow("poly", np_poly)  # show numpy array
+        cv2.waitKey(0)  # wait for ay key to exit window
+        cv2.destroyAllWindows()  # close all windows
+
+
+
+    def set_path_type(self, np_border):
+        MapLog.LOG_TEXT = "Set map path types..."
+        self.poly_of_border_zone = None
         path_types = [MapSpec.BORDER_PATH, MapSpec.BORDER_PATH2, MapSpec.BORDER_PATH3]
         for path_type_selected in path_types:
             print(path_type_selected)
@@ -268,181 +382,300 @@ class MapPathList:
             brd_path = None
             for path in self.paths:
                 if path.type == path_type_selected:
-                    path.path_type = 'obstacle'
+                    path.path_type = MapSpec.PATH_TYPE_OBSTACLE
                     if path.area > area:
                         area = path.area
                         brd_path = path
             print(brd_path)
             if brd_path is not None:
-                brd_path.path_type = 'border'
+                brd_path.path_type = MapSpec.PATH_TYPE_BORDER
+                if brd_path.type == MapSpec.BORDER_PATH:
+                    self.poly_of_border_zone = brd_path.polygon
+                    print("poly_of_border_zone: {}".format(self.poly_of_border_zone))
+
+        # Find unavailable polygons
+        for path in self.paths:
+            # print("path id {} type: {} path_type: {}".format(path.id, path.type, path.path_type))
+            if (path.path_type == MapSpec.PATH_TYPE_BORDER) and (path.type == MapSpec.BORDER_PATH):
+                pass
+            else:
+                # print("path {} is not main zone border".format(path.id))
+                if not self.poly_of_border_zone.contains(path.polygon):
+                    path.path_type = MapSpec.PATH_TYPE_UNAVAILABLE
+                    # print("path {} is unavailable".format(path.id))
+
+
 
         print("len: {}".format(len(self.paths)))
         for path in self.paths:
-            print("id: {} type: {} path_type: {} area: {}".format(path.id, path.type, path.path_type, path.area))
-            if path.path_type == 'border':
-                print("border path polygon: {}".format(path.polygon))
+            print("*************************************************")
+            print("id: {} type: {} path_type: {} area: {} length:{}".format(path.id, path.type, path.path_type, path.area, path.polygon.length))
+            path.path_type = self.polygon_type_by_map(path.polygon_original, np_border)
+            if path.path_type == MapSpec.PATH_TYPE_BORDER and path.polygon.length < 0.8:
+                path.path_type = MapSpec.PATH_TYPE_UNAVAILABLE
+            print("id: {} type: {} path_type: {} area: {} length:{}".format(path.id, path.type, path.path_type, path.area, path.polygon.length))
+            # if path.path_type == MapSpec.PATH_TYPE_BORDER:
+            #     print("border path polygon: {}".format(path.polygon))
 
-    def make_coverage_lines(self, angle, line_distance, margin=0.10):
 
-        MapLog.LOG_TEXT = "make_coverage_lines"
+    def prepare_polygons(self, margin=0.10):
+        MapLog.LOG_TEXT = "Make polygon geometries from map..."
         # get boundary of border polygon
+        self.bounds = self.poly_of_border_zone.bounds
+        # print("bounds: {}".format(bounds))
+
+        # Select top border level
+        self.border_path_level = 0
         for path in self.paths:
-            if path.type == MapSpec.BORDER_PATH and path.path_type == 'border':
-                border_path_poly = path.polygon
-        print("border_path_poly: {}".format(border_path_poly))
-        bounds = border_path_poly.bounds
-        print("bounds: {}".format(bounds))
-        border_path_poly_cut = border_path_poly.buffer(-margin)
+            if path.type in [MapSpec.BORDER_PATH, MapSpec.BORDER_PATH2, MapSpec.BORDER_PATH3]:
+                if path.type > self.border_path_level:
+                    self.border_path_level = path.type  # select max border path used for zone
+
+        # Select border polygons
+        self.border_path_poly_list = []
+        for path in self.paths:
+            if path.type == self.border_path_level and path.path_type == MapSpec.PATH_TYPE_BORDER:
+                if not path.polygon.buffer(-margin).is_empty:
+                    if path.polygon.buffer(-margin).geom_type == 'Polygon':
+                        print("Polygon is not empty")
+                        self.border_path_poly_list.append(path.polygon)
+                    else:
+                        print("It is multipolygon")
+                        self.show_poly_image(path.polygon)
+                        for pol in path.polygon.buffer(-margin).geoms:
+                            self.show_poly_image(pol)
+                            self.border_path_poly_list.append(pol.buffer(margin))
+                else:
+                    print("Polygon is empty")
+
+        # prepare border polygons for cut coverage lines
+        self.border_path_poly_cut_list = []
+        for poly in self.border_path_poly_list:
+            self.border_path_poly_cut_list.append(poly.buffer(-margin))
+
 
         # get obstacle polygons
-        obstacle_polygons = []
-        obstacle_polygons_obj = []
-        obstacle_polygons_cut = []
+        self.obstacle_polygons = []
+        self.obstacle_polygons_obj = []
+        self.obstacle_polygons_cut = []
         for path in self.paths:
-            if path.type == MapSpec.BORDER_PATH and path.path_type == 'obstacle':
-                obstacle_polygons.append(path.polygon.exterior.coords)
-                obstacle_polygons_obj.append(path.polygon)
+            if path.type == self.border_path_level and path.path_type == MapSpec.PATH_TYPE_OBSTACLE:
+                self.obstacle_polygons.append(path.polygon.exterior.coords)
+                self.obstacle_polygons_obj.append(path.polygon)
+                print("Geometry type: {}".format(path.polygon.geom_type))
                 obst_poly_cut = path.polygon.buffer(margin)
-                obstacle_polygons_cut.append(obst_poly_cut.exterior.coords)
-        print("obstacle_polygons: {}".format(obstacle_polygons))
+                print("Geometry type: {}".format(obst_poly_cut.geom_type))
+                self.obstacle_polygons_cut.append(obst_poly_cut.exterior.coords)
+        # print("obstacle_polygons: {}".format(obstacle_polygons))
 
-        # polygon of zone borders with obstacles as holes
-        zone_path_poly = geometry.Polygon(border_path_poly.exterior.coords, obstacle_polygons)
-        zone_path_poly_cut = geometry.Polygon(border_path_poly_cut.exterior.coords, obstacle_polygons_cut)
-        print("zone_path_poly: {}".format(zone_path_poly))
-        max_length = 0.5 + shapely.distance(geometry.Point(bounds[0], bounds[1]), geometry.Point(bounds[2], bounds[3]))
-        print("max_length: {}".format(max_length))
+        # polygons of zone borders with obstacles as holes
+        self.zone_path_poly_list = []
+        for poly in self.border_path_poly_list:
+            self.zone_path_poly_list.append(geometry.Polygon(poly.exterior.coords, self.obstacle_polygons))
+        # self.zone_path_poly = geometry.Polygon(self.border_path_poly.exterior.coords, self.obstacle_polygons)
 
-        # Create lines for coverage
-        length = max_length
-        line_distance = line_distance / 100  # cm to m
-        start = geometry.Point(bounds[0], bounds[1], 0.0)
-        end = geometry.Point(start.x + length, start.y, 0.0)
-        line_list = []
-        line_count = int(length / line_distance)
-        for i in range(0, line_count):
-            line = geometry.LineString([start, end])
-            line_list.append(line)
-            start = geometry.Point(start.x, start.y + line_distance, 0.0)
-            end = geometry.Point(end.x, end.y + line_distance, 0.0)
-        multiline = geometry.MultiLineString(line_list)
+        # polygons of zone borders with obstacles as holes for cut coverage lines
+        self.zone_path_poly_cut_list = []
+        for poly in self.border_path_poly_cut_list:
+            self.zone_path_poly_cut_list.append(geometry.Polygon(poly.exterior.coords, self.obstacle_polygons_cut))
+        # self.zone_path_poly_cut = geometry.Polygon(self.border_path_poly_cut.exterior.coords, self.obstacle_polygons_cut)
 
-        # center with border polygon
-        move_x = zone_path_poly.centroid.x - multiline.centroid.x
-        move_y = zone_path_poly.centroid.y - multiline.centroid.y
-        multiline = affinity.translate(multiline, xoff=move_x, yoff=move_y, zoff=0)
+    def get_mowed_area(self):
+        MapLog.LOG_TEXT = "Calculate mowed area..."
+        self.mowed_area = 0.0
+        for path in self.paths:
+            if path.type == MapSpec.BORDER_PATH:
+                if path.path_type == MapSpec.PATH_TYPE_BORDER:
+                    poly = path.polygon.buffer(MapSpec.COVERAGE_DIAMETER / 2)
+                    self.mowed_area += poly.area
+                if path.path_type == MapSpec.PATH_TYPE_OBSTACLE:
+                    poly = path.polygon.buffer(-(MapSpec.COVERAGE_DIAMETER / 2))
+                    self.mowed_area -= poly.area
+        return self.mowed_area
 
-        # rotate lines
-        multiline = affinity.rotate(multiline, angle, origin="center", use_radians=False)
 
-        # cut lines to fit the polygon outer border
-        multiline = shapely.ops.split(multiline, zone_path_poly_cut)
-
-        # remove lines out of the zone
-        line_list = []
-        for line in multiline.geoms:
-            if shapely.contains_properly(border_path_poly, line):
-                line_list.append(line)
-        multiline = geometry.MultiLineString(line_list)
-
-        # Remove lines in obstacle polygons
-        line_list = []
-        for line in multiline.geoms:
-            hit = False
-            for poly in obstacle_polygons_obj:
-                if shapely.intersects(poly.buffer(margin - 0.00001), line):
-                    hit = True
-            if not hit:
-                line_list.append(line)
-        multiline = geometry.MultiLineString(line_list)
-
-        # Remove short lines
-        line_list = []
-        for line in multiline.geoms:
-            print("line: {}".format(line))
-            print("line.length: {}".format(line.length))
-            if line.length > 0.15:
-                line_list.append(line)
-        multiline = geometry.MultiLineString(line_list)
+    def make_coverage_lines(self, angle, line_distance, margin=0.10):
+        MapLog.LOG_TEXT = "Create coverage paths..."
+        # print("zone_path_poly: {}".format(zone_path_poly))
+        max_length = 0.5 + shapely.distance(geometry.Point(self.bounds[0], self.bounds[1]), geometry.Point(self.bounds[2], self.bounds[3]))
+        # print("max_length: {}".format(max_length))
 
         self.marker_array = MarkerArray()
 
-        # connect lines by nearest point of lines around /////////////////////////////////////////////////
-        line_list = []
-        for line in multiline.geoms:
-            line_list.append([[line.coords[0][0], line.coords[0][1]], [line.coords[1][0], line.coords[1][1]]])
-        np_lines = np.array(line_list)
+        self.multilines = []
+        line_distance = line_distance / 100  # cm to m
+        # For every border polygon
+        print("border_path_poly_list: {}".format(self.border_path_poly_list))
+        print("border_path_poly_list len: {}".format(len(self.border_path_poly_list)))
+        for i in range(0, len(self.border_path_poly_list)):
+            print("i = {}".format(i))
 
-        line_list = []
-        x = bounds[0]
-        y = bounds[3]
-        point = geometry.Point(x, y)
-        i_all = 0
-        multilines = []
-        direction = True  # True: forward, False: backward
-        dir_last = None  # True: forward, False: backward
-        while True:
-            nearest_line = None
-            distance = 9999999
-            i = 0
-            i_line = 0
-            # Find the nearest line from point
-            for line in np_lines:
-                begin_point = geometry.Point([line[0][0], line[0][1]])
-                end_point = geometry.Point([line[1][0], line[1][1]])
-                if begin_point.distance(point) < distance:
-                    distance = begin_point.distance(point)
-                    nearest_line = line
-                    direction = True
-                    i_line = i
-                if end_point.distance(point) < distance:
-                    distance = end_point.distance(point)
-                    nearest_line = [line[1], line[0]]  # reverse line
-                    direction = False
-                    i_line = i
-                i = i + 1
 
-            print("*****************************************************")
-            if nearest_line is not None:  # if any nearest line available
-                conn_line = geometry.LineString([[point.x, point.y], [nearest_line[0][0], nearest_line[0][1]]])
-                print("conn_line length: {}".format(conn_line.length))
-                # is_cross = self.is_crossing_multiline(multilines, conn_line, obstacle_polygons_obj, border_path_poly)
-                is_cross = self.is_crossing_check(conn_line, obstacle_polygons_obj, border_path_poly)
-                print("is_cross: {}".format(is_cross))
-                # if 0.0 < conn_line.length and not is_cross and dir_last is not None and dir_last != direction:  # if the line is not crossing, connect
-                if not is_cross:  # if the line is not crossing, connect
-                    print("if the line is not crossing, connect")
-                    line_list.append(conn_line)
-                    line_list.append(geometry.LineString(nearest_line))
-                else:  # if the line is crossing, close cell
-                    print("if the line is crossing, close cell")
-                    multilines.append(geometry.MultiLineString(line_list))
-                    line_list = []
-                    line_list.append(geometry.LineString(nearest_line))
+            # Create lines for coverage
+            length = max_length
 
-                point = geometry.Point([nearest_line[1][0], nearest_line[1][1]])
-                np_lines = np.delete(np_lines, [i_line], 0)
-                dir_last = direction
-                i_all = i_all + 1
+            start = geometry.Point(self.bounds[0], self.bounds[1], 0.0)
+            end = geometry.Point(start.x + length, start.y, 0.0)
+            line_list = []
+            line_count = int(length / line_distance)
+            print("line_distance: {}".format(line_distance))
+            print("length: {}".format(length))
+            print("line_count: {}".format(line_count))
+            for n in range(0, line_count):
+                line = geometry.LineString([start, end])
+                line_list.append(line)
+                start = geometry.Point(start.x, start.y + line_distance, 0.0)
+                end = geometry.Point(end.x, end.y + line_distance, 0.0)
+            multiline = geometry.MultiLineString(line_list)
 
-            else:
-                break
-        multilines.append(geometry.MultiLineString(line_list))
-        self.multilines = multilines
+            # center with border polygon
+            # move_x = self.zone_path_poly_list[i].centroid.x - multiline.centroid.x
+            # move_y = self.zone_path_poly_list[i].centroid.y - multiline.centroid.y
+            move_x = self.poly_of_border_zone.centroid.x - multiline.centroid.x
+            move_y = self.poly_of_border_zone.centroid.y - multiline.centroid.y
+            multiline = affinity.translate(multiline, xoff=move_x, yoff=move_y, zoff=0)
+
+            # rotate lines
+            multiline = affinity.rotate(multiline, angle, origin="center", use_radians=False)
+
+
+            print("multiline: {}".format(len(multiline.geoms)))
+
+            # cut lines to fit the polygon outer border
+            multiline = shapely.ops.split(multiline, self.zone_path_poly_cut_list[i])
+            print("multiline - cut lines to fit the polygon outer border: {}".format(len(multiline.geoms)))
+            self.show_poly_image(self.zone_path_poly_cut_list[i])
+            multi_list = []
+            for line in multiline.geoms:
+                print("line: {}".format(line))
+                print("line coords: {}".format(line.coords))
+                print("line: {}".format(line.coords[0][0]))
+                xy_line = geometry.LineString([(line.coords[0][0], line.coords[0][1]), (line.coords[1][0], line.coords[1][1])] )
+                multi_list.append(xy_line)
+            # gdf = gpd.GeoDataFrame(geometry=multi_list)
+            # gdf.head()
+            # gdf.plot("sssss")
+            p = gpd.GeoSeries(multi_list + [self.zone_path_poly_cut_list[i]])
+            p.plot()
+            plt.show()
+
+            # remove lines out of the zone
+            line_list = []
+            for line in multiline.geoms:
+                if shapely.contains_properly(self.border_path_poly_list[i], line):
+                    line_list.append(line)
+            multiline = geometry.MultiLineString(line_list)
+            print("multiline: {}".format(len(multiline.geoms)))
+            self.show_poly_image(self.border_path_poly_list[i])
+
+            # Remove lines in obstacle polygons
+            line_list = []
+            for line in multiline.geoms:
+                hit = False
+                for poly in self.obstacle_polygons_obj:
+                    if shapely.intersects(poly.buffer(margin - 0.00001), line):
+                        hit = True
+                if not hit:
+                    line_list.append(line)
+            multiline = geometry.MultiLineString(line_list)
+            print("multiline: {}".format(len(multiline.geoms)))
+
+            # Remove short lines
+            line_list = []
+            for line in multiline.geoms:
+                # print("line: {}".format(line))
+                # print("line.length: {}".format(line.length))
+                if line.length > 0.15:
+                    line_list.append(line)
+            multiline = geometry.MultiLineString(line_list)
+            print("multiline: {}".format(len(multiline.geoms)))
+
+            self.show_poly_image(self.border_path_poly_list[i])
+            # connect lines by nearest point of lines around /////////////////////////////////////////////////
+            line_list = []
+            for line in multiline.geoms:
+                line_list.append([[line.coords[0][0], line.coords[0][1]], [line.coords[1][0], line.coords[1][1]]])
+            np_lines = np.array(line_list)
+
+            line_list = []
+            x = self.bounds[0]
+            y = self.bounds[3]
+            point = geometry.Point(x, y)
+            i_all = 0
+            multilines = []
+            direction = True  # True: forward, False: backward
+            dir_last = None  # True: forward, False: backward
+            while True:
+                nearest_line = None
+                distance = 9999999
+                ni = 0
+                i_line = 0
+                # Find the nearest line from point
+                for line in np_lines:
+                    begin_point = geometry.Point([line[0][0], line[0][1]])
+                    end_point = geometry.Point([line[1][0], line[1][1]])
+                    if begin_point.distance(point) < distance:
+                        distance = begin_point.distance(point)
+                        nearest_line = line
+                        direction = True
+                        i_line = ni
+                    if end_point.distance(point) < distance:
+                        distance = end_point.distance(point)
+                        nearest_line = [line[1], line[0]]  # reverse line
+                        direction = False
+                        i_line = ni
+                    ni = ni + 1
+
+                # print("*****************************************************")
+                if nearest_line is not None:  # if any nearest line available
+                    conn_line = geometry.LineString([[point.x, point.y], [nearest_line[0][0], nearest_line[0][1]]])
+                    print("conn_line length: {}".format(conn_line.length))
+                    # is_cross = self.is_crossing_multiline(multilines, conn_line, obstacle_polygons_obj, border_path_poly)
+                    is_cross = self.is_crossing_check(conn_line, self.obstacle_polygons_obj, self.border_path_poly_list[i])
+                    # print("is_cross: {}".format(is_cross))
+                    # if 0.0 < conn_line.length and not is_cross and dir_last is not None and dir_last != direction:  # if the line is not crossing, connect
+                    if not is_cross:  # if the line is not crossing, connect
+                        # print("if the line is not crossing, connect")
+                        line_list.append(conn_line)
+                        line_list.append(geometry.LineString(nearest_line))
+                    else:  # if the line is crossing, close cell
+                        # print("if the line is crossing, close cell")
+                        multilines.append(geometry.MultiLineString(line_list))
+                        line_list = []
+                        line_list.append(geometry.LineString(nearest_line))
+
+                    point = geometry.Point([nearest_line[1][0], nearest_line[1][1]])
+                    np_lines = np.delete(np_lines, [i_line], 0)
+                    dir_last = direction
+                    i_all = i_all + 1
+
+                else:
+                    break
+                # multilines.append(geometry.MultiLineString(line_list))
+            multilines.append(geometry.MultiLineString(line_list))
+            self.multilines += multilines
+
+
+
+
+
+
 
         # Create Marker msg for multilines
-        self.multiline_list_to_marker(multilines)
+        print("Multilines: {} lines".format(len(self.multilines)))
+        print("Multilines: {}".format(self.multilines))
+        self.multiline_list_to_marker(self.multilines)
 
         # Create path from coverage lines
         path = MapPath()
         path.type = MapSpec.COVERAGE_PATH
-        path.path_type = 'coverage'
+        path.path_type = MapSpec.PATH_TYPE_COVERAGE
         path.id = self.last_path_id + 1
         self.last_path_id = self.last_path_id + 1
         path.path.header.frame_id = "map"
         path.path.header.stamp = rospy.Time.now()
 
-        for multiline in multilines:
+        for multiline in self.multilines:
             for line in multiline.geoms:
                 angle = self.direction(line.coords)
                 for point in line.coords:
@@ -766,9 +999,9 @@ class MapZone:
         self.y_origin = -1 * int(msg_map.info.origin.position.y / self.resolution)
         self.np_polygon = []
         self.get_map_layer()
-        self.compute_area()
+        # self.compute_area()
         self.draw_border_paths()
-        self.paths_list = MapPathList()
+        self.paths_list = MapPathList(self.np_border, self.resolution, self.x_origin, self.y_origin)
         self.get_paths()
 
     def log_publisher(self, log_txt):
@@ -787,6 +1020,15 @@ class MapZone:
 
     def draw_poly(self):
         self.polygon_to_np()
+        # make zone polygon smaller by cut_margin_dist
+        shape_poly = geometry.Polygon(self.np_polygon)
+        cut_margin_dist = int(round((MapSpec.COVERAGE_DIAMETER / 2)/self.resolution))
+        shape_poly = shape_poly.buffer(-cut_margin_dist)
+        pointarray = []
+        for point in shape_poly.exterior.coords:
+            pointarray.append([int(point[0]), int(point[1])])
+        self.np_polygon = np.array(pointarray)
+        # draw polygon on map layer
         cv2.fillPoly(self.np_poly, pts=[self.np_polygon], color=MapSpec.FREE)
 
     def compute_area(self):
@@ -809,7 +1051,7 @@ class MapZone:
         arr_result = np.zeros_like(self.np_border, dtype=np.int8)
         arr_result.fill(MapSpec.UNKNOWN)
         r = 0
-        print(color)
+        # print(color)
         reliable_types = [MapSpec.BORDER_PATH, MapSpec.BORDER_PATH2, MapSpec.BORDER_PATH3,
                           MapSpec.BORDER_PATH_INFILL, MapSpec.OBSTACLE]
         for row in self.np_border:
@@ -828,7 +1070,7 @@ class MapZone:
         self.np_border = np.copy(arr_result)
 
     def draw_border_paths(self):
-        print("Draw border paths: ", self.msg.border_paths)
+        # print("Draw border paths: ", self.msg.border_paths)
         self.log_publisher("Draw border paths".format())
         self.np_border = np.copy(self.np_zone)
         if self.msg.border_paths == 1:
@@ -892,7 +1134,7 @@ class MapZone:
             point.c = next_p_c
             point.position_rc = [point.r, point.c]
             point.get_neighbours_types(self.np_border)
-            self.np_border[point.r, point.c] = np.array(249).astype(dtype=np.int8)
+            self.np_border[point.r, point.c] = np.array(MapSpec.BORDER_PATH_DONE).astype(dtype=np.int8)
             direction = 'nn'
             try:
                 direction = list(point.neigh.keys())[list(point.neigh.values()).index(point.type)]
@@ -968,9 +1210,6 @@ class MapZone:
                 self.paths_list.last_path_id = path_id
                 path_id = path_id + 1
 
-        self.log_publisher("Set path type.".format())
-        self.paths_list.set_path_type()
-
         for path in self.paths_list.paths:
             path.points[-1].conn_next = path.points[0]
 
@@ -978,9 +1217,17 @@ class MapZone:
                 point.set_yaw_to_next()
                 self.np_border[point.r, point.c] = path.type
                 if point.id == 0:
-                    self.np_border[point.r, point.c] = 40
+                    self.np_border[point.r, point.c] = MapSpec.BORDER_PATH_BEGIN
 
+        self.log_publisher("Set path type...".format())
+        self.paths_list.set_path_type(self.np_border)
+        self.paths_list.prepare_polygons()
+        self.msg.area = int(round(self.paths_list.get_mowed_area()))
+        self.log_publisher("Create coverage path...".format())
         self.paths_list.make_coverage_lines(self.msg.coverage_angle, self.msg.paths_distance)
+        self.log_publisher("Group paths by origin...".format())
+        self.paths_list.group_paths()
+
 
 class MapZoneList():
 
@@ -1212,16 +1459,16 @@ class MapEditor():
             pickle.dump(self.map_layers, output, pickle.HIGHEST_PROTOCOL)
         with open('/home/vitulus/.vitulus/running/map_poly_list.pkl', 'wb') as output:
             pickle.dump(self.map_poly_list, output, pickle.HIGHEST_PROTOCOL)
-        with open('/home/vitulus/.vitulus/running/map_zone_list.pkl', 'wb') as output:
-            pickle.dump(self.map_zone_list, output, pickle.HIGHEST_PROTOCOL)
+        # with open('/home/vitulus/.vitulus/running/map_zone_list.pkl', 'wb') as output:
+        #     pickle.dump(self.map_zone_list, output, pickle.HIGHEST_PROTOCOL)
 
     def load_running_data(self):
         with open('/home/vitulus/.vitulus/running/map_layers.pkl', 'rb') as input:
             self.map_layers = pickle.load(input)
         with open('/home/vitulus/.vitulus/running/map_poly_list.pkl', 'rb') as input:
             self.map_poly_list = pickle.load(input)
-        with open('/home/vitulus/.vitulus/running/map_zone_list.pkl', 'rb') as input:
-            self.map_zone_list = pickle.load(input)
+        # with open('/home/vitulus/.vitulus/running/map_zone_list.pkl', 'rb') as input:
+        #     self.map_zone_list = pickle.load(input)
 
 
     def marker_arr_publisher(self):
@@ -1234,7 +1481,7 @@ class MapEditor():
         zone = self.current_zone
         if zone is not None:
             for path in zone.paths_list.paths:
-                if path.path_type in ['border', 'obstacle']:
+                if path.path_type in [MapSpec.PATH_TYPE_BORDER, MapSpec.PATH_TYPE_OBSTACLE]:
                     line_start = None
                     for point in shapely.get_coordinates(path.polygon.exterior):
                         if line_start == None:
@@ -1289,7 +1536,7 @@ class MapEditor():
         if self.current_zone is not None:
             zone = self.current_zone
             for path in zone.paths_list.paths:
-                if path.path_type in ['border', 'obstacle']:
+                if path.path_type in [MapSpec.PATH_TYPE_BORDER, MapSpec.PATH_TYPE_OBSTACLE]:
                     msg = PolygonStamped()
                     msg.header.stamp = rospy.Time.now()
                     msg.header.frame_id = "map"
@@ -1353,7 +1600,6 @@ class MapEditor():
 
     def callback_map_save_zone(self, msg):
         self.log_pub_publisher("Prepare zone {}.".format(msg.name))
-        # map_zone = MapZone(msg, self.map_layers.layer_assembled.np_layer, self.initial_map, self.log_pub_publisher)
         map_zone = MapZone(msg, self.map_layers.layer_assembled.np_layer, self.initial_map)
         self.map_zone_list.add_zone(map_zone)
         self.map_zone_list_publisher()
@@ -1502,10 +1748,12 @@ class MapEditor():
         rospy.loginfo(rospy.get_caller_id() + " Heigth in (m): %s", self.initial_map.info.height * self.initial_map.info.resolution)
         arr = np.array(self.initial_map.data, dtype=np.int8)
         arr = arr.reshape((self.initial_map.info.height, self.initial_map.info.width))
-        # self.np_show = arr
+
         # self.map_layers.init_layers(arr)
         # self.map_poly_list = MapPolygonList()
         # self.map_zone_list = MapZoneList()
+        # rospy.loginfo('New planner data created')
+
         try:
             self.load_running_data()
             rospy.loginfo('Planner data loaded')
@@ -1514,6 +1762,8 @@ class MapEditor():
             self.map_poly_list = MapPolygonList()
             self.map_zone_list = MapZoneList()
             rospy.loginfo('New planner data created')
+        self.map_zone_list = MapZoneList()
+
         self.np_show = self.map_layers.layer_original.np_layer
 
 def map_test():

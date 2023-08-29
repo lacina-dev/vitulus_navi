@@ -166,7 +166,7 @@ def main():
 
                 # Callback for mower set cut height WAIT_FOR_SET_RPM
                 def callback_set_rpm(userdata, msg):
-                    if msg.moto_rpm == userdata.zone_rpm:
+                    if userdata.zone_rpm - 10 < msg.moto_rpm < userdata.zone_rpm + 10:
                         return False
                     else:
                         return True

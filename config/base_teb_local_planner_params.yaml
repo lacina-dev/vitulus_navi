@@ -17,10 +17,10 @@ TebLocalPlannerROS:
 
  # Robot
 
- max_vel_x: 0.75 # Vitulus max is 0,42332961 m/s, for slow use 0.1, for fast use 0.42
- max_vel_x_backwards: 0.75 # Vitulus max is 0,42332961 m/s, for slow use 0.05, for fast use 0.42
+ max_vel_x: 0.5 # Vitulus max is 0,42332961 m/s, for slow use 0.1, for fast use 0.42
+ max_vel_x_backwards: 0.5 # Vitulus max is 0,42332961 m/s, for slow use 0.05, for fast use 0.42
  max_vel_theta: 1.2 #  0.75   Vitulus max is 1,801402596 rad/s, for slow use 0.1, for fast use 5.0 1.8
- acc_lim_x: 0.75 # 1.5     0.5
+ acc_lim_x: 0.5 # 1.5     0.5
  acc_lim_theta: 1.0 # 2.0     0.5,  5.0
  min_turning_radius: 0.0 # 0.6
  footprint_model: # types: "point", "circular", "two_circles", "line", "polygon"

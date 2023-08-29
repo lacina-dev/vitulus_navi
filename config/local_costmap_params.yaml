@@ -191,7 +191,10 @@ local_costmap:
   #  - {name: voxel_layer, type: "costmap_2d::NonPersistentVoxelLayer"}
   #  - {name: voxel_layer, type: "costmap_2d::VoxelLayer"}
   #  - {name: voxel_layer, type: "rtabmap_ros::VoxelLayer"}
-    - {name: laser_layer,      type: "costmap_2d::NonPersistentVoxelLayer"}
+
+#    - {name: laser_layer,      type: "costmap_2d::NonPersistentVoxelLayer"}
+    - {name: laser_layer,      type: "costmap_2d::VoxelLayer"}
+
   #  - {name: clear_layer,  type: "costmap_2d::ObstacleLayer"}
     - {name: rgbd_obstacle_layer, type: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"}
     - {name: inflation_layer,  type: "costmap_2d::InflationLayer"}

@@ -17,18 +17,20 @@
 
 <!--    <include file="$(find vitulus_slam)/launch/rtabmap.launch" pass_all_args="true">-->
 <!--    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" pass_all_args="true">-->
-    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_outdoor.launch" pass_all_args="true">
+
+<!--     <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_outdoor.launch" pass_all_args="true" />-->
+
 <!--    <include file="$(find vitulus_slam)/launch/vitulus_rtabmap4wd.launch" pass_all_args="true">-->
 <!--    <include file="$(find vitulus_slam)/launch/rtabmap_t265.launch" pass_all_args="true">-->
         <!-- arg name="multi_robot_name" value="$(arg multi_robot_name)"/ -->
-    </include>
+<!--     </include> -->
 
     <include file="$(find vitulus_navi)/launch/obstacles.launch">
-        <!-- arg name="multi_robot_name" value="$(arg multi_robot_name)"/ -->
+        arg name="multi_robot_name" value="$(arg multi_robot_name)"/
     </include>
 
-<!--    <include file="$(find vitulus_navi)/launch/vitulus_navi.launch">-->
-<!--    </include>-->
+   <include file="$(find vitulus_navi)/launch/vitulus_navi_mbf.launch">
+   </include>
 
 
 

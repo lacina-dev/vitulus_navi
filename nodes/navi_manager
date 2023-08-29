@@ -104,11 +104,11 @@ def callback_new_interactive_marker(msg):
     int_marker.name = "webgui_marker"
     int_marker.description = "Marker for webUI"
 
-    int_marker.pose.position = msg.position;
-    int_marker.pose.orientation.x = 0;
-    int_marker.pose.orientation.y = 0;
-    int_marker.pose.orientation.z = 0;
-    int_marker.pose.orientation.w = 1;
+    int_marker.pose.position = msg.position
+    int_marker.pose.orientation.x = 0
+    int_marker.pose.orientation.y = 0
+    int_marker.pose.orientation.z = 0
+    int_marker.pose.orientation.w = 1
 
     global interactive_marker_pose
     interactive_marker_pose = int_marker.pose
@@ -137,7 +137,7 @@ def callback_new_interactive_marker(msg):
     rotate_control.name = "rotate_z"
     rotate_control.interaction_mode = InteractiveMarkerControl.ROTATE_AXIS
     rotate_control.always_visible = False
-    int_marker.controls.append(rotate_control);
+    int_marker.controls.append(rotate_control)
     global server
     server.insert(int_marker, interactiveMarkerFeedback)
     server.applyChanges()
@@ -353,13 +353,13 @@ def set_odom_transform():
 
     static_transformStamped.transform.rotation.w = 1
 
-    static_transformStamped.transform.translation.x = odom_gps_msg.pose.pose.position.x
-    static_transformStamped.transform.translation.y = odom_gps_msg.pose.pose.position.y
-    static_transformStamped.transform.translation.z = odom_gps_msg.pose.pose.position.z
-    static_transformStamped.transform.rotation.x = odom_imu_msg.pose.pose.orientation.x
-    static_transformStamped.transform.rotation.y = odom_imu_msg.pose.pose.orientation.y
-    static_transformStamped.transform.rotation.z = odom_imu_msg.pose.pose.orientation.z
-    static_transformStamped.transform.rotation.w = odom_imu_msg.pose.pose.orientation.w
+    # static_transformStamped.transform.translation.x = odom_gps_msg.pose.pose.position.x
+    # static_transformStamped.transform.translation.y = odom_gps_msg.pose.pose.position.y
+    # static_transformStamped.transform.translation.z = odom_gps_msg.pose.pose.position.z
+    # static_transformStamped.transform.rotation.x = odom_imu_msg.pose.pose.orientation.x
+    # static_transformStamped.transform.rotation.y = odom_imu_msg.pose.pose.orientation.y
+    # static_transformStamped.transform.rotation.z = odom_imu_msg.pose.pose.orientation.z
+    # static_transformStamped.transform.rotation.w = odom_imu_msg.pose.pose.orientation.w
     tf2_TransformBroadcaster.sendTransform(static_transformStamped)
     odom_msg = Odometry()
     odom_msg.header.stamp = rospy.Time.now()
@@ -394,10 +394,11 @@ def set_map_utm_transform():
         m_x = 0
         m_y = 0
         if running_map_data.is_utm():
-            m_x = trans.transform.translation.x - running_map_data.utm_x
-            m_y = trans.transform.translation.y - running_map_data.utm_y
-            m_orientation_z = running_map_data.utm_orientation_z
-            m_orientation_w = running_map_data.utm_orientation_w
+            pass
+            # m_x = trans.transform.translation.x - running_map_data.utm_x
+            # m_y = trans.transform.translation.y - running_map_data.utm_y
+            # m_orientation_z = running_map_data.utm_orientation_z
+            # m_orientation_w = running_map_data.utm_orientation_w
         else:
             m_orientation_z = 0
             m_orientation_w = 1
@@ -1057,7 +1058,7 @@ def navi_manager():
         string_msg.data = params['load_map_on_start']
         callback_load_map(string_msg, init=True)
         # shutil.copyfile("/home/vitulus/RtabmapMaps/" + params['load_map_on_start'] + ".db", "/home/vitulus/.ros/rtabmap.db")
-        # rospy.loginfo("Map " + params['load_map_on_start'] + " loaded.")
+        rospy.loginfo("Map " + params['load_map_on_start'] + " loaded.")
         # navi_launch = start_navi_launch(["localization:=true"])
 
     # global dyn_reconfig_client

@@ -4,13 +4,13 @@ global_costmap:
   robot_base_frame: base_link
 #  robot_base_frame: t265_link
 #  robot_base_frame: t265_pose_frame
-  update_frequency: 10.0
-  publish_frequency: 10.0
-#  static_map: false
+  update_frequency: 1.5  # 3.0
+  publish_frequency: 1.5  # 3.0
+  static_map: true
   plugins:
     - name: static_layer
       type: "costmap_2d::StaticLayer"
-    - name: static_layer
+    - name: inflation_layer
       type: "costmap_2d::InflationLayer"
 #
 

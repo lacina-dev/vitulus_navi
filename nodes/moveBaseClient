@@ -25,7 +25,8 @@ class moveBaseClient():
         self.status_pub = rospy.Publisher('move_base_client/state', String, queue_size=10)
         self.poses_list = []
         self.current_goal = 0
-        self.client = actionlib.SimpleActionClient('move_base',MoveBaseAction)
+        self.client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+        # self.client = actionlib.SimpleActionClient('move_base_flex', MoveBaseAction)
         rospy.loginfo("Waiting for action server...")
         wait = self.client.wait_for_server(rospy.Duration(10.0))
         if not wait:
@@ -35,7 +36,8 @@ class moveBaseClient():
         rospy.loginfo("Waiting for new task ...")
         self.status = "READY"
         self.goals_arr_sub = rospy.Subscriber("/waypoint_list", Path, self.callback_new_goals)
-        self.navi_goals_arr_sub = rospy.Subscriber("/move_base_client/goals_arr", Path, self.callback_new_navi_goals)
+        # self.navi_goals_arr_sub = rospy.Subscriber("/move_base_client/goals_arr", Path, self.callback_new_navi_goals)
+        self.navi_goals_arr_sub = rospy.Subscriber("/coverage_path", Path, self.callback_new_navi_goals)
 
 
     def callback_new_goals(self, msg):

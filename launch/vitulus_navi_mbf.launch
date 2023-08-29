@@ -9,23 +9,33 @@
     <!--- Run AMCL -->
 
   <!--- We load ACML here with diff=true to support our differential drive robot -->
-  <!-- include file="$(find amcl)/examples/amcl_diff.launch" / -->
-<!--<node name="move_base_legacy_relay" pkg="mbf_costmap_nav" type="move_base_legacy_relay.py"/>-->
-   <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
-<!--   <node name="move_base_flex" pkg="mbf_costmap_nav" type="mbf_costmap_nav" respawn="false">-->
+<!--  < include file="$(find amcl)/examples/amcl_diff.launch" />-->
+<!--  <node name="move_base_legacy_relay" pkg="mbf_costmap_nav" type="move_base_legacy_relay.py">-->
+<!--    <param name="base_global_planner" value="global_planner/GlobalPlanner" />-->
+<!--    <param name="planner_frequency" value="1.0" />-->
+<!--    <param name="planner_patience" value="5.0" />-->
+<!--    <param name="base_local_planner" value="base_local_planner/TrajectoryPlannerROS" />-->
+<!--    <param name="controller_frequency" value="10.0" />-->
+<!--    <remap from="cmd_vel" to="/cmd_vel"/>-->
+<!--    <remap from="odom" to="/odometry/odom"/>-->
+<!--    <remap from="map" to="/map_assembled"/>-->
+
+
+<!--  </node>-->
+<!--    <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen"> -->
+  <node name="move_base_flex" pkg="mbf_costmap_nav" type="mbf_costmap_nav" respawn="false" output="screen">-->
     <rosparam file="$(find vitulus_navi)/config/costmap_common_params.yaml" command="load" ns="global_costmap" />
     <rosparam file="$(find vitulus_navi)/config/costmap_common_params.yaml" command="load" ns="local_costmap" />
     <rosparam file="$(find vitulus_navi)/config/local_costmap_params.yaml" command="load" />
     <rosparam file="$(find vitulus_navi)/config/global_costmap_params.yaml" command="load" />
     <rosparam file="$(find vitulus_navi)/config/move_base.yaml" command="load"/>
     <rosparam file="$(find vitulus_navi)/config/base_teb_local_planner_params.yaml" command="load" />
+<!--    <rosparam file="$(find vitulus_navi)/config/base_local_planner_params.yaml" command="load" />-->
     <rosparam file="$(find vitulus_navi)/config/global_planner_params.yaml" command="load" />
+
 <!--    <rosparam file="$(find vitulus_navi)/config/carrot_planner_params.yaml" command="load" />-->
-    <rosparam file="$(find vitulus_navi)/config/sbpl_lattice_planner_params.yaml" command="load" />
-
-
-
-<!--    <param name="base_global_planner" value="navfn/NavfnROS" />-->
+<!--     <rosparam file="$(find vitulus_navi)/config/sbpl_lattice_planner_params.yaml" command="load" /> -->
+   <!--    <param name="base_global_planner" value="navfn/NavfnROS" />-->
     <param name="base_global_planner" value="global_planner/GlobalPlanner" />
 <!--    <param name="base_global_planner" value="carrot_planner/CarrotPlanner" />-->
 <!--    <param name="base_global_planner" value="SBPLLatticePlanner" />-->
@@ -34,7 +44,10 @@
 		<param name="planner_patience" value="5.0" />
 
     <param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS" />
+<!--    <param name="base_local_planner" value="base_local_planner/TrajectoryPlannerROS" />-->
     <param name="controller_frequency" value="10.0" />
+
+    <param name="cmd_vel_ignored_tolerance" value="-1" />
 
 
     <remap from="cmd_vel" to="/cmd_vel"/>
@@ -43,10 +56,18 @@
 
 <!--    <remap from="map" to="/rtabmap/grid_map"/>-->
 <!--    <remap from="map" to="/map_fill"/>-->
-    <remap from="map" to="/map"/>
+<!--     <remap from="map" to="/map"/> -->
+    <remap from="map" to="/map_assembled"/>
+
+
+
 
 
  </node>
+<!-- <node name="move_base_legacy_relay" pkg="mbf_costmap_nav" type="move_base_legacy_relay.py">-->
+<!--&lt;!&ndash;     <rosparam file="$(find turtlebot3_mbf)/param/default_planner.yaml" command="load"/> &ndash;&gt;-->
+
+<!--  </node>-->
 
 
 

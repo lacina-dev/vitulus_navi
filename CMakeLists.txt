@@ -11,6 +11,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   std_msgs
+  costmap_2d
 )
 
 ## System dependencies are found with CMake's conventions
@@ -110,7 +111,7 @@ catkin_package(
 )
 
 catkin_package(
-  CATKIN_DEPENDS roscpp rospy std_msgs turtlebot3_msgs
+  CATKIN_DEPENDS roscpp rospy std_msgs turtlebot3_msgs costmap_2d
 )
 
 ###########

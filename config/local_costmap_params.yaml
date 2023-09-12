@@ -146,6 +146,7 @@ local_costmap:
      enabled: true
      observation_sources: laser_scan_clear laser_scan
      track_unknown_space: true
+     publish_voxel_map:     true
 
      laser_scan: {sensor_frame: base_scan,
                          data_type: LaserScan,
@@ -155,7 +156,7 @@ local_costmap:
                          observation_persistence: 0.0,
                          max_obstacle_height: 0.5,
                          min_obstacle_height: 0.0,
-                         obstacle_range: 4.0,
+                         obstacle_range: 2.0,
                          raytrace_range: 12.0,
                          expected_update_rate: 0.2,
                          track_unknown_space: true,

@@ -23,6 +23,7 @@ from tf.transformations import euler_from_quaternion
 from tf import TransformListener
 from tf import listener
 from geometry_msgs.msg import TransformStamped
+import docker
 
 from std_srvs.srv import EmptyRequest, Empty
 from dynamic_reconfigure.srv import Reconfigure, ReconfigureRequest, ReconfigureResponse
@@ -50,6 +51,105 @@ import math
 
 
 
+class DockerConnection:
+
+    def __init__(self, cont_name):
+        self.client = docker.from_env()
+        self.cont_name = cont_name
+        self.cont = None
+        self.cont_command = None
+
+    def stop(self):
+        try:
+            tst_cont = self.client.containers.get(self.cont_name)
+        except:
+            tst_cont = None
+        if tst_cont is not None:
+            tst_cont.stop()
+            tst_cont.remove()
+        while True:
+            try:
+                self.client.containers.get(self.cont_name)
+                time.sleep(0.3)
+            except:
+                break
+        return True
+
+    def run(self, command):
+        self.cont_command = command
+        self.stop()
+        # self.cont = self.client.containers.run("introlab3it/rtabmap_ros:noetic-latest", auto_remove=False, detach=True,
+        self.cont = self.client.containers.run("vitulus/rtabmap_ros:noetic-latest", auto_remove=False, detach=True,
+                                    # environment=["ROS_HOME=/tmp/.ros", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "ROS_DISTRO=noetic", "TARGETPLATFORM=linux/amd64", "DEBIAN_FRONTEND=noninteractive", "LD_LIBRARY_PATH=:/usr/lib/aarch64-linux-gnu/tegra"],
+                                    environment=["ROS_HOME=/tmp/.ros"],
+                                    # command=["roslaunch /rtabmap_docker/vitulus_rtabmap_outdoor.launch"],
+                                    command=self.cont_command,
+                                    volumes={"/home/vitulus/catkin_ws/src/rtabmap_docker": {"bind": "/rtabmap_docker", "mode": "rw"}, "/home/vitulus/.ros": {"bind": "/tmp/.ros", "mode": "rw"}},
+                                    entrypoint="/ros_entrypoint.sh",
+                                    user="vitulus", network_mode="host", privileged=True,
+                                    name=self.cont_name)
+
+
+
+# def run_rtabmap_docker():
+#     print("##############################################################################################")
+#
+#     client = docker.from_env()
+#
+#     for contik in client.containers.list(all=True):
+#         print(contik)
+#     # rtabmap_cont = client.containers.get('rtabmap_custom_launch')
+#     # rtabmap_cont.stop()
+#     # rtabmap_cont.start()
+#     rtabmap_obstacles = client.containers.get('rtabmap_obstacles_launch')
+#     rtabmap_obstacles.stop()
+#     rtabmap_obstacles.start()
+#
+#     cont_name = "RTABMAP_TEST"
+#     try:
+#         tst_cont = client.containers.get(cont_name)
+#     except:
+#         tst_cont = None
+#     print("tsr_cont: {}".format(tst_cont))
+#     if tst_cont is not None:
+#         tst_cont.stop()
+#         tst_cont.remove()
+#     while True:
+#         try:
+#             tst_cont = client.containers.get(cont_name)
+#             time.sleep(0.3)
+#         except:
+#             break
+#
+#     tst_cont = client.containers.run("introlab3it/rtabmap_ros:noetic-latest", auto_remove=False, detach=False,
+#                                 # environment=["ROS_HOME=/tmp/.ros", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "ROS_DISTRO=noetic", "TARGETPLATFORM=linux/amd64", "DEBIAN_FRONTEND=noninteractive", "LD_LIBRARY_PATH=:/usr/lib/aarch64-linux-gnu/tegra"],
+#                                 environment=["ROS_HOME=/tmp/.ros"],
+#                                 command=["roslaunch", "/rtabmap_docker/vitulus_rtabmap_outdoor.launch"],
+#                                 volumes={"/home/vitulus/catkin_ws/src/rtabmap_docker": {"bind": "/rtabmap_docker", "mode": "rw"}, "/home/vitulus/.ros": {"bind": "/tmp/.ros", "mode": "rw"}},
+#                                 entrypoint="/ros_entrypoint.sh",
+#                                 user="root", network_mode="host", privileged=True,
+#                                 name=cont_name)
+#     # while True:
+#     #     available = False
+#     #     for contik in client.containers.list(all=False):
+#     #         print("Container: {}".format(contik.name))
+#     #         if contik.name == cont_name:
+#     #             print("Container {} is running.".format(contik.name))
+#     #             available = True
+#     #     if available:
+#     #         break
+#     #     time.sleep(0.3)
+#     #
+#     #
+#     # print(tst_cont.exec_run("source /opt/ros/noetic/setup.bash && roslaunch /rtabmap_docker/vitulus_rtabmap_outdoor.launch",
+#     #                         workdir="/rtabmap_docker", stream=False, demux=False, tty=True, privileged=True, user="root",
+#     #                         environment=["ROS_HOME=/tmp/.ros", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "ROS_DISTRO=noetic", "TARGETPLATFORM=linux/amd64", "DEBIAN_FRONTEND=noninteractive", "LD_LIBRARY_PATH=:/usr/lib/aarch64-linux-gnu/tegra"]
+#     #                         ))
+
+
+
+
+
 server = None
 interactive_marker_pose = Pose
 save_map_msg = String()
@@ -68,6 +168,28 @@ point_to_publish = ""
 path_to_publish = ""
 move_base_client_state = ""
 
+
+print("##############################################################################################")
+rtabmap_odom_sync = DockerConnection("RTABMAP_ODOM_SYNC")
+rtabmap_odom_sync.run(["roslaunch", "/rtabmap_docker/data_odom_sync.launch"])
+print(rtabmap_odom_sync.cont)
+
+rtabmap_mapping = DockerConnection("RTABMAP_MAPPING")
+# rtabmap_mapping.run(["roslaunch", "/rtabmap_docker/rtabmap_outdoor.launch"])
+print(rtabmap_mapping.cont)
+
+rtabmap_obstacles = DockerConnection("RTABMAP_OBSTACLES")
+rtabmap_obstacles.run(["roslaunch", "/rtabmap_docker/obstacles_detection.launch"])
+print(rtabmap_obstacles.cont)
+
+# rospy.signal_shutdown("Docker done.")
+print("##############################################################################################")
+
+
+
+
+
+
 map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
 waypoint_list_pub = rospy.Publisher('navi_manager/waypoint_list', Path, queue_size=10)
 status_msg_pub = rospy.Publisher('navi_manager/status', String, queue_size=10)
@@ -78,6 +200,7 @@ map_path_list_pub = rospy.Publisher('navi_manager/map_path_list', String, queue_
 map_path_pub = rospy.Publisher('navi_manager/map_path', Path, queue_size=10)
 map_path_goal_arr_pub = rospy.Publisher('move_base_client/goals_arr', Path, queue_size=10)
 oodometry_odom_pub = rospy.Publisher('odometry/odom', Odometry, queue_size=10)
+pose_cov_stamped_pub = rospy.Publisher('pose_cov_stamped', PoseWithCovarianceStamped, queue_size=10)
 
 tf = None
 tf2_Buffer = None
@@ -197,7 +320,7 @@ def get_waypoints():
     rospy.loginfo("Published {} waypoints.".format(len(msg.poses)))
 
 
-def start_navi_launch(args = []):
+def start_navi_launch(args=[]):
     status_msg_pub.publish("Starting navi module...")
     print(sys.argv)
     sys.argv = [sys.argv[0]]
@@ -212,6 +335,9 @@ def start_navi_launch(args = []):
     launch = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/launch_navi.launch"])
     launch.start()
 
+    # global rtabmap_mapping
+    rtabmap_mapping.run(["roslaunch", "/rtabmap_docker/rtabmap_outdoor.launch"] + args)
+
     rospy.loginfo("Vitulus navi started.")
     status_msg_pub.publish("Vitulus navi started.")
     return launch
@@ -220,6 +346,7 @@ def start_navi_launch(args = []):
 def shutdown_navi_launch():
     status_msg_pub.publish("Stopping navi module.")
     navi_launch.shutdown()
+    rtabmap_mapping.stop()
     rospy.loginfo("Vitulus navi stopped.")
     status_msg_pub.publish("Vitulus navi stopped.")
 
@@ -353,13 +480,14 @@ def set_odom_transform():
 
     static_transformStamped.transform.rotation.w = 1
 
-    # static_transformStamped.transform.translation.x = odom_gps_msg.pose.pose.position.x
-    # static_transformStamped.transform.translation.y = odom_gps_msg.pose.pose.position.y
-    # static_transformStamped.transform.translation.z = odom_gps_msg.pose.pose.position.z
-    # static_transformStamped.transform.rotation.x = odom_imu_msg.pose.pose.orientation.x
-    # static_transformStamped.transform.rotation.y = odom_imu_msg.pose.pose.orientation.y
-    # static_transformStamped.transform.rotation.z = odom_imu_msg.pose.pose.orientation.z
-    # static_transformStamped.transform.rotation.w = odom_imu_msg.pose.pose.orientation.w
+    static_transformStamped.transform.translation.x = odom_gps_msg.pose.pose.position.x
+    static_transformStamped.transform.translation.y = odom_gps_msg.pose.pose.position.y
+    static_transformStamped.transform.translation.z = odom_gps_msg.pose.pose.position.z
+    static_transformStamped.transform.rotation.x = odom_imu_msg.pose.pose.orientation.x
+    static_transformStamped.transform.rotation.y = odom_imu_msg.pose.pose.orientation.y
+    static_transformStamped.transform.rotation.z = odom_imu_msg.pose.pose.orientation.z
+    static_transformStamped.transform.rotation.w = odom_imu_msg.pose.pose.orientation.w
+
     tf2_TransformBroadcaster.sendTransform(static_transformStamped)
     odom_msg = Odometry()
     odom_msg.header.stamp = rospy.Time.now()
@@ -375,6 +503,24 @@ def set_odom_transform():
 
 
     oodometry_odom_pub.publish(odom_msg)
+
+    pose_cov_stamped = PoseWithCovarianceStamped()
+    pose_cov_stamped.header.stamp = rospy.Time.now()
+    pose_cov_stamped.header.frame_id = "odom"
+    pose_cov_stamped.pose.pose.position.x = static_transformStamped.transform.translation.x
+    pose_cov_stamped.pose.pose.position.y = static_transformStamped.transform.translation.y
+    pose_cov_stamped.pose.pose.position.z = static_transformStamped.transform.translation.z
+    pose_cov_stamped.pose.pose.orientation.x = static_transformStamped.transform.rotation.x
+    pose_cov_stamped.pose.pose.orientation.y = static_transformStamped.transform.rotation.y
+    pose_cov_stamped.pose.pose.orientation.z = static_transformStamped.transform.rotation.z
+    pose_cov_stamped.pose.pose.orientation.w = static_transformStamped.transform.rotation.w
+    pose_cov_stamped.pose.covariance = [0.1, 0, 0, 0, 0, 0,
+                                        0, 0.1, 0, 0, 0, 0,
+                                        0, 0, 0.1, 0, 0, 0,
+                                        0, 0, 0, 0.1, 0, 0,
+                                        0, 0, 0, 0, 0.1, 0,
+                                        0, 0, 0, 0, 0, 0.1]
+    pose_cov_stamped_pub.publish(pose_cov_stamped)
 
 
 def set_map_utm_transform():
@@ -395,10 +541,10 @@ def set_map_utm_transform():
         m_y = 0
         if running_map_data.is_utm():
             pass
-            # m_x = trans.transform.translation.x - running_map_data.utm_x
-            # m_y = trans.transform.translation.y - running_map_data.utm_y
-            # m_orientation_z = running_map_data.utm_orientation_z
-            # m_orientation_w = running_map_data.utm_orientation_w
+            m_x = trans.transform.translation.x - running_map_data.utm_x
+            m_y = trans.transform.translation.y - running_map_data.utm_y
+            m_orientation_z = running_map_data.utm_orientation_z
+            m_orientation_w = running_map_data.utm_orientation_w
         else:
             m_orientation_z = 0
             m_orientation_w = 1
@@ -992,6 +1138,9 @@ def callback_odom_filtered_map(msg):
 
 
 
+    print("##############################################################################################")
+
+
 def navi_manager():
     with open(r'/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/config/navi_manager.yaml') as file:
         # The FullLoader parameter handles the conversion from YAML
@@ -1067,8 +1216,6 @@ def navi_manager():
 
     # rospy.wait_for_service('/set_pose_map')
     # set_map_utm_transform()
-
-
 
 
 

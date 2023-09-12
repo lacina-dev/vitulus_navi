@@ -2,7 +2,8 @@
 
 
   <!-- Run the map server -->
-  <arg name="map_file" default="$(find vitulus_navi)/config/maps/gridmap.yaml"/>
+<!--  <arg name="map_file" default="$(find vitulus_navi)/config/maps/gridmap.yaml"/>-->
+  <arg name="map_file" default="$(find vitulus_navi)/config/maps/Garden_09_2023.yaml"/>
 <!--   <arg name="map_file" default="$(find vitulus_navi)/config/maps/map_show.yaml"/> -->
   <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_file)" >
   </node>

@@ -20,6 +20,8 @@
 <!--    <remap from="odom" to="/odometry/odom"/>-->
 <!--    <remap from="map" to="/map_assembled"/>-->
 
+<!-- work around for footprint reload -->
+  <rosparam command="delete" ns="move_base_flex" />
 
 <!--  </node>-->
 <!--    <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen"> -->
@@ -30,22 +32,30 @@
     <rosparam file="$(find vitulus_navi)/config/global_costmap_params.yaml" command="load" />
     <rosparam file="$(find vitulus_navi)/config/move_base.yaml" command="load"/>
     <rosparam file="$(find vitulus_navi)/config/base_teb_local_planner_params.yaml" command="load" />
-<!--    <rosparam file="$(find vitulus_navi)/config/base_local_planner_params.yaml" command="load" />-->
+    <rosparam file="$(find vitulus_navi)/config/base_local_planner_params.yaml" command="load" />
+    <rosparam file="$(find vitulus_navi)/config/dwa_local_planner_params.yaml" command="load" />
+    <rosparam file="$(find vitulus_navi)/config/graceful_controller_params.yaml" command="load" />
+    <rosparam file="$(find vitulus_navi)/config/neo_local_planner_params.yaml" command="load" />
     <rosparam file="$(find vitulus_navi)/config/global_planner_params.yaml" command="load" />
 
 <!--    <rosparam file="$(find vitulus_navi)/config/carrot_planner_params.yaml" command="load" />-->
 <!--     <rosparam file="$(find vitulus_navi)/config/sbpl_lattice_planner_params.yaml" command="load" /> -->
    <!--    <param name="base_global_planner" value="navfn/NavfnROS" />-->
-    <param name="base_global_planner" value="global_planner/GlobalPlanner" />
+
+<!--    <param name="base_global_planner" value="global_planner/GlobalPlanner" />-->
+
 <!--    <param name="base_global_planner" value="carrot_planner/CarrotPlanner" />-->
 <!--    <param name="base_global_planner" value="SBPLLatticePlanner" />-->
 <!--        <param name="SBPLLatticePlanner/primitive_filename" value="$(find vitulus_navi)/config/mprm05.mprim" />-->
-		<param name="planner_frequency" value="1.0" />
-		<param name="planner_patience" value="5.0" />
 
-    <param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS" />
+<!--		<param name="planner_frequency" value="1.0" />-->
+<!--		<param name="planner_patience" value="5.0" />-->
+
+<!--    <param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS" />-->
+
 <!--    <param name="base_local_planner" value="base_local_planner/TrajectoryPlannerROS" />-->
-    <param name="controller_frequency" value="10.0" />
+
+<!--    <param name="controller_frequency" value="10.0" />-->
 
     <param name="cmd_vel_ignored_tolerance" value="-1" />
 
@@ -57,7 +67,8 @@
 <!--    <remap from="map" to="/rtabmap/grid_map"/>-->
 <!--    <remap from="map" to="/map_fill"/>-->
 <!--     <remap from="map" to="/map"/> -->
-    <remap from="map" to="/map_assembled"/>
+<!--    <remap from="map" to="/map_assembled"/>-->
+    <remap from="map" to="/map_edited"/>
 
 
 

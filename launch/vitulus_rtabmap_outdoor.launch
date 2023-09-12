@@ -150,7 +150,7 @@
 <!--        </node>-->
 
     <!--    <node name="rtabmap" pkg="rtabmap_ros" type="rtabmap" output="screen" args="&#45;&#45;delete_db_on_start">       -->
-        <node name="rtabmap" pkg="rtabmap_slam" type="rtabmap" output="screen" args="$(arg rtabmap_args) --Rtabmap/DetectionRate 2"> <!-- delete_db_on_start Rtabmap/DetectionRate 10-->
+        <node name="rtabmap" pkg="rtabmap_slam" type="rtabmap" output="screen" args="$(arg rtabmap_args) --Rtabmap/DetectionRate 5 -- delete_db_on_start"> <!-- delete_db_on_start Rtabmap/DetectionRate 10-->
 <!--            <remap from="odom" to="/odometry/filtered/local_base"/>-->
             <remap from="odom" to="/rtabmap/odom_out"/>
 <!--            <remap from="scan" to="/scan"/>-->

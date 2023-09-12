@@ -1,7 +1,4 @@
 
-#planners:
-#  - name: GlobalPlanner
-#    type: global_planner/GlobalPlanner
 
 planners:
 #  - name: NavfnROS
@@ -14,17 +11,24 @@ planners:
 #    type: SBPLLatticePlanner
 
 controllers:
+  - name: GracefulControllerROS
+    type: graceful_controller/GracefulControllerROS
+#  - name: NeoLocalPlanner
+#    type: neo_local_planner/NeoLocalPlanner
+  - name: DWAPlannerROS
+    type: dwa_local_planner/DWAPlannerROS
   - name: TebLocalPlannerROS
     type: teb_local_planner/TebLocalPlannerROS
+  - name: TrajectoryPlannerROS
+    type: base_local_planner/TrajectoryPlannerROS
 
-#controllers:
-#  - name: TrajectoryPlannerROS
-#    type: base_local_planner/TrajectoryPlannerROS
 
-controller_frequency: 10.0
+
+
+controller_frequency: 30.0
 controller_patience: 3.0
 
-planner_frequency: 1.0
+planner_frequency: 0.0
 planner_patience: 5.0
 
 oscillation_timeout: 10.0

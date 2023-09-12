@@ -1,0 +1,21 @@
+#submap_service: "/elevation_mapping/get_submap"
+submap_service: /elevation_mapping/get_raw_submap
+#submap_service: /elevation_mapping/get_submap
+#map_frame_id: odom     # Must be the same as the input elevation submap.
+map_frame_id: map     # Must be the same as the input elevation submap.
+robot_frame_id: base_link
+min_update_rate: 4
+#min_update_rate: 10
+update_rate: 6
+map_center_x: 0.0
+map_center_y: 0.0
+map_length_x: 4.0
+map_length_y: 5.0
+#footprint_yaw: 0.7854
+footprint_yaw: 0.0
+# footprint_yaw: 0.2
+max_gap_width: 0.15
+grid_map_to_initialize_traversability_map:
+    enable: true
+    grid_map_topic_name: initial_elevation_map
+use_raw_map: true

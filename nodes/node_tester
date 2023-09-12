@@ -1,0 +1,47 @@
+#!/usr/bin/env python
+import rospy
+import time
+from std_msgs.msg import Bool, String
+import sys
+import signal
+from vitulus_msgs.msg import PlannerProgram
+from nav_msgs.msg import Path
+
+class Node:
+
+    def __init__(self):
+        self.pub_test = rospy.Publisher('/test_path', Path, queue_size=10)
+        self.sub_test = rospy.Subscriber("/program_active", PlannerProgram, self.callback_program)
+
+    def publish_test(self, msg):
+        msg = String()
+        msg.data = "TEST"
+        self.pub_test.publish(msg)
+
+    def callback_program(self, msg):
+        for path in msg.zone_list[0].paths:
+            self.pub_test.publish(path)
+            time.sleep(2)
+        rospy.loginfo("<{}> {}".format(rospy.get_caller_id(), msg.data))
+
+
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('test_node')
+        rospy.loginfo("<{}> Initialising...".format(rospy.get_caller_id()))
+        node = Node()
+        r = rospy.Rate(1)  # Hz
+
+        def signal_handler():
+            rospy.signal_shutdown("end")
+            sys.exit(0)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        while not rospy.is_shutdown():
+            # node.publish_test()
+            r.sleep()
+
+    except rospy.ROSInterruptException:
+        rospy.logerr("<{}> error.".format(rospy.get_caller_id()))

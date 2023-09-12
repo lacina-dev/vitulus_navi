@@ -25,9 +25,12 @@
         <!-- arg name="multi_robot_name" value="$(arg multi_robot_name)"/ -->
 <!--     </include> -->
 
-    <include file="$(find vitulus_navi)/launch/obstacles.launch">
-        arg name="multi_robot_name" value="$(arg multi_robot_name)"/
-    </include>
+<!--    <include file="$(find vitulus_navi)/launch/obstacles.launch">-->
+<!--        arg name="multi_robot_name" value="$(arg multi_robot_name)"/-->
+<!--    </include>-->
+
+
+
 
    <include file="$(find vitulus_navi)/launch/vitulus_navi_mbf.launch">
    </include>

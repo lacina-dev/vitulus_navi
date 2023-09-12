@@ -1,0 +1,20 @@
+# Footprint parameters
+footprint:
+#  footprint_polygon: [[0.45, 0.30], [0.45, -0.30], [-0.45, -0.30], [-0.45, 0.30]] # Vertices of footprint polygon with coordinates [x, y] in robot footprint frame.
+  footprint_polygon: [[-0.03,-0.256],[-0.03,0.256],[-0.55,0.256],[-0.55,0.05],[-0.6,0.05],[-0.6,-0.05],[-0.55,-0.05],[-0.55,-0.256]] # Vertices of footprint polygon with coordinates [x, y] in robot footprint frame.
+#  circular_footprint_radius: 0.5
+#  circular_footprint_radius_inscribed: 0.30
+#  circular_footprint_offset: 0.15
+#  footprint_frame_id: base_footprint
+#  traversability_default: 0.04
+#  verify_roughness_footprint: false
+#  check_robot_inclination: true
+
+  circular_footprint_radius: 0.360
+  circular_footprint_radius_inscribed: 0.360
+  circular_footprint_offset: 0.0
+  footprint_frame_id: base_link # base_footprint
+  traversability_default: 0.3
+  verify_roughness_footprint: false
+  check_robot_inclination: false
+

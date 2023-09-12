@@ -4,44 +4,42 @@ TebLocalPlannerROS:
  odom_topic: /odometry/odom
  map_frame: map
 
-# map_frame: t265_odom_frame
-
  # Trajectory
-
  teb_autosize: True
- dt_ref: 0.3
+ dt_ref: 0.2
  dt_hysteresis: 0.1
  global_plan_overwrite_orientation: True
- max_global_plan_lookahead_dist: 3.0
+ max_global_plan_lookahead_dist: 2.0
  feasibility_check_no_poses: 5
+
+ global_plan_prune_distance: 0.5
+# publish_feedback: False
+# min_resolution_collision_check_angular: 3.14159265358979323846264338327950288
+
 
  # Robot
 
- max_vel_x: 0.5 # Vitulus max is 0,42332961 m/s, for slow use 0.1, for fast use 0.42
- max_vel_x_backwards: 0.5 # Vitulus max is 0,42332961 m/s, for slow use 0.05, for fast use 0.42
- max_vel_theta: 1.2 #  0.75   Vitulus max is 1,801402596 rad/s, for slow use 0.1, for fast use 5.0 1.8
- acc_lim_x: 0.5 # 1.5     0.5
- acc_lim_theta: 1.0 # 2.0     0.5,  5.0
+ max_vel_x: 0.3 #
+ max_vel_x_backwards: 0.3 #
+ max_vel_theta: 0.8 #  0.75
+ acc_lim_x: 0.6 # 1.5     0.5
+ acc_lim_theta: 1.2 # 2.0     0.5,  5.0
  min_turning_radius: 0.0 # 0.6
  footprint_model: # types: "point", "circular", "two_circles", "line", "polygon"
+#   type: "circular"
 #   radius: 0.36 # for type "circular"
-#   vertices: [[0.10, -0.256], [0.10, 0.256], [-0.10, 0.256], [-0.10, 0.10], [-0.55, 0.10], [-0.55, -0.10], [-0.10, -0.10], [-0.10, -0.256] ] # for type "polygon"
-#   vertices: [[-0.03,-0.256],[-0.03,0.256],[-0.55,0.256],[-0.55,0.05],[-0.6,0.05],[-0.6,-0.05],[-0.55,-0.05],[-0.55,-0.256]] # for type "polygon"
    vertices: [[0.238,-0.256],[0.238,0.256],[-0.238,0.256],[-0.238,0.050],[-0.288,0.05],[-0.288,-0.05],[-0.238,-0.05],[-0.238,-0.256]]  # 4WD
-#   vertices: [[0.25,-0.256],[0.25,0.256],[-0.25,0.256],[-0.25,0.05],[-0.3,0.05],[-0.3,-0.05],[-0.25,-0.05],[-0.25,-0.256]]   ## 4WD Long
-#   vertices: [[0.01,-0.256],[0.01,0.256],[-0.51,0.256],[-0.51,0.05],[-0.56,0.05],[-0.56,-0.05],[-0.51,-0.05],[-0.51,-0.256]]
- # GoalTolerance
 
+ # GoalTolerance
  xy_goal_tolerance: 0.2
  yaw_goal_tolerance: 0.2
- free_goal_vel: true
+ free_goal_vel: false
 
  # Via points
- global_plan_viapoint_sep: 0.2
+ global_plan_viapoint_sep: 0.05
 
 
  # Obstacles
-
  min_obstacle_dist: 0.4
  include_costmap_obstacles: True
  costmap_obstacles_behind_robot_dist: 1.0
@@ -51,7 +49,6 @@ TebLocalPlannerROS:
  costmap_converter_rate: 5
 
  # Optimization
-
  no_inner_iterations: 5
  no_outer_iterations: 4
  optimization_activate: True
@@ -73,7 +70,6 @@ TebLocalPlannerROS:
  alternative_time_cost: False # not in use yet
 
  # Homotopy Class Planner
-
  enable_homotopy_class_planning: False
  enable_multithreading: True
  simple_exploration: False

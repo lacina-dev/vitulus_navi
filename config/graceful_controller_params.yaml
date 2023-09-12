@@ -1,0 +1,33 @@
+GracefulControllerROS:
+  acc_lim_theta: 0.6
+  acc_lim_x: 0.5
+  beta: 0.3
+  compute_orientations: true
+  decel_lim_x: 0.5
+  initial_rotate_tolerance: 0.1
+  k1: 1.1
+  k2: 1.2
+  lambda: 0.6
+  latch_xy_goal_tolerance: true
+  max_lookahead: 0.8
+  max_vel_theta: 0.7
+  max_vel_x: 0.5
+  max_x_to_max_theta_scale_factor: 100.0
+  min_in_place_vel_theta: 0.6
+  min_lookahead: 0.2
+  min_vel_theta: 0.3
+  min_vel_x: -0.05
+  odom_topic: /odometry/filtered/navsat
+  prefer_final_rotation: true
+  scaling_factor: 0.0
+  scaling_step: 0.1
+  scaling_vel_x: 0.5
+  use_orientation_filter: true
+  xy_goal_tolerance: 0.15
+  xy_vel_goal_tolerance: 0.5
+  yaw_filter_tolerance: 0.785
+  yaw_gap_tolerance: 0.25
+  yaw_goal_tolerance: 0.15
+  yaw_vel_goal_tolerance: 0.2
+  prune_plan: true
+

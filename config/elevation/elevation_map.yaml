@@ -1,0 +1,61 @@
+# Map.
+length_in_x:                                4.0
+length_in_y:                                5.0
+position_x:                                 0.0
+position_y:                                 0.0
+resolution:                                 0.15
+min_variance:                               0.0001
+max_variance:                               0.05
+mahalanobis_distance_threshold:             2.5 # 2.5
+multi_height_noise:                         0.1 # 0.001
+surface_normal_positive_axis:               z
+fused_map_publishing_rate:                  0
+enable_visibility_cleanup:                  false
+visibility_cleanup_rate:                    0.2
+#scanning_duration:                          1.0
+#min_horizontal_variance:                    0.25
+#max_horizontal_variance:                    2.5
+
+
+# Init submap
+initialize_elevation_map:                   false
+initialization_method:                      0
+length_in_x_init_submap:                    2.0
+length_in_y_init_submap:                    2.0
+init_submap_height_offset:                  0.02
+init_submap_variance:                       0.001
+target_frame_init_submap:                   base_link
+
+scanning_duration: 0.033
+relocate_rate: 3.0
+#enable_visibility_cleanup: false
+time_tolerance: 0.5
+min_update_rate: 6
+num_callback_threads: 3
+
+#length_in_x: 4 # 2.7
+#length_in_y: 4 # 2.7
+#position_x: 0.0
+#position_y: 0.0
+#resolution: 0.05
+##min_variance: 0.0001
+##max_variance: 10000.0
+## mahalanobis_distance_threshold: 8.0
+##multi_height_noise: 0.00002
+#multi_height_noise: 0.5 # 0.2
+#min_variance: 0.001
+#max_variance: 0.05
+#mahalanobis_distance_threshold: 10
+## multi_height_noise: 0.0000009
+#fused_map_publishing_rate: 0
+#map_publishing_rate: 0
+#min_update_rate: 10
+#
+##sensor_processor/apply_voxelgrid_filter: true
+##sensor_processor/voxelgrid_filter_size: 0.05
+#
+#visibility_cleanup_rate: 0.6
+#scanning_duration: 0.033
+#relocate_rate: 3.0
+#enable_visibility_cleanup: false
+#time_tolerance: 0.5

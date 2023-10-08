@@ -63,6 +63,7 @@
     <remap from="cmd_vel" to="/cmd_vel"/>
 <!--    <remap from="odom" to="/odometry/filtered/local"/>-->
     <remap from="odom" to="/odometry/odom"/>
+<!--    <remap from="TebLocalPlannerROS/odom" to="/odometry/filtered/navsat"/>-->
 
 <!--    <remap from="map" to="/rtabmap/grid_map"/>-->
 <!--    <remap from="map" to="/map_fill"/>-->

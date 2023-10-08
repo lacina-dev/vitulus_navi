@@ -1,0 +1,59 @@
+<launch>
+
+   <!-- Ekf -->
+    <!-- Ekf -->
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_global" clear_params="true">
+      <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_global.yaml" />
+<!--      <remap from="/odometry/filtered" to="/odometry/filtered/global" />-->
+      <remap from="/odometry/filtered" to="/odometry/odom" />
+        <remap from="/set_pose" to="/set_pose_global"/>
+    </node>
+
+<!--    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_local" clear_params="true">-->
+<!--      <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_local.yaml" />-->
+<!--      <remap from="/odometry/filtered" to="/odometry/filtered/local" />-->
+<!--        <remap from="/set_pose" to="/set_pose_local"/>-->
+<!--    </node>-->
+
+<!--    <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_bno_nav.yaml" />-->
+<!--    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_bno_nav" clear_params="true" output="screen">-->
+<!--        <remap from="odometry/filtered" to="odometry/filtered/imu"/>-->
+<!--        <remap from="accel/filtered" to="accel/filtered/imu"/>-->
+<!--        <remap from="/set_pose" to="/set_pose_imu"/>-->
+<!--    </node>-->
+
+    <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="screen">
+          <rosparam command="load" file="$(find vitulus_navi)/config/ekf/navsat.yaml" />
+          <!--subscribers-->
+          <remap from="imu/data" to="/bno085/navheading" />
+          <remap from="gps/fix" to="/gnss/fix" />
+<!--          <remap from="odometry/filtered" to="/odometry/filtered/global" />-->
+          <remap from="odometry/filtered" to="/odometry/odom" />
+          <!--publishers-->
+          <remap from="gps/filtered" to="gps/filtered" />
+          <remap from="odometry/gps" to="odometry/gps" />
+    </node>
+
+<!--    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_base" clear_params="true" output="screen">-->
+<!--&lt;!&ndash;        <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base_outdoor.yaml" />&ndash;&gt;-->
+<!--        <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base_gnss.yaml" />-->
+<!--        <remap from="/odometry/filtered" to="/odometry/filtered/local" />-->
+<!--        <remap from="/set_pose" to="/set_pose_map"/>-->
+<!--    </node>-->
+
+
+
+<!--    <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_navsat.yaml" />-->
+<!--    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_navsat" clear_params="true" output="screen">-->
+<!--        <remap from="odometry/filtered" to="odometry/filtered/navsat"/>-->
+<!--        <remap from="/set_pose" to="/set_pose_navsat"/>-->
+<!--    </node>-->
+
+<!--<node pkg="tf" type="static_transform_publisher" name="map_odom" args="0 0 0 0 0 0 /map /odom 100"/>-->
+
+    <!-- Run the map server with a blank map -->
+<!--  <node name="map_server" pkg="map_server" type="map_server" args="$(find vitulus_navi)/maps/blank_map.yaml" />-->
+
+
+
+</launch>

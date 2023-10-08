@@ -1,33 +1,70 @@
 GracefulControllerROS:
-  acc_lim_theta: 0.6
-  acc_lim_x: 0.5
+  acc_lim_theta: 1.2
+  acc_lim_x: 1.5
   beta: 0.3
   compute_orientations: true
-  decel_lim_x: 0.5
-  initial_rotate_tolerance: 0.1
-  k1: 1.1
-  k2: 1.2
-  lambda: 0.6
+  decel_lim_x: 1.5
+  initial_rotate_tolerance: 5.0
+  k1: 2.4
+  k2: 0.7
+  lambda: 0.7
   latch_xy_goal_tolerance: true
-  max_lookahead: 0.8
-  max_vel_theta: 0.7
+  max_lookahead: 0.75
+  max_vel_theta: 0.9
   max_vel_x: 0.5
-  max_x_to_max_theta_scale_factor: 100.0
-  min_in_place_vel_theta: 0.6
-  min_lookahead: 0.2
+  max_x_to_max_theta_scale_factor: 30.969000000000005
+  min_in_place_vel_theta: 0.9
+  min_lookahead: 0.25
   min_vel_theta: 0.3
-  min_vel_x: -0.05
+  min_vel_x: -0.5
   odom_topic: /odometry/filtered/navsat
   prefer_final_rotation: true
+  prune_plan: true
   scaling_factor: 0.0
   scaling_step: 0.1
   scaling_vel_x: 0.5
   use_orientation_filter: true
-  xy_goal_tolerance: 0.15
+  xy_goal_tolerance: 0.2
   xy_vel_goal_tolerance: 0.5
   yaw_filter_tolerance: 0.785
   yaw_gap_tolerance: 0.25
-  yaw_goal_tolerance: 0.15
+  yaw_goal_tolerance: 0.5
   yaw_vel_goal_tolerance: 0.2
-  prune_plan: true
+  acc_dt: 0.25
+
+
+
+
+  #Celkem good ale pomale
+#  acc_lim_theta: 0.6
+#  acc_lim_x: 0.5
+#  beta: 0.3
+#  compute_orientations: true
+#  decel_lim_x: 0.5
+#  initial_rotate_tolerance: 0.1
+#  k1: 1.1
+#  k2: 1.2
+#  lambda: 0.6
+#  latch_xy_goal_tolerance: true
+#  max_lookahead: 0.8
+#  max_vel_theta: 0.7
+#  max_vel_x: 0.5
+#  max_x_to_max_theta_scale_factor: 100.0
+#  min_in_place_vel_theta: 0.6
+#  min_lookahead: 0.2
+#  min_vel_theta: 0.3
+#  min_vel_x: 0.1
+#  odom_topic: /odometry/filtered/navsat
+#  prefer_final_rotation: true
+#  scaling_factor: 0.0
+#  scaling_step: 0.1
+#  scaling_vel_x: 0.5
+#  use_orientation_filter: true
+#  xy_goal_tolerance: 0.15
+#  xy_vel_goal_tolerance: 0.5
+#  yaw_filter_tolerance: 0.785
+#  yaw_gap_tolerance: 0.25
+#  yaw_goal_tolerance: 0.15
+#  yaw_vel_goal_tolerance: 0.2
+#  prune_plan: true
 

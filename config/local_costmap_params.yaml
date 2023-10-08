@@ -144,9 +144,13 @@ local_costmap:
     }
   laser_layer:
      enabled: true
-     observation_sources: laser_scan_clear laser_scan
+#     observation_sources: laser_scan_clear laser_scan
+#     observation_sources: laser_scan laser_scan_clear
+     observation_sources: laser_scan
      track_unknown_space: true
      publish_voxel_map:     true
+     z_resolution: 2.0
+     z_voxels: 1
 
      laser_scan: {sensor_frame: base_scan,
                          data_type: LaserScan,
@@ -154,11 +158,11 @@ local_costmap:
                          marking: true,
                          clearing: true,
                          observation_persistence: 0.0,
-                         max_obstacle_height: 0.5,
-                         min_obstacle_height: 0.0,
+                         max_obstacle_height: 2.0,
+                         min_obstacle_height: -2.0,
                          obstacle_range: 2.0,
-                         raytrace_range: 12.0,
-                         expected_update_rate: 0.2,
+                         raytrace_range: 15.0,
+                         expected_update_rate: 6,
                          track_unknown_space: true,
                          inf_is_valid: true
     }
@@ -168,11 +172,11 @@ local_costmap:
                    marking: false,
                    clearing: true,
                    observation_persistence: 0.0,
-                   max_obstacle_height: 0.5,
-                   min_obstacle_height: 0.0,
-                   obstacle_range: 4.0,
-                   raytrace_range: 12.0,
-                   expected_update_rate: 0.2,
+                   max_obstacle_height: 2.0,
+                   min_obstacle_height: -2.0,
+                   obstacle_range: 2.0,
+                   raytrace_range: 15.0,
+                   expected_update_rate: 6,
                    track_unknown_space: true,
                    inf_is_valid: true
      }
@@ -197,7 +201,8 @@ local_costmap:
     - {name: laser_layer,      type: "costmap_2d::VoxelLayer"}
 
   #  - {name: clear_layer,  type: "costmap_2d::ObstacleLayer"}
-    - {name: rgbd_obstacle_layer, type: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"}
+#    - {name: laser_layer,  type: "costmap_2d::ObstacleLayer"}
+#    - {name: rgbd_obstacle_layer, type: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"}
     - {name: inflation_layer,  type: "costmap_2d::InflationLayer"}
 
 

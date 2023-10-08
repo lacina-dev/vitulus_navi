@@ -3,15 +3,19 @@
 
 <!--    <node pkg="tf" type="static_transform_publisher" name="base_gps" args="-0.155 -0.21 0.3 3.1415926 0 0 /chassis /gnss 100"/>-->
 
-      <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="screen">
-          <rosparam command="load" file="$(find vitulus_navi)/config/navsat.yaml" />
-          <remap from="imu/data" to="/gnss/navheading" />
-          <remap from="gps/fix" to="/gnss_lite/fix" />
-<!--          <remap from="odometry/filtered" to="/odometry/filtered/local" />-->
-          <remap from="odometry/filtered" to="/odometry/filtered/navsat" />
-<!--          <remap from="/odometry/filtered" to="/odometry/filtered/map" />-->
+<!--    <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="screen">-->
+<!--      <rosparam command="load" file="$(find vitulus_navi)/config/navsat.yaml" />-->
+<!--      <remap from="imu/data" to="/gnss/navheading" />-->
+<!--      <remap from="gps/fix" to="/gnss_lite/fix" />-->
+<!--      <remap from="odometry/filtered" to="/odometry/filtered/navsat" />-->
+<!--    </node>-->
 
-      </node>
+    <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="screen">
+      <rosparam command="load" file="$(find vitulus_navi)/config/navsat_imu.yaml" />
+      <remap from="imu/data" to="/odometry/filtered/imu" />
+      <remap from="gps/fix" to="/gnss_lite/fix" />
+      <remap from="odometry/filtered" to="/odometry/filtered/navsat" />
+    </node>
 
 <!--  <rosparam command="load" file="$(find vitulus_gnss)/config/ekf_imu.yaml" />-->
 <!--  <node pkg="robot_localization" type="ekf_localization_node" name="ekf_imu" clear_params="true">-->

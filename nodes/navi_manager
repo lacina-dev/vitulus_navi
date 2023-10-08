@@ -434,6 +434,8 @@ def callback_load_map(msg, init=False):
         global navi_launch
         navi_launch = start_navi_launch(["localization:=true"])
         load_running_map_data()
+        # set_map_utm_map_pose()
+        set_map_utm_transform()
     else:
         status_msg_pub.publish("Map not loaded. Empty name.")
         rospy.logerr("Map not loaded. Empty name.")
@@ -487,22 +489,25 @@ def set_odom_transform():
     static_transformStamped.transform.rotation.y = odom_imu_msg.pose.pose.orientation.y
     static_transformStamped.transform.rotation.z = odom_imu_msg.pose.pose.orientation.z
     static_transformStamped.transform.rotation.w = odom_imu_msg.pose.pose.orientation.w
-
-    tf2_TransformBroadcaster.sendTransform(static_transformStamped)
-    odom_msg = Odometry()
-    odom_msg.header.stamp = rospy.Time.now()
-    odom_msg.header.frame_id = "odom"
-    odom_msg.child_frame_id = "base_link"
-    odom_msg.pose.pose.position.x = static_transformStamped.transform.translation.x
-    odom_msg.pose.pose.position.y = static_transformStamped.transform.translation.y
-    odom_msg.pose.pose.position.z = static_transformStamped.transform.translation.z
-    odom_msg.pose.pose.orientation.x = static_transformStamped.transform.rotation.x
-    odom_msg.pose.pose.orientation.y = static_transformStamped.transform.rotation.y
-    odom_msg.pose.pose.orientation.z = static_transformStamped.transform.rotation.z
-    odom_msg.pose.pose.orientation.w = static_transformStamped.transform.rotation.w
+    # static_transformStamped.transform.rotation.z = odom_navsat_msg.pose.pose.orientation.z
+    # static_transformStamped.transform.rotation.w = odom_navsat_msg.pose.pose.orientation.w
 
 
-    oodometry_odom_pub.publish(odom_msg)
+    # tf2_TransformBroadcaster.sendTransform(static_transformStamped)
+    # odom_msg = Odometry()
+    # odom_msg.header.stamp = rospy.Time.now()
+    # odom_msg.header.frame_id = "odom"
+    # odom_msg.child_frame_id = "base_link"
+    # odom_msg.pose.pose.position.x = static_transformStamped.transform.translation.x
+    # odom_msg.pose.pose.position.y = static_transformStamped.transform.translation.y
+    # odom_msg.pose.pose.position.z = static_transformStamped.transform.translation.z
+    # odom_msg.pose.pose.orientation.x = static_transformStamped.transform.rotation.x
+    # odom_msg.pose.pose.orientation.y = static_transformStamped.transform.rotation.y
+    # odom_msg.pose.pose.orientation.z = static_transformStamped.transform.rotation.z
+    # odom_msg.pose.pose.orientation.w = static_transformStamped.transform.rotation.w
+    #
+    #
+    # oodometry_odom_pub.publish(odom_msg)
 
     pose_cov_stamped = PoseWithCovarianceStamped()
     pose_cov_stamped.header.stamp = rospy.Time.now()
@@ -525,27 +530,40 @@ def set_odom_transform():
 
 def set_map_utm_transform():
 
-        # print("############################################################################################################################")
-        # print("############################################################################################################################")
+    # print("############################################################################################################################")
+    # print("############################################################################################################################")
 
-        global tf2_Buffer
+    global tf2_Buffer
+    available = False
+    # while not available:
+    #     try:
+    #         # trans = tf2_Buffer.lookup_transform('utm', 'map', rospy.Time(0))
+    #         trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+    #         available = True
+    #     except:
+    #         available = False
+    # while not available:
+    try:
+        # trans = tf2_Buffer.lookup_transform('utm', 'map', rospy.Time(0))
+        trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+        available = True
+
+    except:
         available = False
-        while not available:
-            try:
-                # trans = tf2_Buffer.lookup_transform('utm', 'map', rospy.Time(0))
-                trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
-                available = True
-            except:
-                available = False
+
+    if available:
         m_x = 0
         m_y = 0
         if running_map_data.is_utm():
+            # print("################ map data available #######################")
             pass
+
             m_x = trans.transform.translation.x - running_map_data.utm_x
             m_y = trans.transform.translation.y - running_map_data.utm_y
             m_orientation_z = running_map_data.utm_orientation_z
             m_orientation_w = running_map_data.utm_orientation_w
         else:
+            # print("################ map data unavailable #######################")
             m_orientation_z = 0
             m_orientation_w = 1
 
@@ -579,6 +597,8 @@ def set_map_utm_transform():
         static_transformStamped.transform.rotation.w = m_orientation_w
 
         tf2_TransformBroadcaster.sendTransform(static_transformStamped)
+        # global tf2_StaticTransformBroadcaster
+        # tf2_StaticTransformBroadcaster.sendTransform(static_transformStamped)
             # rospy.wait_for_service('/set_pose_map')
             # try:
             #     srv_msg = SetPoseRequest()
@@ -602,24 +622,114 @@ def set_map_utm_transform():
             #     print("Service call failed: %s" % e)
 
 
+def set_map_utm_map_pose():
+    # print("############################################################################################################################")
+    # print("############################################################################################################################")
+
+    global tf2_Buffer
+    available = False
+    # time.sleep(3)
+    while not available:
+        try:
+            # trans = tf2_Buffer.lookup_transform('utm', 'map', rospy.Time(0))
+            trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+            available = True
+        except:
+            available = False
+    m_x = 0
+    m_y = 0
+    if running_map_data.is_utm():
+        print("################ saved data available #######################")
+        pass
+        m_x = trans.transform.translation.x - running_map_data.utm_x
+        m_y = trans.transform.translation.y - running_map_data.utm_y
+        m_orientation_z = running_map_data.utm_orientation_z
+        m_orientation_w = running_map_data.utm_orientation_w
+    else:
+        print("################ saved data unavailable #######################")
+        m_orientation_z = 0
+        m_orientation_w = 1
+    print("################ trans #######################")
+    print(trans)
+    print("################ x #######################")
+    print(m_x)
+    print("################ y #######################")
+    print(m_y)
+    print("################ running_map_data.utm_x #######################")
+    print(running_map_data.utm_x)
+    print("################ running_map_data.utm_y #######################")
+    print(running_map_data.utm_y)
+    print("################ ori z #######################")
+    print(m_orientation_z)
+    print("################ ori w #######################")
+    print(m_orientation_w)
+    print("###################################################################################################################################")
+
+    # static_transformStamped = TransformStamped()
+    #
+    # static_transformStamped.header.stamp = rospy.Time.now()
+    # static_transformStamped.header.frame_id = "map"
+    # static_transformStamped.child_frame_id = "odom"
+    #
+    # static_transformStamped.transform.translation.x = m_x
+    # static_transformStamped.transform.translation.y = m_y
+
+    # static_transformStamped.transform.translation.z = float(sys.argv[4])
+
+    # quat = tf.transformations.quaternion_from_euler(
+    #     float(sys.argv[5]), float(sys.argv[6]), float(sys.argv[7]))
+    # static_transformStamped.transform.rotation.x = quat[0]
+    # static_transformStamped.transform.rotation.y = quat[1]
+
+    # static_transformStamped.transform.rotation.z = m_orientation_z
+    # static_transformStamped.transform.rotation.w = m_orientation_w
+
+    # tf2_TransformBroadcaster.sendTransform(static_transformStamped)
+
+
+    rospy.wait_for_service('/set_pose_global')
+    try:
+        srv_msg = SetPoseRequest()
+
+        # pose = PoseWithCovarianceStamped()
+        srv_msg.pose.header.stamp = rospy.Time.now()
+        srv_msg.pose.header.frame_id = "odom"
+
+        srv_msg.pose.pose.pose.position.x = m_x * 1
+        srv_msg.pose.pose.pose.position.y = m_y * 1
+        set_pose_srv = rospy.ServiceProxy('/set_pose_global', SetPose)
+        set_pose_srv(srv_msg)
+
+        # srv_msg.pose.pose.orientation = m_y
+        print("################ srv_msg #######################")
+        print(srv_msg)
+        print("#######################################")
+
+        # srvs = rospy.ServiceProxy('/set_pose', srv_msg)
+        # resp = srvs()
+    except rospy.ServiceException as e:
+        print("Service call failed: %s" % e)
+
+
 def save_map_utm_pose():
     if not running_map_data.is_utm():
         global tf2_Buffer
-        trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+        # trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+        trans = tf2_Buffer.lookup_transform('utm', 'map', rospy.Time(0))
         running_map_data.utm_x = trans.transform.translation.x
         running_map_data.utm_y = trans.transform.translation.y
         running_map_data.utm_z = trans.transform.translation.z
         running_map_data.utm_orientation_z = trans.transform.rotation.z
         running_map_data.utm_orientation_w = trans.transform.rotation.w
-        # print("###########################################################################")
-        # print("###########################################################################")
-        # print("###########################################################################")
-        # print("###########################################################################")
-        # print(trans)
-        # print("###########################################################################")
-        # print("###########################################################################")
-        # print("###########################################################################")
-        # print("###########################################################################")
+        print("###########################################################################")
+        print("###########################################################################")
+        print("###########################################################################")
+        print("###########################################################################")
+        print(trans)
+        print("###########################################################################")
+        print("###########################################################################")
+        print("###########################################################################")
+        print("###########################################################################")
         save_running_map_data(running_map_data)
 
 def callback_speed(msg):
@@ -1159,7 +1269,9 @@ def navi_manager():
 
     rospy.loginfo("Initialising navi_manager node...")
     # rate = rospy.Rate(0.2)  # 1hz
-    rate = rospy.Rate(50)  # 1hz
+    # rate = rospy.Rate(50)  # 1hz
+    rate_nr = 30
+    rate = rospy.Rate(rate_nr)  # 1hz
     rospy.loginfo("Node initialised.")
     global tf
     global tf2_Buffer
@@ -1217,20 +1329,24 @@ def navi_manager():
     # rospy.wait_for_service('/set_pose_map')
     # set_map_utm_transform()
 
-
-
-
-
+    # ros_timer = rospy.Timer(rospy.Duration(1.0/3.0), set_map_utm_transform()).shutdown()
+    slow_counter = 0
+    slow_nr = int(rate_nr/2)  # 2x per second
     while not rospy.is_shutdown():
-        get_maplist()
-        # get_waypoints()
-        global point_to_publish
-        publish_map_point(point_to_publish)
-        publish_map_point_list()
-        publish_map_path_list()
-        publish_map_path(path_to_publish)
-        set_odom_transform()
         set_map_utm_transform()
+        set_odom_transform()
+        if (slow_nr == slow_counter):
+            get_maplist()
+            # get_waypoints()
+            global point_to_publish
+            publish_map_point(point_to_publish)
+            publish_map_point_list()
+            publish_map_path_list()
+            publish_map_path(path_to_publish)
+            # set_odom_transform()
+            # set_map_utm_transform()
+            slow_counter = 0
+        slow_counter += 1
 
         rate.sleep()
 

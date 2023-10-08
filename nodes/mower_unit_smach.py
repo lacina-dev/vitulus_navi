@@ -1,4 +1,5 @@
 import rospy
+import shapely
 import smach
 import smach_ros
 from smach_ros import ServiceState
@@ -14,6 +15,8 @@ from mbf_msgs.msg import ExePathAction
 from mbf_msgs.msg import GetPathAction
 from mbf_msgs.msg import RecoveryAction
 from mbf_msgs.srv import CheckPath, CheckPathRequest, CheckPathResponse
+import PyKDL as kdl
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
 
 import sys
 
@@ -46,15 +49,116 @@ class GetPathData(smach.State):
         smach.State.__init__(self, outcomes=['available', 'failed'],
                              input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index', 'zone_name', 'path_planner',
                                          'zone_start_pose', 'path_plan', 'index_path', 'paths', 'path_start_pose',
-                                         'path'],
+                                         'path', 'final_pose'],
                              output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 'zone_start_pose', 'path_planner',
-                                          'path_plan', 'paths', 'path_start_pose', 'path'])
+                                          'path_plan', 'paths', 'path_start_pose', 'path', 'final_pose'])
+    def path_to_polygon(self, path):
+        # create shapely polygon from path poses
+        polygon = geometry.LinearRing([[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
+        polygon = shapely.remove_repeated_points(polygon)
+        return polygon
+
+    def path_to_multiline(self, path):
+        # create shapely multiline string from path poses
+        multiline = geometry.MultiLineString(
+            [[[pose.pose.position.x, pose.pose.position.y] for pose in path.poses]])
+        return multiline
+
+    def path_to_line(self, path):
+        # create shapely multiline string from path poses
+        line = geometry.LineString(
+            [[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
+        return line
+
+    def direction(self, line):
+        # point_2.x - point_1.x, point_2.y - point_1.y)
+        x = line[1][0] - line[0][0]
+        y = line[1][1] - line[0][1]
+        diagonal = math.sqrt(x ** 2 + y ** 2)
+        if y < 0:
+            if x >= 0:
+                angle = math.asin(y / diagonal)
+            else:
+                angle = math.acos(x / diagonal) * -1
+        else:
+            if x >= 0:
+                angle = math.asin(y / diagonal)
+            else:
+                angle = math.acos(x / diagonal)
+        return angle
 
     def execute(self, userdata):
         rospy.loginfo('[{}]Getting path data - state GET_PATH_DATA'.format(rospy.get_caller_id()))
         path = userdata.paths[userdata.index_path]
         userdata.path_planner = path
         userdata.path_start_pose = path.poses[0]
+        line = geometry.LineString([[path.poses[0].pose.position.x, path.poses[0].pose.position.y],
+                                    [path.poses[-1].pose.position.x, path.poses[-1].pose.position.y]])
+
+        print("#########################################################")
+        print("#########################################################")
+        print("Line length: {}".format(line.length))
+        segmentize_distance = 0.03
+        if line.length == 0:
+            print("Outline path")
+            start_offset = 0.18
+            start_poses_offset = int(round(start_offset / segmentize_distance))
+            # print("start_poses_offset: {}".format(start_poses_offset))
+            path_new = Path()
+            path_new.header = path.header
+            polygon = self.path_to_polygon(path)
+            # polygon = polygon.exterior
+            # print("polygon: {}".format(polygon))
+            for n in range(0, len(polygon.coords) - 1):
+                line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]],
+                                            [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
+                # print("Line* length: {}".format(line.length))
+                angle = self.direction(line.coords)
+                line = line.segmentize(segmentize_distance)
+                for point in line.coords:
+                    pose = PoseStamped()
+                    pose.header.frame_id = "map"
+                    pose.header.stamp = rospy.Time.now()
+                    pose.pose.position.x = point[0]
+                    pose.pose.position.y = point[1]
+                    pose.pose.position.z = 0.0
+                    pose.pose.orientation = Quaternion(
+                        *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                    path_new.poses.append(pose)
+            path_new.poses = path_new.poses[0:-start_poses_offset]
+            path_new.poses = path_new.poses[start_poses_offset:]
+            path = path_new
+            userdata.path_start_pose = path.poses[0]
+            userdata.final_pose = path.poses[-1]
+
+        else:
+            print("Coverage path")
+            line = self.path_to_line(path)
+            path_new = Path()
+            path_new.header.frame_id = "map"
+            path_new.header.stamp = rospy.Time.now()
+
+            line = line.segmentize(segmentize_distance)
+            for pose_id in range(0, len(line.coords) - 1):
+                angle = self.direction([[line.coords[pose_id][0], line.coords[pose_id][1]],
+                                       [line.coords[pose_id + 1][0], line.coords[pose_id + 1][1]]])
+                pose = PoseStamped()
+                pose.header.frame_id = "map"
+                pose.header.stamp = rospy.Time.now()
+                pose.pose.position.x = line.coords[pose_id][0]
+                pose.pose.position.y = line.coords[pose_id][1]
+                pose.pose.position.z = 0.0
+                pose.pose.orientation = Quaternion(
+                    *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                path_new.poses.append(pose)
+            path = path_new
+
+        print("#########################################################")
+        print("#########################################################")
+        # publish current path
+        pub_current_path = rospy.Publisher('/test_path', Path, latch=True, queue_size=1)
+        pub_status = pub_current_path.publish(path)
+
         # pose_tmp = path.poses[0]
         # userdata.path_plan = None
         # line = geometry.LineString([[path.poses[0].pose.position.x, path.poses[0].pose.position.y],
@@ -75,7 +179,6 @@ class GetPathData(smach.State):
         userdata.path = path
 
         print("Path length: {}  ************************".format(len(userdata.path.poses)))
-        # rospy.sleep(3)
         return 'available'
 
 class CheckDistance(smach.State):
@@ -111,6 +214,7 @@ def main():
     sm.userdata.zone_start_pose = None
     sm.userdata.paths = None
     sm.userdata.path_cost = None
+    sm.userdata.final_pose = None
 
     with sm:
         # Program callback for state WAIT_FOR_PROGRAM
@@ -129,6 +233,7 @@ def main():
             ),
             transitions={
                 'invalid': 'POWER_ON_MOWER',
+                # 'invalid': 'ZONE_IT',
                 'valid': 'WAIT_FOR_PROGRAM',
                 'preempted': 'preempted'
             }
@@ -225,6 +330,7 @@ def main():
                 ),
                                        transitions={
                                            'succeeded': 'SET_CUT_HEIGHT',
+                                           # 'succeeded': 'PATH_IT',
                                            'aborted': 'GET_PATH_TO_START',
                                            'preempted': 'preempted'
                                        }, remapping={'path': 'path_plan'}
@@ -400,10 +506,10 @@ def main():
                                                )
 
                         # Add state CHECK_PLANNER_PATH - service call to check path
-                        @smach.cb_interface(input_keys=['path_planner'])
+                        @smach.cb_interface(input_keys=['path'])
                         def check_path_request_cb(userdata, request):
                             srvs_request = CheckPathRequest()
-                            srvs_request.path = userdata.path_planner
+                            srvs_request.path = userdata.path
                             srvs_request.safety_dist = 0.1
                             srvs_request.lethal_cost_mult = 0
                             srvs_request.inscrib_cost_mult = 0
@@ -423,7 +529,7 @@ def main():
                                                             CheckPath,
                                                             request_cb=check_path_request_cb,
                                                             response_cb=check_path_response_cb,
-                                                            input_keys=['path_planner']),
+                                                            input_keys=['path']),
                                                transitions={'succeeded': 'EXE_PLANNER_PATH',
                                                             'aborted': 'CHECK_PLANNER_PATH',
                                                             'preempted': 'preempted'})
@@ -443,13 +549,14 @@ def main():
                         smach.StateMachine.add('EXE_PLANNER_PATH', smach_ros.SimpleActionState(
                             '/move_base_flex/exe_path', ExePathAction, goal_slots=['path'],
                             result_cb=get_exe_planner_path_result_cb,
-                            input_keys=['paths']
+                            input_keys=['paths', 'final_pose']
                         ),
                                                transitions={
                                                    'succeeded': 'continue_path',
                                                    'aborted': 'GET_PATH_TO_BEGIN_OF_PATH',
                                                    'preempted': 'preempted'
-                                               }, remapping={'path': 'path'}
+                                               }, remapping={'path': 'path',
+                                                             'final_pose': 'final_pose'}
                                                )
 
                     # close processing path

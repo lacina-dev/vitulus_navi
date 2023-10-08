@@ -21,8 +21,8 @@ class Node:
     def callback_program(self, msg):
         for path in msg.zone_list[0].paths:
             self.pub_test.publish(path)
-            time.sleep(2)
-        rospy.loginfo("<{}> {}".format(rospy.get_caller_id(), msg.data))
+            time.sleep(10)
+        rospy.loginfo("<{}> Finished program {}".format(rospy.get_caller_id(), msg.name))
 
 
 

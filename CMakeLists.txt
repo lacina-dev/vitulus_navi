@@ -204,7 +204,9 @@ install(DIRECTORY launch
 
 catkin_install_python(PROGRAMS
   nodes/navi_manager
-  nodes/mapdata.py
+  nodes/mower_unit_smach
+  nodes/navi_man
+  # nodes/mapdata.py
 
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

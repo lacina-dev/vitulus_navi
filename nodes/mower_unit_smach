@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import rospy
 import shapely
 import smach
@@ -198,6 +199,8 @@ class CheckDistance(smach.State):
 
 def main():
     rospy.init_node('mower_unit_smach')
+    pub_active_prg = rospy.Publisher('/mower_smach/active_program', String, latch=True, queue_size=1)
+    pub_status = pub_active_prg.publish(String(" "))
 
     # Create SMACH state machine
     sm = smach.StateMachine(outcomes=['succeeded', 'aborted', 'preempted'])
@@ -220,13 +223,21 @@ def main():
         # Program callback for state WAIT_FOR_PROGRAM
         def callback_program(userdata, msg):
             userdata.program = msg
+            rospy.loginfo('[{}]Get new program to run - state WAIT_FOR_PROGRAM'.format(rospy.get_caller_id()))
+            pub_active_program = rospy.Publisher('/mower_smach/active_program', String, latch=True, queue_size=1)
+            pub_status = pub_active_program.publish(String(msg.name))
+            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+            pub_log_info.publish(String("Running program: {}".format(msg.name)))
+            pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+            pub_pm_play_melody.publish(Int16(2))  # 5:short_beep, 1:beep, 2:double beep,
+            rospy.sleep(1.0)
             return False
 
         # Monitor topic to get program
         smach.StateMachine.add(
             'WAIT_FOR_PROGRAM',
             smach_ros.MonitorState(
-                '/program_active',
+                '/web_plan/program_active',
                 PlannerProgram,
                 callback_program,
                 output_keys=['program']
@@ -247,6 +258,11 @@ def main():
             msg = Bool()
             msg.data = True
             pub_status = pub_mower_set_power.publish(msg)
+            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+            pub_log_info.publish(String("Turn on mower"))
+            pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+            pub_pm_play_melody.publish(Int16(1)) # 5:short_beep, 1:beep, 2:double beep,
+            rospy.sleep(1.5)
             if pub_status is None:
                 return 'success'
 
@@ -256,6 +272,11 @@ def main():
         # Program callback for mower status WAIT_FOR_MOWER_ON
         def callback_mower_status(userdata, msg):
             if msg.status == 'WAIT':
+                pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+                pub_log_info.publish(String("Mower is ready"))
+                pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+                pub_pm_play_melody.publish(Int16(1))  # 5:short_beep, 1:beep, 2:double beep,
+                rospy.sleep(0.5)
                 return False
             else:
                 return True
@@ -297,6 +318,10 @@ def main():
                     if result.outcome == 2:
                         return 'aborted'
                     else:
+                        pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+                        pub_log_info.publish(String("Going to start point"))
+                        pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+                        pub_pm_play_melody.publish(Int16(2))  # 5:short_beep, 1:beep, 2:double beep,
                         return 'succeeded'
 
                 smach.StateMachine.add('GET_PATH_TO_START', smach_ros.SimpleActionState(
@@ -345,7 +370,11 @@ def main():
                     msg = Int16()
                     msg.data = userdata.zone_cut_height
                     pub_status = pub_mower_set_cut_height.publish(msg)
-                    rospy.sleep(0.5)
+                    pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+                    pub_log_info.publish(String("Setting mower height"))
+                    pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+                    pub_pm_play_melody.publish(Int16(1))  # 5:short_beep, 1:beep, 2:double beep,
+                    rospy.sleep(1.5)
                     if pub_status is None:
                         return 'success'
 
@@ -391,6 +420,8 @@ def main():
                     msg = Bool()
                     msg.data = True
                     pub_status = pub_mower_set_motor_on.publish(msg)
+                    pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+                    pub_log_info.publish(String("Mowing started..."))
                     if pub_status is None:
                         return 'success'
 
@@ -611,6 +642,7 @@ def main():
             msg = Bool()
             msg.data = False
             pub_status = pub_mower_off.publish(msg)
+            rospy.sleep(1.5)
             if pub_status is None:
                 return 'success'
 
@@ -620,6 +652,8 @@ def main():
         # Callback for mower set cut height WAIT_MOWER_OFF
         def callback_set_mower_off(userdata, msg):
             if msg.status == 'OFF':
+                pub_active_prg = rospy.Publisher('/mower_smach/active_program', String, latch=True, queue_size=1)
+                pub_status = pub_active_prg.publish(String(" "))
                 return False
             else:
                 return True

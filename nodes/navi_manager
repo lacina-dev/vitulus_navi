@@ -47,6 +47,7 @@ import actionlib
 # Brings in the .action file and messages used by the move base action
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 import math
+from vitulus_msgs.msg import StringList
 
 
 
@@ -155,7 +156,7 @@ interactive_marker_pose = Pose
 save_map_msg = String()
 remove_map_msg = String()
 edit_map_msg = String()
-load_map_msg = String()
+load_map_msg = "New"
 new_map_msg = String()
 status_msg = String()
 string_msg = String()
@@ -191,6 +192,7 @@ print("#########################################################################
 
 
 map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
+map_list_str_pub = rospy.Publisher('navi_manager/map_str_list', StringList, queue_size=10)
 waypoint_list_pub = rospy.Publisher('navi_manager/waypoint_list', Path, queue_size=10)
 status_msg_pub = rospy.Publisher('navi_manager/status', String, queue_size=10)
 pub_sound = rospy.Publisher('/sound', Sound, queue_size=10)
@@ -201,6 +203,7 @@ map_path_pub = rospy.Publisher('navi_manager/map_path', Path, queue_size=10)
 map_path_goal_arr_pub = rospy.Publisher('move_base_client/goals_arr', Path, queue_size=10)
 oodometry_odom_pub = rospy.Publisher('odometry/odom', Odometry, queue_size=10)
 pose_cov_stamped_pub = rospy.Publisher('pose_cov_stamped', PoseWithCovarianceStamped, queue_size=10)
+pub_active_map = rospy.Publisher('navi_manager/active_map', String, queue_size=10, latch=True)
 
 tf = None
 tf2_Buffer = None
@@ -282,6 +285,12 @@ def get_maplist():
     onlyfiles = ["{} ({:.2f} GB)".format(f, float(os.path.getsize(join(mypath, f)))/1000000000).replace(".db", "") for f in listdir(mypath) if isfile(join(mypath, f))]
     onlyfilesStr = '---'.join(onlyfiles)
     map_list_pub.publish(onlyfilesStr)
+    str_list_msg = StringList()
+    for map in onlyfiles:
+        str_list_msg.string_list.append(map)
+    str_list_msg.header.stamp = rospy.Time.now()
+    str_list_msg.header.frame_id = "map"
+    map_list_str_pub.publish(str_list_msg)
     return onlyfiles
 
 
@@ -387,6 +396,8 @@ def callback_save_map(msg):
             rospy.loginfo("There is no map to save.")
         global navi_launch
         navi_launch = start_navi_launch(["localization:=true"])
+        global load_map_msg
+        load_map_msg = save_map_msg
     else:
         status_msg_pub.publish("Map not saved. Empty name.")
         rospy.logerr("Map not saved. Empty name.")
@@ -446,6 +457,8 @@ def callback_load_map(msg, init=False):
 def callback_new_map(msg):
     global new_map_msg
     new_map_msg = msg.data
+    global load_map_msg
+    load_map_msg = "New"
 
     if new_map_msg != "":
         if new_map_msg != "INIT":
@@ -1343,6 +1356,8 @@ def navi_manager():
             publish_map_point_list()
             publish_map_path_list()
             publish_map_path(path_to_publish)
+            global load_map_msg
+            pub_active_map.publish(String(load_map_msg))
             # set_odom_transform()
             # set_map_utm_transform()
             slow_counter = 0

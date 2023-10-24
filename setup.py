@@ -5,7 +5,7 @@ from catkin_pkg.python_setup import generate_distutils_setup
 
 # fetch values from package.xml
 setup_args = generate_distutils_setup(
-    packages=['navi_manager'],
+    packages=['navi_man'],
     package_dir={'': 'src'}
 )
 

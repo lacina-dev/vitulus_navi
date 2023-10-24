@@ -1,0 +1,30 @@
+<launch>
+
+    <arg name="arg_ns" default="/"/>
+    <group ns="$(arg arg_ns)">
+
+        <!--    #### Node template  #####-->
+        <node name="navi_man" pkg="vitulus_navi" type="navi_man" respawn="true" respawn_delay="1" output="screen">
+<!--            <param name="prm_name" value="prm_value"/>-->
+<!--            <remap from="/topic" to="/another_topic" />-->
+        </node>
+<!--        <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="screen">-->
+<!--&lt;!&ndash;            <param name="prm_name" value="prm_value"/>&ndash;&gt;-->
+<!--&lt;!&ndash;            <remap from="/topic" to="/another_topic" />&ndash;&gt;-->
+<!--        </node>-->
+
+    </group>
+
+<!--    <include file="$(find vitulus_pkg_template)/launch/template.launch">-->
+<!--&lt;!&ndash;        <param name="prm_name" value="prm_value"/>&ndash;&gt;-->
+<!--&lt;!&ndash;        <remap from="/topic" to="/another_topic" />&ndash;&gt;-->
+<!--    </include>-->
+
+    <!--##### Show in Rviz #####-->
+    <!--    <node name="rviz"-->
+    <!--              pkg="rviz"-->
+    <!--              type="rviz"-->
+    <!--              args="-d $(find vitulus_imu)/rviz/imu.rviz"-->
+    <!--              required="false" />-->
+
+</launch>

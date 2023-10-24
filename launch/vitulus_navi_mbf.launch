@@ -69,7 +69,7 @@
 <!--    <remap from="map" to="/map_fill"/>-->
 <!--     <remap from="map" to="/map"/> -->
 <!--    <remap from="map" to="/map_assembled"/>-->
-    <remap from="map" to="/map_edited"/>
+    <remap from="map" to="/web_plan/map_edited"/>
 
 
 

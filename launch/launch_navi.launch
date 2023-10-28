@@ -1,11 +1,13 @@
 <launch>
 
-    <include file="$(find vitulus_navi)/launch/vitulus_navi_outdoor.launch" pass_all_args="true">
-    </include>
-    <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="screen" />
-
-<!--     <include file="$(find vitulus_navi)/launch/vitulus_navi_indoor.launch">-->
+<!--    <include file="$(find vitulus_navi)/launch/vitulus_navi_outdoor.launch" pass_all_args="true">-->
 <!--    </include>-->
+<!--    <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="screen" />-->
+<!--    <node name="node_smach_exe_path" pkg="vitulus_navi" type="smach_exe_path" respawn="true" respawn_delay="1" output="screen" />-->
+<!--    <node name="node_exe_goal" pkg="vitulus_navi" type="mower_exe_goal" respawn="true" respawn_delay="1" output="screen" />-->
+
+     <include file="$(find vitulus_navi)/launch/vitulus_navi_indoor.launch">
+    </include>
 
 
 

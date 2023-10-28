@@ -52,6 +52,7 @@ from visualization_msgs.msg import *
 import actionlib
 # Brings in the .action file and messages used by the move base action
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from actionlib_msgs.msg import GoalStatusArray
 import math
 from vitulus_msgs.msg import StringList
 
@@ -204,6 +205,8 @@ class DockerConnection:
         self.cont_name = cont_name
         self.cont = None
         self.cont_command = None
+        self.indoor = "/rtabmap_docker/rtabmap_indoor.launch"
+        self.outdoor = "/rtabmap_docker/rtabmap_outdoor.launch"
 
     def stop(self):
         try:
@@ -257,6 +260,7 @@ class Node:
         self.point_to_publish = ""
         self.path_to_publish = ""
         self.move_base_client_state = ""
+        self.indoor = False
 
         self.map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
         self.map_list_str_pub = rospy.Publisher('navi_manager/map_str_list', StringList, queue_size=10)
@@ -267,11 +271,14 @@ class Node:
         self.map_point_list_pub = rospy.Publisher('navi_manager/map_point_list', String, queue_size=10)
         self.map_path_list_pub = rospy.Publisher('navi_manager/map_path_list', String, queue_size=10)
         self.map_path_pub = rospy.Publisher('navi_manager/map_path', Path, queue_size=10)
-        self.map_path_goal_arr_pub = rospy.Publisher('move_base_client/goals_arr', Path, queue_size=10)
+        self.map_path_goal_arr_pub = rospy.Publisher('/move_base_smach/exe_path', Path, queue_size=10)
+        self.map_goal_pub = rospy.Publisher('/move_base_smach/goal', PoseStamped, queue_size=10)
         # self.odometry_odom_pub = rospy.Publisher('odometry/odom', Odometry, queue_size=10)
         self.pose_cov_stamped_pub = rospy.Publisher('pose_cov_stamped', PoseWithCovarianceStamped, queue_size=10)
         self.pub_active_map = rospy.Publisher('navi_manager/active_map', String, queue_size=10, latch=False)
         self.pub_map_status = rospy.Publisher('navi_manager/map_status', String, queue_size=10, latch=False)
+        self.is_rtabmap_pub = rospy.Publisher('navi_manager/is_rtabmap', Bool, queue_size=1, latch=True)
+
 
         self.sub_nm_new_interactive_marker = rospy.Subscriber("/navi_manager/new_interactive_marker", Pose, self.callback_new_interactive_marker)
         self.server = InteractiveMarkerServer("interactive_marker")
@@ -302,13 +309,15 @@ class Node:
         rospy.Subscriber("/navi_manager/save_path", String, self.callback_save_path)
         rospy.Subscriber("/navi_manager/save_path_point", String, self.callback_save_path_point)
         rospy.Subscriber("/navi_manager/publish_path", String, self.callback_publish_path)
-        rospy.Subscriber("/move_base_client/state", String, self.callback_move_base_client_state)
+        rospy.Subscriber("/move_base_flex/exe_path/status", GoalStatusArray, self.callback_move_base_client_state)
+        # rospy.Subscriber("/move_base_client/state", String, self.callback_move_base_client_state)
         rospy.Subscriber("/navi_manager/execute_path", String, self.callback_execute_path)
         rospy.Subscriber("/navi_manager/interactive_marker_goal", String, self.callback_interactive_marker_goal)
         # rospy.Subscriber("/odometry/filtered/navsat", Odometry, self.callback_odom_filtered_navsat)
         # rospy.Subscriber("/odometry/filtered/imu", Odometry, self.callback_odom_filtered_imu)
         rospy.Subscriber("/odometry/gps", Odometry, self.callback_odom_gps)
         rospy.Subscriber("/odometry/odom", Odometry, self.callback_odometry_odom)
+        rospy.Subscriber("/navi_manager/is_indoor", Bool, self.callback_is_indoor)
 
 
         print("##############################################################################################")
@@ -343,6 +352,9 @@ class Node:
     def callback_odometry_odom(self, msg):
         self.msg_odometry_odom = msg
 
+    def callback_is_indoor(self, msg):
+        self.indoor = msg.data
+
     def callback_odom_gps(self, msg):
         self.last_odom_gps_stamp = msg.header.stamp
 
@@ -355,9 +367,42 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.logwarn("The name is empty!")
 
+    # def callback_move_base_client_state(self, msg):
+    #     if msg.data != "":
+    #         self.move_base_client_state = msg.data
+
     def callback_move_base_client_state(self, msg):
-        if msg.data != "":
-            self.move_base_client_state = msg.data
+        # print(msg)
+        self.move_base_client_state = "READY"
+        for status in msg.status_list:
+            if status.status == 1:
+                self.move_base_client_state = "ACTIVE"
+                break
+        # print(self.move_base_client_state)
+
+    # def callback_interactive_marker_goal(self, msg):
+    #     self.status_msg_pub.publish("Interactive marker is new goal")
+    #     rospy.loginfo("Interactive marker is new goal")
+    #     if msg.data != "":
+    #         print(self.interactive_marker_pose.position)
+    #         point = Pose()
+    #         point.position = self.interactive_marker_pose.position
+    #         point.orientation = self.interactive_marker_pose.orientation
+    #         if point:
+    #             goal = MoveBaseGoal()
+    #             goal.target_pose.pose = point
+    #             goal.target_pose.header.frame_id = 'map'
+    #             goal.target_pose.header.stamp = rospy.Time.now()
+    #
+    #             self.status_msg_pub.publish("Interactive marker goal sending to move_base")
+    #             rospy.loginfo("Interactive marker goal sending to move_base")
+    #             result = self.movebase_client(goal)
+    #             if result:
+    #                 self.status_msg_pub.publish("Interactive marker goal reached")
+    #                 rospy.loginfo("Interactive marker goal reached")
+    #     else:
+    #         self.status_msg_pub.publish("The name is empty!")
+    #         rospy.loginfo("The name is empty!")
 
     def callback_interactive_marker_goal(self, msg):
         self.status_msg_pub.publish("Interactive marker is new goal")
@@ -368,20 +413,50 @@ class Node:
             point.position = self.interactive_marker_pose.position
             point.orientation = self.interactive_marker_pose.orientation
             if point:
-                goal = MoveBaseGoal()
-                goal.target_pose.pose = point
-                goal.target_pose.header.frame_id = 'map'
-                goal.target_pose.header.stamp = rospy.Time.now()
+                goal = PoseStamped()
+                goal.pose = point
+                goal.header.frame_id = 'map'
+                goal.header.stamp = rospy.Time.now()
 
                 self.status_msg_pub.publish("Interactive marker goal sending to move_base")
                 rospy.loginfo("Interactive marker goal sending to move_base")
-                result = self.movebase_client(goal)
-                if result:
-                    self.status_msg_pub.publish("Interactive marker goal reached")
-                    rospy.loginfo("Interactive marker goal reached")
+                self.map_goal_pub.publish(goal)
         else:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
+
+    #
+    # def callback_execute_path(self, msg):
+    #     if msg.data != "":
+    #         print(self.move_base_client_state)
+    #         if self.move_base_client_state == "READY":
+    #             path = self.running_map_data.get_map_path(msg.data)
+    #             print("path")
+    #             print(path)
+    #             if path:
+    #                 path_exe = Path()
+    #                 path_exe.header.frame_id = path.tf_frame
+    #                 path_exe.header.stamp = rospy.Time.now()
+    #                 for pose in path.poses:
+    #                     pose_st = PoseStamped()
+    #                     pose_st.header.stamp = rospy.Time.now()
+    #                     pose_st.header.frame_id = path.tf_frame
+    #                     pose_st.pose = pose
+    #                     path_exe.poses.append(pose_st)
+    #                 self.map_path_goal_arr_pub.publish(path_exe)
+    #
+    #                 self.status_msg_pub.publish("{} path is sent to move base client".format(msg.data))
+    #                 rospy.loginfo("{} path is sent to move base client".format(msg.data))
+    #             else:
+    #                 self.status_msg_pub.publish("{} path does not exist".format(msg.data))
+    #                 rospy.logwarn("{} path does not exist".format(msg.data))
+    #         else:
+    #             self.status_msg_pub.publish(
+    #                 "Move base client executing another task. The {} can't be executed".format(msg.data))
+    #             rospy.logwarn("Move base client executing another task. The {} can't be executed".format(msg.data))
+    #     else:
+    #         self.status_msg_pub.publish("The name is empty!")
+    #         rospy.logwarn("The name is empty!")
 
     def callback_execute_path(self, msg):
         if msg.data != "":
@@ -447,27 +522,45 @@ class Node:
         else:
             return client.get_result()
 
-
     def callback_goal_point(self, msg):
         self.status_msg_pub.publish("{} is new goal".format(msg.data))
         rospy.loginfo("{} is new goal".format(msg.data))
         if msg.data != "":
             point = self.running_map_data.get_map_point(msg.data)
             if point:
-                goal = MoveBaseGoal()
-                goal.target_pose.pose = point.pose
-                goal.target_pose.header.frame_id = point.marker_message.header.frame_id
-                goal.target_pose.header.stamp = rospy.Time.now()
+                goal = PoseStamped()
+                goal.pose = point.pose
+                goal.header.frame_id = point.marker_message.header.frame_id
+                goal.header.stamp = rospy.Time.now()
 
                 self.status_msg_pub.publish("{} goal sending to move_base".format(msg.data))
                 rospy.loginfo("{} goal sending to move_base".format(msg.data))
-                result = self.movebase_client(goal)
-                if result:
-                    self.status_msg_pub.publish("{} goal reached".format(msg.data))
-                    rospy.loginfo("{} goal reached".format(msg.data))
+                self.map_goal_pub.publish(goal)
         else:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
+
+
+    # def callback_goal_point(self, msg):
+    #     self.status_msg_pub.publish("{} is new goal".format(msg.data))
+    #     rospy.loginfo("{} is new goal".format(msg.data))
+    #     if msg.data != "":
+    #         point = self.running_map_data.get_map_point(msg.data)
+    #         if point:
+    #             goal = MoveBaseGoal()
+    #             goal.target_pose.pose = point.pose
+    #             goal.target_pose.header.frame_id = point.marker_message.header.frame_id
+    #             goal.target_pose.header.stamp = rospy.Time.now()
+    #
+    #             self.status_msg_pub.publish("{} goal sending to move_base".format(msg.data))
+    #             rospy.loginfo("{} goal sending to move_base".format(msg.data))
+    #             result = self.movebase_client(goal)
+    #             if result:
+    #                 self.status_msg_pub.publish("{} goal reached".format(msg.data))
+    #                 rospy.loginfo("{} goal reached".format(msg.data))
+    #     else:
+    #         self.status_msg_pub.publish("The name is empty!")
+    #         rospy.loginfo("The name is empty!")
 
     def callback_save_path(self, msg):
         if msg.data != "":
@@ -690,12 +783,22 @@ class Node:
         self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, [
             "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/launch_navi.launch"])
         self.navi_launch.start()
+        self.is_rtabmap_pub.publish(Bool(False))
         if not localization:
-            self.rtabmap_mapping.run(["roslaunch", "/rtabmap_docker/rtabmap_outdoor.launch"] + args)
+            self.is_rtabmap_pub.publish(Bool(True))
+            if not self.indoor:
+                self.rtabmap_mapping.run(["roslaunch", self.rtabmap_mapping.outdoor] + args)
+            else:
+                self.rtabmap_mapping.run(["roslaunch", self.rtabmap_mapping.indoor] + args)
         else:
             if rtabmap_run:
-                self.rtabmap_mapping.run(["roslaunch", "/rtabmap_docker/rtabmap_outdoor.launch"] + args)
+                self.is_rtabmap_pub.publish(Bool(True))
+                if not self.indoor:
+                    self.rtabmap_mapping.run(["roslaunch", self.rtabmap_mapping.outdoor] + args)
+                else:
+                    self.rtabmap_mapping.run(["roslaunch", self.rtabmap_mapping.indoor] + args)
             else:
+                self.is_rtabmap_pub.publish(Bool(False))
                 self.rtabmap_mapping.stop()
 
         rospy.loginfo("Vitulus navi started.")
@@ -704,7 +807,8 @@ class Node:
 
     def shutdown_navi_launch(self):
         self.status_msg_pub.publish("Stopping navi module.")
-        self.navi_launch.shutdown()
+        if self.navi_launch is not None:
+            self.navi_launch.shutdown()
         self.rtabmap_mapping.stop()
         rospy.loginfo("Vitulus navi stopped.")
         self.status_msg_pub.publish("Vitulus navi stopped.")
@@ -712,7 +816,8 @@ class Node:
     def callback_save_map(self, msg):
         if msg.data != "":
             # self.map_status = "Loading"
-            self.save_map_utm_pose()
+            if not self.indoor:
+                self.save_map_utm_pose()
             self.shutdown_navi_launch()
             self.status_msg_pub.publish("Saving the map...")
             if (exists("/home/vitulus/.ros/rtabmap.db") and exists("/home/vitulus/.ros/mapdata.pkl")):

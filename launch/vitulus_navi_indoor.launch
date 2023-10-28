@@ -16,7 +16,7 @@
 <!--    <include file="$(find vitulus_slam)/launch/rtabmap.launch" pass_all_args="true">-->
 <!--    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" pass_all_args="true">-->
 
-    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" />
+<!--    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" />-->
 <!--    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" pass_all_args="true" />-->
 
 <!--    <include file="$(find vitulus_slam)/launch/vitulus_rtabmap4wd.launch" pass_all_args="true">-->
@@ -30,7 +30,7 @@
 
 
 <!--    MOVE BASE-->
-    <include file="$(find vitulus_navi)/launch/vitulus_navi.launch">
+    <include file="$(find vitulus_navi)/launch/vitulus_navi_mbf.launch">
     </include>
 
 

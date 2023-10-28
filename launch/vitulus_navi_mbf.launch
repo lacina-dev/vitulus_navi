@@ -30,7 +30,9 @@
     <rosparam file="$(find vitulus_navi)/config/costmap_common_params.yaml" command="load" ns="local_costmap" />
     <rosparam file="$(find vitulus_navi)/config/local_costmap_params.yaml" command="load" />
     <rosparam file="$(find vitulus_navi)/config/global_costmap_params.yaml" command="load" />
-    <rosparam file="$(find vitulus_navi)/config/move_base.yaml" command="load"/>
+<!--    <rosparam file="$(find vitulus_navi)/config/move_base.yaml" command="load"/>-->
+    <rosparam file="$(find vitulus_navi)/config/planners.yaml" command="load"/>
+    <rosparam file="$(find vitulus_navi)/config/controllers.yaml" command="load"/>
     <rosparam file="$(find vitulus_navi)/config/base_teb_local_planner_params.yaml" command="load" />
     <rosparam file="$(find vitulus_navi)/config/base_local_planner_params.yaml" command="load" />
     <rosparam file="$(find vitulus_navi)/config/dwa_local_planner_params.yaml" command="load" />
@@ -42,7 +44,7 @@
 <!--     <rosparam file="$(find vitulus_navi)/config/sbpl_lattice_planner_params.yaml" command="load" /> -->
    <!--    <param name="base_global_planner" value="navfn/NavfnROS" />-->
 
-<!--    <param name="base_global_planner" value="global_planner/GlobalPlanner" />-->
+    <param name="base_global_planner" value="global_planner/GlobalPlanner" />
 
 <!--    <param name="base_global_planner" value="carrot_planner/CarrotPlanner" />-->
 <!--    <param name="base_global_planner" value="SBPLLatticePlanner" />-->
@@ -51,7 +53,7 @@
 <!--		<param name="planner_frequency" value="1.0" />-->
 <!--		<param name="planner_patience" value="5.0" />-->
 
-<!--    <param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS" />-->
+    <param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS" />
 
 <!--    <param name="base_local_planner" value="base_local_planner/TrajectoryPlannerROS" />-->
 
@@ -76,8 +78,10 @@
 
 
  </node>
+
 <!-- <node name="move_base_legacy_relay" pkg="mbf_costmap_nav" type="move_base_legacy_relay.py">-->
-<!--&lt;!&ndash;     <rosparam file="$(find turtlebot3_mbf)/param/default_planner.yaml" command="load"/> &ndash;&gt;-->
+<!--    <param name="base_global_planner" value="GlobalPlanner" />-->
+<!--    <param name="base_local_planner" value="TebLocalPlannerROS" />-->
 
 <!--  </node>-->
 

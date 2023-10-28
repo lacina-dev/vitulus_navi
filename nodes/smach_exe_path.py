@@ -1,0 +1,261 @@
+#!/usr/bin/env python
+import rospy
+import shapely
+import smach
+import smach_ros
+from smach_ros import ServiceState
+from smach import Iterator, CBState
+import math
+from shapely import geometry
+
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Path
+from std_msgs.msg import Bool, String, Int16
+from vitulus_msgs.msg import PlannerProgram, Mower
+from mbf_msgs.msg import ExePathAction
+from mbf_msgs.msg import GetPathAction
+from mbf_msgs.msg import RecoveryAction
+from mbf_msgs.srv import CheckPath, CheckPathRequest, CheckPathResponse
+import PyKDL as kdl
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
+
+
+class GetPathData(smach.State):
+    def __init__(self):
+        smach.State.__init__(self, outcomes=['available', 'failed'],
+                             input_keys=['path', 'path_to_exe'],
+                             output_keys=['path'])
+    def path_to_polygon(self, path):
+        # create shapely polygon from path poses
+        polygon = geometry.LinearRing([[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
+        polygon = shapely.remove_repeated_points(polygon)
+        return polygon
+
+    def path_to_multiline(self, path):
+        # create shapely multiline string from path poses
+        multiline = geometry.MultiLineString(
+            [[[pose.pose.position.x, pose.pose.position.y] for pose in path.poses]])
+        return multiline
+
+    def path_to_line(self, path):
+        # create shapely multiline string from path poses
+        line = geometry.LineString(
+            [[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
+        return line
+
+    def direction(self, line):
+        # point_2.x - point_1.x, point_2.y - point_1.y)
+        x = line[1][0] - line[0][0]
+        y = line[1][1] - line[0][1]
+        diagonal = math.sqrt(x ** 2 + y ** 2)
+        if y < 0:
+            if x >= 0:
+                angle = math.asin(y / diagonal)
+            else:
+                angle = math.acos(x / diagonal) * -1
+        else:
+            if x >= 0:
+                angle = math.asin(y / diagonal)
+            else:
+                angle = math.acos(x / diagonal)
+        return angle
+
+    def execute(self, userdata):
+        rospy.loginfo('[{}]Getting path data - state GET_PATH_DATA'.format(rospy.get_caller_id()))
+        path = userdata.path_to_exe
+        line = geometry.LineString([[path.poses[0].pose.position.x, path.poses[0].pose.position.y],
+                                    [path.poses[-1].pose.position.x, path.poses[-1].pose.position.y]])
+
+        print("#########################################################")
+        print("#########################################################")
+        print("Line length: {}".format(line.length))
+        segmentize_distance = 0.03
+        if line.length == 0:
+            print("Outline path")
+            start_offset = 0.18
+            start_poses_offset = int(round(start_offset / segmentize_distance))
+            # print("start_poses_offset: {}".format(start_poses_offset))
+            path_new = Path()
+            path_new.header = path.header
+            polygon = self.path_to_polygon(path)
+            # polygon = polygon.exterior
+            # print("polygon: {}".format(polygon))
+            for n in range(0, len(polygon.coords) - 1):
+                line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]],
+                                            [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
+                # print("Line* length: {}".format(line.length))
+                angle = self.direction(line.coords)
+                line = line.segmentize(segmentize_distance)
+                for point in line.coords:
+                    pose = PoseStamped()
+                    pose.header.frame_id = "map"
+                    pose.header.stamp = rospy.Time.now()
+                    pose.pose.position.x = point[0]
+                    pose.pose.position.y = point[1]
+                    pose.pose.position.z = 0.0
+                    pose.pose.orientation = Quaternion(
+                        *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                    path_new.poses.append(pose)
+            path_new.poses = path_new.poses[0:-start_poses_offset]
+            path_new.poses = path_new.poses[start_poses_offset:]
+            path = path_new
+            userdata.path_start_pose = path.poses[0]
+            userdata.final_pose = path.poses[-1]
+
+        # else:
+        #     print("Coverage path")
+        #     line = self.path_to_line(path)
+        #     path_new = Path()
+        #     path_new.header.frame_id = "map"
+        #     path_new.header.stamp = rospy.Time.now()
+        #
+        #     line = line.segmentize(segmentize_distance)
+        #     for pose_id in range(0, len(line.coords) - 1):
+        #         angle = self.direction([[line.coords[pose_id][0], line.coords[pose_id][1]],
+        #                                [line.coords[pose_id + 1][0], line.coords[pose_id + 1][1]]])
+        #         pose = PoseStamped()
+        #         pose.header.frame_id = "map"
+        #         pose.header.stamp = rospy.Time.now()
+        #         pose.pose.position.x = line.coords[pose_id][0]
+        #         pose.pose.position.y = line.coords[pose_id][1]
+        #         pose.pose.position.z = 0.0
+        #         pose.pose.orientation = Quaternion(
+        #             *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+        #         path_new.poses.append(pose)
+        #     path = path_new
+
+        print("#########################################################")
+        print("#########################################################")
+        # publish current path
+        pub_current_path = rospy.Publisher('/test_path', Path, latch=True, queue_size=1)
+        pub_status = pub_current_path.publish(path)
+
+
+        userdata.path = path
+
+        print("Path length: {}  ************************".format(len(userdata.path.poses)))
+        return 'available'
+
+
+def main():
+    rospy.init_node('mbf_state_machine')
+
+    # Create SMACH state machine
+    sm = smach.StateMachine(outcomes=['succeeded', 'aborted', 'preempted'])
+
+    # Define userdata
+    sm.userdata.path_to_exe = None
+    sm.userdata.path = None
+    sm.userdata.error = None
+    sm.userdata.clear_costmap_flag = False
+    sm.userdata.error_status = None
+
+    with sm:
+        # Goal callback for state WAIT_FOR_PATH
+        def path_to_exe_cb(userdata, msg):
+            userdata.path_to_exe = msg
+            return False
+
+        smach.StateMachine.add(
+            'WAIT_FOR_PATH',
+            smach_ros.MonitorState(
+                '/move_base_smach/exe_path',
+                Path,
+                path_to_exe_cb,
+                output_keys=['path_to_exe']
+            ),
+            transitions={
+                'invalid': 'GET_PATH_DATA',
+                'valid': 'WAIT_FOR_PATH',
+                'preempted': 'preempted'
+            }
+        )
+
+        # Add state GET_PATH_DATA
+        smach.StateMachine.add('GET_PATH_DATA', GetPathData(),
+                               transitions={'available': 'CHECK_PATH',
+                                            'failed': 'CHECK_PATH'})
+
+        # Add state CHECK_PATH - service call to check path
+        @smach.cb_interface(input_keys=['path'])
+        def check_path_request_cb(userdata, request):
+            srvs_request = CheckPathRequest()
+            srvs_request.path = userdata.path
+            srvs_request.safety_dist = 0.1
+            srvs_request.lethal_cost_mult = 0
+            srvs_request.inscrib_cost_mult = 0
+            srvs_request.unknown_cost_mult = 0
+            srvs_request.costmap = CheckPathRequest.GLOBAL_COSTMAP
+            srvs_request.skip_poses = 0
+            srvs_request.use_padded_fp = False
+            srvs_request.path_cells_only = False
+            return srvs_request
+
+        def check_path_response_cb(userdata, response):
+            print("result: {}".format(response))
+            return 'succeeded'
+
+        smach.StateMachine.add('CHECK_PATH',
+                               ServiceState('/move_base_flex/check_path_cost',
+                                            CheckPath,
+                                            request_cb=check_path_request_cb,
+                                            response_cb=check_path_response_cb,
+                                            input_keys=['path']),
+                               transitions={'succeeded': 'EXE_PATH',
+                                            'aborted': 'CHECK_PATH',
+                                            'preempted': 'preempted'})
+
+        # Execute path
+        smach.StateMachine.add(
+            'EXE_PATH',
+            smach_ros.SimpleActionState(
+                '/move_base_flex/exe_path',
+                ExePathAction,
+                goal_slots=['path']
+            ),
+            transitions={
+                'succeeded': 'WAIT_FOR_PATH',
+                'aborted': 'RECOVERY',
+                'preempted': 'preempted'
+            }
+        )
+
+        # Goal callback for state RECOVERY
+        def recovery_path_goal_cb(userdata, goal):
+            if userdata.clear_costmap_flag == False:
+                goal.behavior = 'clear_costmap'
+                userdata.clear_costmap_flag = True
+            else:
+                goal.behavior = 'straf_recovery'
+                userdata.clear_costmap_flag = False
+
+        # Recovery
+        smach.StateMachine.add(
+            'RECOVERY',
+             smach_ros.SimpleActionState(
+                'move_base_flex/recovery',
+                RecoveryAction,
+                goal_cb=recovery_path_goal_cb,
+                input_keys=["error", "clear_costmap_flag"],
+                output_keys = ["error_status", 'clear_costmap_flag']
+            ),
+            transitions={
+                'succeeded': 'CHECK_PATH',
+                'aborted': 'WAIT_FOR_PATH',
+                'preempted': 'preempted'
+            }
+        )
+
+    # Create and start introspection server
+    sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT')
+    sis.start()
+
+    # Execute SMACH plan
+    sm.execute()
+
+    # Wait for interrupt and stop introspection server
+    rospy.spin()
+    sis.stop()
+
+if __name__=="__main__":
+    main()

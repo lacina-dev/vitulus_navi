@@ -4,6 +4,7 @@ import smach_ros
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
+from std_msgs.msg import Int16, String
 
 from mbf_msgs.msg import ExePathAction
 from mbf_msgs.msg import GetPathAction
@@ -46,13 +47,26 @@ def main():
         )
 
         # Get path
+        def get_path_result_cb(userdata, status, result):
+            print("get path status: {}".format(status))
+            print("get path result: {}".format(result.message))
+            if result.outcome == 2:
+                return 'aborted'
+            else:
+                pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+                pub_log_info.publish(String("Get path"))
+                pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+                pub_pm_play_melody.publish(Int16(5))  # 5:short_beep, 1:beep, 2:double beep,
+                return 'succeeded'
+
         smach.StateMachine.add(
             'GET_PATH',
             smach_ros.SimpleActionState(
                 '/move_base_flex/get_path',
                 GetPathAction,
                 goal_slots=['target_pose'],
-                result_slots=['path']
+                result_slots=['path'],
+                result_cb=get_path_result_cb
             ),
             transitions={
                 'succeeded': 'EXE_PATH',
@@ -100,7 +114,7 @@ def main():
             ),
             transitions={
                 'succeeded': 'GET_PATH',
-                'aborted': 'aborted',
+                'aborted': 'WAIT_FOR_GOAL',
                 'preempted': 'preempted'
             }
         )

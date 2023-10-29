@@ -278,6 +278,7 @@ class Node:
         self.pub_active_map = rospy.Publisher('navi_manager/active_map', String, queue_size=10, latch=False)
         self.pub_map_status = rospy.Publisher('navi_manager/map_status', String, queue_size=10, latch=False)
         self.is_rtabmap_pub = rospy.Publisher('navi_manager/is_rtabmap', Bool, queue_size=1, latch=True)
+        self.is_indoor_pub = rospy.Publisher('navi_manager/is_indoor', Bool, queue_size=1, latch=True)
 
 
         self.sub_nm_new_interactive_marker = rospy.Subscriber("/navi_manager/new_interactive_marker", Pose, self.callback_new_interactive_marker)
@@ -1095,6 +1096,7 @@ if __name__ == '__main__':
                 node.publish_map_path_list()
                 node.publish_map_path(node.path_to_publish)
                 node.pub_active_map.publish(String(node.active_map))
+                node.is_indoor_pub.publish(Bool(node.indoor))
                 node.pub_map_status.publish(String(node.map_status))
                 node.set_map_status()
                 slow_counter = 0

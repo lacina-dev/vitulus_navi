@@ -777,7 +777,8 @@ class Node:
                 rtabmap_run = True
                 rtabmap_change_id = ch_id
             ch_id += 1
-        args[rtabmap_change_id] = "localization:=true"
+        if rtabmap_run:
+            args[rtabmap_change_id] = "localization:=true"
         # sys.argv.append("rtabmap_args:=--delete_db_on_start")
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
         roslaunch.configure_logging(uuid)

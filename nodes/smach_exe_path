@@ -7,6 +7,9 @@ from smach_ros import ServiceState
 from smach import Iterator, CBState
 import math
 from shapely import geometry
+import signal
+import sys
+import time
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
@@ -249,6 +252,18 @@ def main():
     # Create and start introspection server
     sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT')
     sis.start()
+
+    def signal_handler(sig, frame):
+        print("Shutting down...")
+        # print(node)
+        rospy.signal_shutdown("end")
+        sm.request_preempt()
+        sis.stop()
+        sis.clear()
+        time.sleep(1)
+        # sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
 
     # Execute SMACH plan
     sm.execute()

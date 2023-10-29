@@ -7,6 +7,9 @@ from smach_ros import ServiceState
 from smach import Iterator, CBState
 import math
 from shapely import geometry
+import signal
+import sys
+import time
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
@@ -24,7 +27,7 @@ import sys
 
 class GetZoneData(smach.State):
     def __init__(self):
-        smach.State.__init__(self, outcomes=['available', 'failed'],
+        smach.State.__init__(self, outcomes=['available', 'failed', 'preempted'],
                              input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index', 'zone_name',
                                          'zone_start_pose', 'paths'],
                              output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 'zone_start_pose', 'paths'])
@@ -47,7 +50,7 @@ class GetZoneData(smach.State):
 
 class GetPathData(smach.State):
     def __init__(self):
-        smach.State.__init__(self, outcomes=['available', 'failed'],
+        smach.State.__init__(self, outcomes=['available', 'failed', 'preempted'],
                              input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index', 'zone_name', 'path_planner',
                                          'zone_start_pose', 'path_plan', 'index_path', 'paths', 'path_start_pose',
                                          'path', 'final_pose'],
@@ -184,7 +187,7 @@ class GetPathData(smach.State):
 
 class CheckDistance(smach.State):
     def __init__(self):
-        smach.State.__init__(self, outcomes=['on_place', 'exe_path'],
+        smach.State.__init__(self, outcomes=['on_place', 'exe_path', 'preempted'],
                              input_keys=['path_cost'],
                              output_keys=['path_cost'])
 
@@ -267,7 +270,8 @@ def main():
                 return 'success'
 
         smach.StateMachine.add('POWER_ON_MOWER', CBState(turn_on_mower_cb),
-                               {'success': 'WAIT_FOR_MOWER_ON', 'failure': 'POWER_ON_MOWER'})
+                               {'success': 'WAIT_FOR_MOWER_ON',
+                                'failure': 'POWER_ON_MOWER'})
 
         # Program callback for mower status WAIT_FOR_MOWER_ON
         def callback_mower_status(userdata, msg):
@@ -309,7 +313,9 @@ def main():
             with process_zone_sm:
                 # Add state GET_ZONE_DATA
                 smach.StateMachine.add('GET_ZONE_DATA', GetZoneData(),
-                                       transitions={'available': 'GET_PATH_TO_START', 'failed': 'aborted'})
+                                       transitions={'available': 'GET_PATH_TO_START',
+                                                    'failed': 'aborted',
+                                                    'preempted': 'preempted'})
 
                 # Add state GET_PATH_TO_START - Get path to start point of the zone
                 def get_path_result_cb(userdata, status, result):
@@ -469,7 +475,8 @@ def main():
                         # Add state GET_PATH_DATA
                         smach.StateMachine.add('GET_PATH_DATA', GetPathData(),
                                                transitions={'available': 'GET_PATH_TO_BEGIN_OF_PATH',
-                                                            'failed': 'GET_PATH_TO_BEGIN_OF_PATH'})
+                                                            'failed': 'GET_PATH_TO_BEGIN_OF_PATH',
+                                                            'preempted': 'preempted'})
 
                         # Add state GET_PATH_TO_BEGIN_OF_PATH - Get path to start point of the zone
                         def get_path_to_path_result_cb(userdata, status, result):
@@ -512,7 +519,8 @@ def main():
                         # Add state CHECK_DISTANCE - check if is on place or not
                         smach.StateMachine.add('CHECK_DISTANCE', CheckDistance(),
                                                transitions={'on_place': 'CHECK_PLANNER_PATH',
-                                                            'exe_path': 'EXE_PATH_TO_BEGIN_OF_PATH'})
+                                                            'exe_path': 'EXE_PATH_TO_BEGIN_OF_PATH',
+                                                            'preempted': 'preempted'})
 
                         # Add state EXE_PATH_TO_BEGIN_OF_PATH - Execute path to start point
                         def get_exe_to_path_result_cb(userdata, status, result):
@@ -669,6 +677,19 @@ def main():
     # Create and start introspection server
     sis = smach_ros.IntrospectionServer('smach_server', sm, '/WAIT_FOR_PROGRAM')
     sis.start()
+
+    def signal_handler(sig, frame):
+        print("Shutting down...")
+        # print(node)
+        rospy.signal_shutdown("end")
+        sm.request_preempt()
+        sis.stop()
+        sis.clear()
+        time.sleep(1)
+        # sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
     sm.execute()
     rospy.spin()
     sis.stop()

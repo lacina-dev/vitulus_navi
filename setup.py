@@ -5,7 +5,7 @@ from catkin_pkg.python_setup import generate_distutils_setup
 
 # fetch values from package.xml
 setup_args = generate_distutils_setup(
-    packages=['navi_man'],
+    packages=['navi_man', 'smach_exe_path', 'smach_exe_goal', 'mower_unit_smach'],
     package_dir={'': 'src'}
 )
 

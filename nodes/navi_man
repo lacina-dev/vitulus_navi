@@ -781,8 +781,12 @@ class Node:
         # sys.argv.append("rtabmap_args:=--delete_db_on_start")
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
         roslaunch.configure_logging(uuid)
-        self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, [
-            "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/launch_navi.launch"])
+        # self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/launch_navi.launch"])
+        if self.indoor:
+            self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_indoor.launch"])
+        else:
+            self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, [
+                "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_outdoor.launch"])
         self.navi_launch.start()
         self.is_rtabmap_pub.publish(Bool(False))
         if not localization:

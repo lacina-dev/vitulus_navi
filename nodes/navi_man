@@ -699,34 +699,39 @@ class Node:
 
     def set_map_utm_transform(self):
         # get world odom coords
-        try:
-            trans = self.tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
-            available = True
-        except:
-            available = False
-            # self.map_status = "Loading"
+        if not self.indoor:
+            try:
+                trans = self.tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+                available = True
+            except:
+                available = False
+                # self.map_status = "Loading"
 
-        if available:
-            m_x = 0
-            m_y = 0
-            if self.running_map_data.is_utm():
-                m_x = trans.transform.translation.x - self.running_map_data.utm_x
-                m_y = trans.transform.translation.y - self.running_map_data.utm_y
-                m_orientation_z = self.running_map_data.utm_orientation_z
-                m_orientation_w = self.running_map_data.utm_orientation_w
-            else:
-                m_orientation_z = 0
-                m_orientation_w = 1
+            if available:
+                m_x = 0
+                m_y = 0
+                if self.running_map_data.is_utm():
+                    m_x = trans.transform.translation.x - self.running_map_data.utm_x
+                    m_y = trans.transform.translation.y - self.running_map_data.utm_y
+                    m_orientation_z = self.running_map_data.utm_orientation_z
+                    m_orientation_w = self.running_map_data.utm_orientation_w
+                else:
+                    m_orientation_z = 0
+                    m_orientation_w = 1
 
-            static_transformStamped = TransformStamped()
-            static_transformStamped.header.stamp = rospy.Time.now()
-            static_transformStamped.header.frame_id = "map"
-            static_transformStamped.child_frame_id = "odom"
-            static_transformStamped.transform.translation.x = m_x
-            static_transformStamped.transform.translation.y = m_y
-            static_transformStamped.transform.rotation.z = m_orientation_z
-            static_transformStamped.transform.rotation.w = m_orientation_w
-            self.tf2_TransformBroadcaster.sendTransform(static_transformStamped)
+                static_transformStamped = TransformStamped()
+                static_transformStamped.header.stamp = rospy.Time.now()
+                static_transformStamped.header.frame_id = "map"
+                static_transformStamped.child_frame_id = "odom"
+                static_transformStamped.transform.translation.x = m_x
+                static_transformStamped.transform.translation.y = m_y
+                static_transformStamped.transform.rotation.z = m_orientation_z
+                static_transformStamped.transform.rotation.w = m_orientation_w
+                self.tf2_TransformBroadcaster.sendTransform(static_transformStamped)
+        else:
+            pass
+            # self.tf2_TransformBroadcaster.
+
 
 
     def save_running_map_data(self):
@@ -1084,10 +1089,18 @@ if __name__ == '__main__':
         slow_counter = 0
         slow_nr = int(rate_nr / 2)  # 2x per second
 
-        def signal_handler():
+        def signal_handler(sig, frame):
+            print("Shutting down...")
+            print(node)
+            node.rtabmap_mapping.stop()
+            node.rtabmap_obstacles.stop()
+            node.rtabmap_odom_sync.stop()
             rospy.signal_shutdown("end")
             sys.exit(0)
         signal.signal(signal.SIGINT, signal_handler)
+
+
+
 
         while not rospy.is_shutdown():
             node.set_map_utm_transform()
@@ -1107,6 +1120,14 @@ if __name__ == '__main__':
                 slow_counter = 0
             slow_counter += 1
             rate.sleep()
+
+        # def shutdown_clean():
+        #     print("Shutting down...")
+        #     print(node)
+        #     node.rtabmap_mapping.stop()
+        #     node.rtabmap_obstacles.stop()
+        #     node.rtabmap_odom_sync.stop()
+        # rospy.on_shutdown(shutdown_clean)
 
     except rospy.ROSInterruptException:
         rospy.logerr("<{}> error.".format(rospy.get_caller_id()))

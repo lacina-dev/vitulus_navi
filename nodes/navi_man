@@ -260,7 +260,7 @@ class Node:
         self.point_to_publish = ""
         self.path_to_publish = ""
         self.move_base_client_state = ""
-        self.indoor = True
+        self.indoor = False
 
         self.map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
         self.map_list_str_pub = rospy.Publisher('navi_manager/map_str_list', StringList, queue_size=10)

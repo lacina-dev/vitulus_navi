@@ -1,5 +1,5 @@
 <launch>
-
+    <arg name="map_topic" />
 
     <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="screen" />
     <node name="node_smach_exe_path" pkg="vitulus_navi" type="smach_exe_path" respawn="true" respawn_delay="1" output="screen" />
@@ -33,13 +33,14 @@
 <!--     </include> -->
 
 <!--    <include file="$(find vitulus_navi)/launch/obstacles.launch">-->
-<!--        arg name="multi_robot_name" value="$(arg multi_robot_name)"/-->
+<!--        <arg name="multi_robot_name" value="$(arg multi_robot_name)"/>-->
 <!--    </include>-->
 
 
 
 
    <include file="$(find vitulus_navi)/launch/vitulus_navi_mbf.launch">
+       <arg name="map_topic" value="$(arg map_topic)"/>
    </include>
 
 

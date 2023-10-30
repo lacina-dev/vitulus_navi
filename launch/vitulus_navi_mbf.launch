@@ -1,5 +1,5 @@
 <launch>
-
+  <arg name="map_topic" />
    <!--master auto="start"/>
     Run the map server
     <node name="map_server" pkg="map_server" type="map_server" args="$(find my_map_package)/my_map.pgm my_map_resolution"/>
@@ -71,7 +71,10 @@
 <!--    <remap from="map" to="/map_fill"/>-->
 <!--     <remap from="map" to="/map"/> -->
 <!--    <remap from="map" to="/map_assembled"/>-->
-    <remap from="map" to="/web_plan/map_edited"/>
+<!--    <remap from="map" to="/web_plan/map_edited"/>-->
+    <remap from="map" to="$(arg map_topic)"/>
+
+
 
 
 

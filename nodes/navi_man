@@ -260,7 +260,7 @@ class Node:
         self.point_to_publish = ""
         self.path_to_publish = ""
         self.move_base_client_state = ""
-        self.indoor = False
+        self.indoor = True
 
         self.map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
         self.map_list_str_pub = rospy.Publisher('navi_manager/map_str_list', StringList, queue_size=10)
@@ -777,6 +777,7 @@ class Node:
                 localization = True
             if arg == "localization:=false":
                 localization = False
+                rtabmap_run = True
             if arg == "localization:=true_rtabmap":
                 localization = True
                 rtabmap_run = True
@@ -789,11 +790,33 @@ class Node:
         roslaunch.configure_logging(uuid)
         # self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/launch_navi.launch"])
         if self.indoor:
-            self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_indoor.launch"])
+            if rtabmap_run:
+                cli_args = ['/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_indoor.launch',
+                            'map_topic:=/rtabmap/grid_map']
+                roslaunch_args = cli_args[1:]
+                roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
+                self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
+            else:
+                cli_args = ['/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_indoor.launch',
+                            'map_topic:=/web_plan/map_edited']
+                roslaunch_args = cli_args[1:]
+                roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
+                self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
         else:
-            self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, [
-                "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_outdoor.launch"])
-        self.navi_launch.start()
+            if not rtabmap_run:
+                cli_args = ['/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_outdoor.launch',
+                            'map_topic:=/web_plan/map_edited']
+                roslaunch_args = cli_args[1:]
+                roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
+                self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
+            else:
+                cli_args = ['/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_outdoor.launch',
+                            'map_topic:=/rtabmap/grid_map']
+                roslaunch_args = cli_args[1:]
+                roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
+                self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
+
+
         self.is_rtabmap_pub.publish(Bool(False))
         if not localization:
             self.is_rtabmap_pub.publish(Bool(True))
@@ -811,7 +834,7 @@ class Node:
             else:
                 self.is_rtabmap_pub.publish(Bool(False))
                 self.rtabmap_mapping.stop()
-
+        self.navi_launch.start()
         rospy.loginfo("Vitulus navi started.")
         self.status_msg_pub.publish("Vitulus navi started.")
 

@@ -3,7 +3,7 @@ odom_frame: odom
 base_link_frame: base_link
 world_frame: odom
 predict_to_current_time: false
-two_d_mode: false
+two_d_mode: true
 #use_control: true
 #control_config: [true,  false, false,
 #                 false, false, true]
@@ -25,8 +25,8 @@ odom0_config: [true,  true,  true,
               false, false, false,
               false, false, true,
               false, false, false]
-odom0_differential: false
-odom0_relative: false
+odom0_differential: true
+odom0_relative: true
 
 
 
@@ -38,7 +38,7 @@ imu0_config: [false,  false, false,
               false, false, false]
 
 imu0_differential: false
-imu0_relative: false
+imu0_relative: true
 imu0_remove_gravitational_acceleration: true
 
 #imu0_differential: false

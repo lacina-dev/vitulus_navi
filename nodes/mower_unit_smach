@@ -11,6 +11,7 @@ import signal
 import sys
 import time
 
+
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from std_msgs.msg import Bool, String, Int16
@@ -198,6 +199,7 @@ class CheckDistance(smach.State):
             return 'on_place'
         else:
             return 'exe_path'
+
 
 
 def main():

@@ -14,9 +14,25 @@ from mbf_msgs.msg import RecoveryAction
 import signal
 import sys
 import time
+import actionlib
+import mbf_msgs.msg as mbf_msgs
+
+def wait_for_mbf():
+    """
+    Wait for Move Base Flex's move_base action (the last to be started) getting available
+    """
+    mb_ac = actionlib.SimpleActionClient("/move_base_flex/move_base", mbf_msgs.MoveBaseAction)
+    available = mb_ac.wait_for_server(rospy.Duration(30))
+    if not available:
+        rospy.logwarn("Move Base Flex not available after 30 seconds")
+    return available
 
 def main():
     rospy.init_node('mbf_state_machine_goal')
+    rospy.loginfo("<{}> Initialising...".format(rospy.get_caller_id()))
+
+    # Wait for Move Base Flex's move_base action (the last to be started) getting available
+    wait_for_mbf()
 
     # Create SMACH state machine
     sm = smach.StateMachine(outcomes=['succeeded', 'aborted', 'preempted'])
@@ -32,6 +48,7 @@ def main():
         # Goal callback for state WAIT_FOR_GOAL
         def goal_cb(userdata, msg):
             userdata.goal = msg
+            rospy.loginfo("[{}] Goal received".format(rospy.get_caller_id()))
             return False
 
         # Monitor topic to get MeshGoal from RViz plugin

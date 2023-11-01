@@ -771,6 +771,7 @@ class Node:
         rtabmap_change_id = 0
         rtabmap_run = False
         ch_id = 0
+        rtabmap_delete_db = False
         for arg in args:
             sys.argv.append(arg)
             if arg == "localization:=true":
@@ -782,6 +783,8 @@ class Node:
                 localization = True
                 rtabmap_run = True
                 rtabmap_change_id = ch_id
+            if arg == "rtabmap_args:=--delete_db_on_start":
+                rtabmap_delete_db = True
             ch_id += 1
         if rtabmap_run:
             args[rtabmap_change_id] = "localization:=true"
@@ -834,6 +837,9 @@ class Node:
             else:
                 self.is_rtabmap_pub.publish(Bool(False))
                 self.rtabmap_mapping.stop()
+            if rtabmap_delete_db:
+                self.rtabmap_mapping.run(["roslaunch", self.rtabmap_mapping.outdoor] + args)
+
         self.navi_launch.start()
         rospy.loginfo("Vitulus navi started.")
         self.status_msg_pub.publish("Vitulus navi started.")

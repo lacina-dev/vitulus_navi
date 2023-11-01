@@ -30,7 +30,8 @@ odom0_relative: true
 
 
 
-imu0: /bno085/imu
+#imu0: /bno085/navheading
+imu0: /imu/complementary
 imu0_config: [false,  false, false,
               true, true, true,
               false, false, false,

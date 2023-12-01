@@ -250,7 +250,7 @@ def main():
         )
 
     # Create and start introspection server
-    sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT')
+    sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT_PATH')
     sis.start()
 
     def signal_handler(sig, frame):

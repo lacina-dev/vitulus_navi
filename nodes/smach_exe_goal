@@ -49,6 +49,8 @@ def main():
         def goal_cb(userdata, msg):
             userdata.goal = msg
             rospy.loginfo("[{}] Goal received".format(rospy.get_caller_id()))
+            nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+            nex_log_info_pub.publish(String("Goal received"))
             return False
 
         # Monitor topic to get MeshGoal from RViz plugin
@@ -74,8 +76,8 @@ def main():
             if result.outcome == 2:
                 return 'aborted'
             else:
-                pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
-                pub_log_info.publish(String("Get path"))
+                pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+                pub_log_info.publish(String("Executing goal."))
                 pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
                 pub_pm_play_melody.publish(Int16(5))  # 5:short_beep, 1:beep, 2:double beep,
                 return 'succeeded'
@@ -116,6 +118,8 @@ def main():
 
         # Goal callback for state RECOVERY
         def recovery_path_goal_cb(userdata, goal):
+            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+            pub_log_info.publish(String("Recovery"))
             if userdata.clear_costmap_flag == False:
                 goal.behavior = 'clear_costmap'
                 userdata.clear_costmap_flag = True
@@ -141,7 +145,7 @@ def main():
         )
 
     # Create and start introspection server
-    sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT')
+    sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT_GOAL')
     sis.start()
 
     def signal_handler(sig, frame):

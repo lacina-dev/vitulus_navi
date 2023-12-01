@@ -7,7 +7,7 @@ import signal
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker
 from turtlebot3_msgs.msg import Sound
-from nav_msgs.msg import Odometry, Path
+from nav_msgs.msg import Odometry, Path, OccupancyGrid
 import shutil
 from turtlebot3_msgs.msg import Sound
 from os import listdir
@@ -260,7 +260,7 @@ class Node:
         self.point_to_publish = ""
         self.path_to_publish = ""
         self.move_base_client_state = ""
-        self.indoor = False
+        self.indoor = True
 
         self.map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
         self.map_list_str_pub = rospy.Publisher('navi_manager/map_str_list', StringList, queue_size=10)
@@ -279,7 +279,10 @@ class Node:
         self.pub_map_status = rospy.Publisher('navi_manager/map_status', String, queue_size=10, latch=False)
         self.is_rtabmap_pub = rospy.Publisher('navi_manager/is_rtabmap', Bool, queue_size=1, latch=True)
         self.is_indoor_pub = rospy.Publisher('navi_manager/is_indoor', Bool, queue_size=1, latch=True)
-
+        self.nm_local_costmap_pub = rospy.Publisher('navi_manager/local_costmap', OccupancyGrid, queue_size=1, latch=True)
+        self.nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+        self.local_costmap_repub_interval = 3  # Republish every 5th message
+        self.local_costmap_repub_index = 0
 
         self.sub_nm_new_interactive_marker = rospy.Subscriber("/navi_manager/new_interactive_marker", Pose, self.callback_new_interactive_marker)
         self.server = InteractiveMarkerServer("interactive_marker")
@@ -319,6 +322,7 @@ class Node:
         rospy.Subscriber("/odometry/gps", Odometry, self.callback_odom_gps)
         rospy.Subscriber("/odometry/odom", Odometry, self.callback_odometry_odom)
         rospy.Subscriber("/navi_manager/is_indoor", Bool, self.callback_is_indoor)
+        rospy.Subscriber("/move_base_flex/local_costmap/costmap", OccupancyGrid, self.callback_local_costmap)
 
 
         print("##############################################################################################")
@@ -349,6 +353,12 @@ class Node:
             map_msg = String(self.map_name)
             self.callback_load_map(map_msg, init=True)
             rospy.loginfo("Map " + self.params['load_map_on_start'] + " loaded.")
+
+    def callback_local_costmap(self, msg):
+        if (self.local_costmap_repub_interval == self.local_costmap_repub_index):
+            self.nm_local_costmap_pub.publish(msg)
+            self.local_costmap_repub_index = 0
+        self.local_costmap_repub_index += 1
 
     def callback_odometry_odom(self, msg):
         self.msg_odometry_odom = msg
@@ -409,7 +419,7 @@ class Node:
         self.status_msg_pub.publish("Interactive marker is new goal")
         rospy.loginfo("Interactive marker is new goal")
         if msg.data != "":
-            print(self.interactive_marker_pose.position)
+            print(self.interactive_marker_pose)
             point = Pose()
             point.position = self.interactive_marker_pose.position
             point.orientation = self.interactive_marker_pose.orientation
@@ -627,20 +637,20 @@ class Node:
 
     def callback_speed(self, msg):
         if msg.data == "SLOW":
-            rospy.wait_for_service('/move_base/TebLocalPlannerROS/set_parameters')
+            rospy.wait_for_service('/move_base_flex/TebLocalPlannerROS/set_parameters')
             srvs_request = ReconfigureRequest()
-            dbl_param = DoubleParameter(name="max_vel_x", value=0.25)
+            dbl_param = DoubleParameter(name="max_vel_x", value=0.3)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="max_vel_x_backwards", value=0.25)
+            dbl_param = DoubleParameter(name="max_vel_x_backwards", value=0.3)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="max_vel_theta", value=0.5)
+            dbl_param = DoubleParameter(name="max_vel_theta", value=0.4)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="acc_lim_x", value=0.25)
+            dbl_param = DoubleParameter(name="acc_lim_x", value=0.02)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="acc_lim_theta", value=0.5)
+            dbl_param = DoubleParameter(name="acc_lim_theta", value=0.1)
             srvs_request.config.doubles.append(dbl_param)
             try:
-                srvs = rospy.ServiceProxy('/move_base/TebLocalPlannerROS/set_parameters', Reconfigure)
+                srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
                 # srsmsg = ReconfigureRequest()
                 resp = srvs(srvs_request)
                 print(resp)
@@ -648,7 +658,7 @@ class Node:
                 print("Service call failed: %s" % e)
 
         if msg.data == "MEDIUM":
-            rospy.wait_for_service('/move_base/TebLocalPlannerROS/set_parameters')
+            rospy.wait_for_service('/move_base_flex/TebLocalPlannerROS/set_parameters')
             srvs_request = ReconfigureRequest()
             dbl_param = DoubleParameter(name="max_vel_x", value=0.5)
             srvs_request.config.doubles.append(dbl_param)
@@ -661,7 +671,7 @@ class Node:
             dbl_param = DoubleParameter(name="acc_lim_theta", value=1.0)
             srvs_request.config.doubles.append(dbl_param)
             try:
-                srvs = rospy.ServiceProxy('/move_base/TebLocalPlannerROS/set_parameters', Reconfigure)
+                srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
                 # srsmsg = ReconfigureRequest()
                 resp = srvs(srvs_request)
                 print(resp)
@@ -669,7 +679,7 @@ class Node:
                 print("Service call failed: %s" % e)
 
         if msg.data == "FAST":
-            rospy.wait_for_service('/move_base/TebLocalPlannerROS/set_parameters')
+            rospy.wait_for_service('/move_base_flex/TebLocalPlannerROS/set_parameters')
             srvs_request = ReconfigureRequest()
             dbl_param = DoubleParameter(name="max_vel_x", value=1.2)
             srvs_request.config.doubles.append(dbl_param)
@@ -682,7 +692,7 @@ class Node:
             dbl_param = DoubleParameter(name="acc_lim_theta", value=1.5)
             srvs_request.config.doubles.append(dbl_param)
             try:
-                srvs = rospy.ServiceProxy('/move_base/TebLocalPlannerROS/set_parameters', Reconfigure)
+                srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
                 # srsmsg = ReconfigureRequest()
                 resp = srvs(srvs_request)
                 print(resp)
@@ -856,25 +866,31 @@ class Node:
     def callback_save_map(self, msg):
         if msg.data != "":
             # self.map_status = "Loading"
+            ind_outd = "***env*INDOOR"
             if not self.indoor:
+                ind_outd = "***env*OUTDOOR"
                 self.save_map_utm_pose()
             self.shutdown_navi_launch()
             self.status_msg_pub.publish("Saving the map...")
+            self.nex_log_info_pub.publish("Saving the map.")
             if (exists("/home/vitulus/.ros/rtabmap.db") and exists("/home/vitulus/.ros/mapdata.pkl")):
                 shutil.copyfile("/home/vitulus/.ros/rtabmap.db",
-                                "/home/vitulus/.vitulus/saves/maps/" + msg.data + ".db")
+                                "/home/vitulus/.vitulus/saves/maps/" + msg.data + ind_outd + ".db")
                 shutil.copyfile("/home/vitulus/.ros/mapdata.pkl",
-                                "/home/vitulus/.vitulus/saves/maps_data/" + msg.data + ".pkl")
+                                "/home/vitulus/.vitulus/saves/maps_data/" + msg.data + ind_outd + ".pkl")
                 self.status_msg_pub.publish("Map " + msg.data + " saved.")
+                self.nex_log_info_pub.publish(msg.data + " saved.")
                 rospy.loginfo("Map " + msg.data + " saved.")
             else:
                 self.status_msg_pub.publish("There is no map to save.")
+                self.nex_log_info_pub.publish("No map to save.")
                 rospy.loginfo("There is no map to save.")
             self.navi_launch = self.start_navi_launch(["localization:=true"])
             self.active_map = msg.data
             # self.map_status = "Ready"
         else:
             self.status_msg_pub.publish("Map not saved. Empty name.")
+            self.nex_log_info_pub.publish("Fill the map name")
             rospy.logerr("Map not saved. Empty name.")
         self.sound_msg.value = 4
         self.pub_sound.publish(self.sound_msg)
@@ -975,9 +991,14 @@ class Node:
         if msg.data != "":
             # self.map_status = "Loading"
             self.active_map = "New"
+            if (msg.data == "indoor"):
+                self.indoor = True
+            if (msg.data == "outdoor"):
+                self.indoor = False
             if msg.data != "INIT":
                 self.shutdown_navi_launch()
             self.status_msg_pub.publish("Backuping current map...")
+            self.nex_log_info_pub.publish("Backup current map.")
             if (exists("/home/vitulus/.ros/rtabmap.db") and exists("/home/vitulus/.ros/mapdata.pkl")):
                 shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST.db")
                 shutil.copyfile("/home/vitulus/.ros/mapdata.pkl",
@@ -988,6 +1009,7 @@ class Node:
             self.running_map_data = self.map_data
             self.save_running_map_data()
             self.status_msg_pub.publish("New current map created.")
+            self.nex_log_info_pub.publish("New map created")
             rospy.loginfo("New current map created.")
             # self.map_status = "Ready"
         else:

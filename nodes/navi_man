@@ -269,7 +269,9 @@ class Node:
         self.pub_sound = rospy.Publisher('/sound', Sound, queue_size=10)
         self.map_point_pub = rospy.Publisher('navi_manager/map_point', Marker, queue_size=10)
         self.map_point_list_pub = rospy.Publisher('navi_manager/map_point_list', String, queue_size=10)
+        self.map_point_str_list_pub = rospy.Publisher('navi_manager/map_point_str_list', StringList, queue_size=10)
         self.map_path_list_pub = rospy.Publisher('navi_manager/map_path_list', String, queue_size=10)
+        self.map_path_str_list_pub = rospy.Publisher('navi_manager/map_path_str_list', StringList, queue_size=10)
         self.map_path_pub = rospy.Publisher('navi_manager/map_path', Path, queue_size=10)
         self.map_path_goal_arr_pub = rospy.Publisher('/move_base_smach/exe_path', Path, queue_size=10)
         self.map_goal_pub = rospy.Publisher('/move_base_smach/goal', PoseStamped, queue_size=10)
@@ -310,9 +312,11 @@ class Node:
         rospy.Subscriber("/navi_manager/save_waypoint", String, self.callback_save_waypoint)
         rospy.Subscriber("/navi_manager/publish_point", String, self.callback_publish_point)
         rospy.Subscriber("/navi_manager/goal_point", String, self.callback_goal_point)
+        rospy.Subscriber("/navi_manager/remove_point", String, self.callback_remove_point)
         rospy.Subscriber("/navi_manager/save_path", String, self.callback_save_path)
         rospy.Subscriber("/navi_manager/save_path_point", String, self.callback_save_path_point)
         rospy.Subscriber("/navi_manager/publish_path", String, self.callback_publish_path)
+        rospy.Subscriber("/navi_manager/remove_path", String, self.callback_remove_path)
         rospy.Subscriber("/move_base_flex/exe_path/status", GoalStatusArray, self.callback_move_base_client_state)
         # rospy.Subscriber("/move_base_client/state", String, self.callback_move_base_client_state)
         rospy.Subscriber("/navi_manager/execute_path", String, self.callback_execute_path)
@@ -375,8 +379,28 @@ class Node:
             self.status_msg_pub.publish("{} path is published".format(msg.data))
             rospy.loginfo("{} path is published".format(msg.data))
         else:
+            self.path_to_publish = ""
+            self.status_msg_pub.publish("Stop publishing path.")
+            rospy.loginfo("Stop publishing path.")
+
+    def callback_remove_path(self, msg):
+        if msg.data != "":
+            path = self.running_map_data.get_map_path(msg.data)
+            if path:
+                self.running_map_data.paths.remove(path)
+                self.save_running_map_data()
+                self.status_msg_pub.publish("{} path removed.".format(msg.data))
+                rospy.loginfo("{} path removed.".format(msg.data))
+                self.nex_log_info_pub.publish("Path {} removed".format(msg.data))
+            else:
+                self.status_msg_pub.publish("{} path not exist.".format(msg.data))
+                rospy.loginfo("{} path not exist.".format(msg.data))
+                self.nex_log_info_pub.publish("{} path not exist".format(msg.data))
+        else:
             self.status_msg_pub.publish("The name is empty!")
-            rospy.logwarn("The name is empty!")
+            rospy.loginfo("The name is empty!")
+            self.nex_log_info_pub.publish("The name is empty!")
+
 
     # def callback_move_base_client_state(self, msg):
     #     if msg.data != "":
@@ -419,7 +443,7 @@ class Node:
         self.status_msg_pub.publish("Interactive marker is new goal")
         rospy.loginfo("Interactive marker is new goal")
         if msg.data != "":
-            print(self.interactive_marker_pose)
+            # print(self.interactive_marker_pose)
             point = Pose()
             point.position = self.interactive_marker_pose.position
             point.orientation = self.interactive_marker_pose.orientation
@@ -471,11 +495,11 @@ class Node:
 
     def callback_execute_path(self, msg):
         if msg.data != "":
-            print(self.move_base_client_state)
+            # print(self.move_base_client_state)
             if self.move_base_client_state == "READY":
                 path = self.running_map_data.get_map_path(msg.data)
-                print("path")
-                print(path)
+                # print("path")
+                # print(path)
                 if path:
                     path_exe = Path()
                     path_exe.header.frame_id = path.tf_frame
@@ -551,6 +575,23 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
 
+    def callback_remove_point(self, msg):
+        if msg.data != "":
+            point = self.running_map_data.get_map_point(msg.data)
+            if point:
+                self.running_map_data.points.remove(point)
+                self.save_running_map_data()
+                self.status_msg_pub.publish("{} point removed.".format(msg.data))
+                rospy.loginfo("{} point removed.".format(msg.data))
+                self.nex_log_info_pub.publish("Point {} removed".format(msg.data))
+            else:
+                self.status_msg_pub.publish("{} point not exist.".format(msg.data))
+                rospy.loginfo("{} point not exist.".format(msg.data))
+                self.nex_log_info_pub.publish("{} point not exist".format(msg.data))
+        else:
+            self.status_msg_pub.publish("The name is empty!")
+            rospy.loginfo("The name is empty!")
+            self.nex_log_info_pub.publish("The name is empty!")
 
     # def callback_goal_point(self, msg):
     #     self.status_msg_pub.publish("{} is new goal".format(msg.data))
@@ -598,6 +639,7 @@ class Node:
             self.point_to_publish = msg.data
             self.status_msg_pub.publish("{} point is published".format(msg.data))
             rospy.loginfo("{} point is published".format(msg.data))
+            self.publish_map_point(msg.data)
         else:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
@@ -626,14 +668,17 @@ class Node:
                 self.save_running_map_data()
                 self.status_msg_pub.publish("New point {} added.".format(msg.data))
                 rospy.loginfo("New point {} added.".format(msg.data))
+                self.nex_log_info_pub.publish("Point {} added".format(msg.data))
             else:
                 point_exist = point
                 self.save_running_map_data()
                 self.status_msg_pub.publish("{} point changed.".format(msg.data))
                 rospy.loginfo("{} point changed.".format(msg.data))
+                self.nex_log_info_pub.publish("{} changed".format(msg.data))
         else:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
+            self.nex_log_info_pub.publish("The name is empty!")
 
     def callback_speed(self, msg):
         if msg.data == "SLOW":
@@ -653,7 +698,7 @@ class Node:
                 srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
                 # srsmsg = ReconfigureRequest()
                 resp = srvs(srvs_request)
-                print(resp)
+                # print(resp)
             except rospy.ServiceException as e:
                 print("Service call failed: %s" % e)
 
@@ -674,7 +719,7 @@ class Node:
                 srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
                 # srsmsg = ReconfigureRequest()
                 resp = srvs(srvs_request)
-                print(resp)
+                # print(resp)
             except rospy.ServiceException as e:
                 print("Service call failed: %s" % e)
 
@@ -695,7 +740,7 @@ class Node:
                 srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
                 # srsmsg = ReconfigureRequest()
                 resp = srvs(srvs_request)
-                print(resp)
+                # print(resp)
             except rospy.ServiceException as e:
                 print("Service call failed: %s" % e)
 
@@ -762,15 +807,15 @@ class Node:
             self.running_map_data.utm_z = trans.transform.translation.z
             self.running_map_data.utm_orientation_z = trans.transform.rotation.z
             self.running_map_data.utm_orientation_w = trans.transform.rotation.w
-            print("###########################################################################")
-            print("###########################################################################")
-            print("###########################################################################")
-            print("###########################################################################")
-            print(trans)
-            print("###########################################################################")
-            print("###########################################################################")
-            print("###########################################################################")
-            print("###########################################################################")
+            # print("###########################################################################")
+            # print("###########################################################################")
+            # print("###########################################################################")
+            # print("###########################################################################")
+            # print(trans)
+            # print("###########################################################################")
+            # print("###########################################################################")
+            # print("###########################################################################")
+            # print("###########################################################################")
             self.save_running_map_data()
 
     def start_navi_launch(self, args=[]):
@@ -779,9 +824,13 @@ class Node:
         localization = False
         sys.argv = [sys.argv[0]]
         rtabmap_change_id = 0
+        change_arg = False
         rtabmap_run = False
         ch_id = 0
         rtabmap_delete_db = False
+        print("##############################################################################################")
+        print("##########################################  OLD  #################################################")
+        print("args: {}".format(args))
         for arg in args:
             sys.argv.append(arg)
             if arg == "localization:=true":
@@ -793,10 +842,11 @@ class Node:
                 localization = True
                 rtabmap_run = True
                 rtabmap_change_id = ch_id
+                change_arg = True
             if arg == "rtabmap_args:=--delete_db_on_start":
                 rtabmap_delete_db = True
             ch_id += 1
-        if rtabmap_run:
+        if change_arg:
             args[rtabmap_change_id] = "localization:=true"
         # sys.argv.append("rtabmap_args:=--delete_db_on_start")
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
@@ -829,7 +879,9 @@ class Node:
                 roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
                 self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
 
-
+        print("##############################################################################################")
+        print("########################################   NEW   ###################################################")
+        print("args: {}".format(args))
         self.is_rtabmap_pub.publish(Bool(False))
         if not localization:
             self.is_rtabmap_pub.publish(Bool(True))
@@ -966,6 +1018,10 @@ class Node:
         if msg.data != "":
             # self.map_status = "Loading"
             self.active_map = msg.data
+            print("Map {} will be loaded...".format(msg.data))
+            self.indoor = False
+            if msg.data.split("***env*")[1] == "INDOOR":
+                self.indoor = True
             self.status_msg_pub.publish("Map {} will be loaded...".format(msg.data))
             if not init:
                 self.shutdown_navi_launch()
@@ -997,12 +1053,15 @@ class Node:
                 self.indoor = False
             if msg.data != "INIT":
                 self.shutdown_navi_launch()
+            ind_outd = "***env*INDOOR"
+            if not self.indoor:
+                ind_outd = "***env*OUTDOOR"
             self.status_msg_pub.publish("Backuping current map...")
             self.nex_log_info_pub.publish("Backup current map.")
             if (exists("/home/vitulus/.ros/rtabmap.db") and exists("/home/vitulus/.ros/mapdata.pkl")):
-                shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST.db")
+                shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST" + ind_outd + ".db")
                 shutil.copyfile("/home/vitulus/.ros/mapdata.pkl",
-                                "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST.pkl")
+                                "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST" + ind_outd + ".pkl")
                 self.status_msg_pub.publish("There is nothing to backup.")
                 rospy.loginfo("There is nothing to backup.")
             self.start_navi_launch(["rtabmap_args:=--delete_db_on_start", "localization:=false"])
@@ -1108,8 +1167,22 @@ class Node:
     def publish_map_point_list(self):
         self.map_point_list_pub.publish(self.running_map_data.get_map_point_list())
 
+    def publish_map_point_str_list(self):
+        msg = StringList()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        for point in self.running_map_data.points:
+            msg.string_list.append(point.name)
+        self.map_point_str_list_pub.publish(msg)
+
     def publish_map_path_list(self):
         self.map_path_list_pub.publish(self.running_map_data.get_map_path_list())
+        msg = StringList()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        for path in self.running_map_data.paths:
+            msg.string_list.append(path.name)
+        self.map_path_str_list_pub.publish(msg)
 
     def publish_map_path(self, name):
         path = self.running_map_data.get_map_path(name)
@@ -1160,8 +1233,9 @@ if __name__ == '__main__':
             if (slow_nr == slow_counter):
                 node.get_maplist()
                 # get_waypoints()
-                node.publish_map_point(node.point_to_publish)
+                # node.publish_map_point(node.point_to_publish)
                 node.publish_map_point_list()
+                node.publish_map_point_str_list()
                 node.publish_map_path_list()
                 node.publish_map_path(node.path_to_publish)
                 node.pub_active_map.publish(String(node.active_map))

@@ -85,7 +85,6 @@ class MapPath:
         self.create_path_msg()
 
 
-
 class MapData:
 
     def __init__(self, name):

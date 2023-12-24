@@ -1,6 +1,4 @@
 ### Navi manager init ###
 
-
 # Name of the map to load (create new map if empty).
-load_map_on_start: "" #zustane tenhle komentar po editaci z pythonu?
-#load_map_on_start: "Garden_09_2023" #zustane tenhle komentar po editaci z pythonu?
+load_map_on_start: ""

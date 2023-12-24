@@ -2,8 +2,7 @@ global_costmap:
 #  global_frame: t265_odom_frame
   global_frame: map
   robot_base_frame: base_link
-#  robot_base_frame: t265_link
-#  robot_base_frame: t265_pose_frame
+
   update_frequency: 1.5  # 3.0
   publish_frequency: 1.5  # 3.0
   static_map: true
@@ -12,7 +11,7 @@ global_costmap:
       type: "costmap_2d::StaticLayer"
     - name: inflation_layer
       type: "costmap_2d::InflationLayer"
-#
+
 
 
 #  plugins:

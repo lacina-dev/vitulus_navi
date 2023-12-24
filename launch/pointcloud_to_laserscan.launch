@@ -1,11 +1,8 @@
 <?xml version="1.0"?>
 
 <launch>
-
-
     <!-- run pointcloud_to_laserscan node -->
     <node pkg="pointcloud_to_laserscan" type="pointcloud_to_laserscan_node" name="pointcloud_to_laserscan">
-
         <remap from="cloud_in" to="/voxel_grid/output_y"/>
         <remap from="scan" to="/scan_from_points"/>
         <rosparam>
@@ -29,7 +26,5 @@
             # 2->inf : Parallelism level
             concurrency_level: 1
         </rosparam>
-
     </node>
-
 </launch>

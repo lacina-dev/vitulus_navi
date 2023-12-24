@@ -1,26 +1,21 @@
 #!/usr/bin/env python
-import rospy
-import shapely
-import smach
-import smach_ros
-from smach_ros import ServiceState
-from smach import Iterator, CBState
 import math
-from shapely import geometry
 import signal
 import sys
 import time
 
-from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
-from std_msgs.msg import Bool, String, Int16
-from vitulus_msgs.msg import PlannerProgram, Mower
-from mbf_msgs.msg import ExePathAction
-from mbf_msgs.msg import GetPathAction
-from mbf_msgs.msg import RecoveryAction
-from mbf_msgs.srv import CheckPath, CheckPathRequest, CheckPathResponse
 import PyKDL as kdl
-from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
+import rospy
+import shapely
+import smach
+import smach_ros
+from geometry_msgs.msg import Quaternion, PoseStamped
+from mbf_msgs.msg import ExePathAction
+from mbf_msgs.msg import RecoveryAction
+from mbf_msgs.srv import CheckPath, CheckPathRequest
+from nav_msgs.msg import Path
+from shapely import geometry
+from smach_ros import ServiceState
 
 
 class GetPathData(smach.State):
@@ -69,24 +64,18 @@ class GetPathData(smach.State):
         line = geometry.LineString([[path.poses[0].pose.position.x, path.poses[0].pose.position.y],
                                     [path.poses[-1].pose.position.x, path.poses[-1].pose.position.y]])
 
-        print("#########################################################")
-        print("#########################################################")
-        print("Line length: {}".format(line.length))
+        # print("Line length: {}".format(line.length))
         segmentize_distance = 0.03
         if line.length == 0:
-            print("Outline path")
+            # print("Outline path")
             start_offset = 0.18
             start_poses_offset = int(round(start_offset / segmentize_distance))
-            # print("start_poses_offset: {}".format(start_poses_offset))
             path_new = Path()
             path_new.header = path.header
             polygon = self.path_to_polygon(path)
-            # polygon = polygon.exterior
-            # print("polygon: {}".format(polygon))
             for n in range(0, len(polygon.coords) - 1):
                 line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]],
                                             [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
-                # print("Line* length: {}".format(line.length))
                 angle = self.direction(line.coords)
                 line = line.segmentize(segmentize_distance)
                 for point in line.coords:
@@ -104,39 +93,11 @@ class GetPathData(smach.State):
             path = path_new
             userdata.path_start_pose = path.poses[0]
             userdata.final_pose = path.poses[-1]
-
-        # else:
-        #     print("Coverage path")
-        #     line = self.path_to_line(path)
-        #     path_new = Path()
-        #     path_new.header.frame_id = "map"
-        #     path_new.header.stamp = rospy.Time.now()
-        #
-        #     line = line.segmentize(segmentize_distance)
-        #     for pose_id in range(0, len(line.coords) - 1):
-        #         angle = self.direction([[line.coords[pose_id][0], line.coords[pose_id][1]],
-        #                                [line.coords[pose_id + 1][0], line.coords[pose_id + 1][1]]])
-        #         pose = PoseStamped()
-        #         pose.header.frame_id = "map"
-        #         pose.header.stamp = rospy.Time.now()
-        #         pose.pose.position.x = line.coords[pose_id][0]
-        #         pose.pose.position.y = line.coords[pose_id][1]
-        #         pose.pose.position.z = 0.0
-        #         pose.pose.orientation = Quaternion(
-        #             *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
-        #         path_new.poses.append(pose)
-        #     path = path_new
-
-        print("#########################################################")
-        print("#########################################################")
         # publish current path
         pub_current_path = rospy.Publisher('/test_path', Path, latch=True, queue_size=1)
-        pub_status = pub_current_path.publish(path)
-
-
+        pub_current_path.publish(path)
         userdata.path = path
-
-        print("Path length: {}  ************************".format(len(userdata.path.poses)))
+        # print("Path length: {}  ************************".format(len(userdata.path.poses)))
         return 'available'
 
 
@@ -195,7 +156,7 @@ def main():
             return srvs_request
 
         def check_path_response_cb(userdata, response):
-            print("result: {}".format(response))
+            # print("result: {}".format(response))
             return 'succeeded'
 
         smach.StateMachine.add('CHECK_PATH',
@@ -261,7 +222,7 @@ def main():
         sis.stop()
         sis.clear()
         time.sleep(1)
-        # sys.exit(0)
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 

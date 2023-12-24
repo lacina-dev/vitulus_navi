@@ -3,9 +3,9 @@
   <name>vitulus_navi</name>
   <version>0.0.0</version>
   <description>The vitulus_navi package</description>
-  <maintainer email="robert.lacina@gmail.com">Robert Lacina</maintainer>
+  <maintainer email="robert@lacina.dev">Robert Lacina</maintainer>
   <license>Apache 2.0</license>
-  <author email="robert.lacina@gmail.com">Robert Lacina</author>
+  <author email="robert@lacina.dev">Robert Lacina</author>
 
 
   <buildtool_depend>catkin</buildtool_depend>
@@ -21,13 +21,11 @@
   <exec_depend>roscpp</exec_depend>
   <exec_depend>rospy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>turtlebot3_msgs</exec_depend>
     <exec_depend>move_base_flex</exec_depend>
   <exec_depend>move_base</exec_depend>
   <exec_depend>costmap_2d</exec_depend>
 
 <!--  <export>-->
-
 <!--        <costmap_2d plugin="${vitulus_navi}/costmap_plugins.xml"/>-->
 <!--  </export>-->
 

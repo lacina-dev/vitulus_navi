@@ -1,3 +1,0 @@
-
-CarrotPlanner:                                  # Also see: http://wiki.ros.org/global_planner
-  step_size: 0.05                                # default 0.4

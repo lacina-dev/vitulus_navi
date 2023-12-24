@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 
 import rospy
-import math
-from std_msgs.msg import String
-from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker
-from visualization_msgs.msg import MarkerArray
-import uuid
-import os
-import sys, time
-from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped
-from tf.transformations import quaternion_from_euler
-from tf import TransformListener
-
 
 
 class MapPoint:
@@ -24,20 +15,7 @@ class MapPoint:
         self.marker_message = Marker()
         self.create_marker_msg()
 
-
     def create_marker_msg(self):
-        # ARROW = 0
-        # CUBE = 1
-        # SPHERE = 2
-        # CYLINDER = 3
-        # LINE_STRIP = 4
-        # LINE_LIST = 5
-        # CUBE_LIST = 6
-        # SPHERE_LIST = 7
-        # POINTS = 8
-        # TEXT_VIEW_FACING = 9
-        # MESH_RESOURCE = 10
-        # TRIANGLE_LIST = 11
         self.marker_message.header.frame_id = self.tf_frame
         self.marker_message.ns = self.name
         self.marker_message.type = self.marker_message.ARROW
@@ -52,22 +30,13 @@ class MapPoint:
         self.marker_message.pose = self.pose
 
 
-
-
-
-
-
-
-
 class MapPath:
-
     def __init__(self, name, tf_frame):
         self.name = name
         self.poses = []
         self.tf_frame = tf_frame
         self.message = Path()
         self.create_path_msg()
-
 
     def create_path_msg(self):
         self.message.header.frame_id = self.tf_frame
@@ -79,14 +48,12 @@ class MapPath:
             poseStamped.pose = pose
             self.message.poses.append(poseStamped)
 
-
     def add_pose(self, pose):
         self.poses.append(pose)
         self.create_path_msg()
 
 
 class MapData:
-
     def __init__(self, name):
         self.map_name = name
         self.points = []
@@ -102,7 +69,6 @@ class MapData:
             return False
         else:
             return True
-
 
     def add_map_point(self, point):
         self.points.append(point)

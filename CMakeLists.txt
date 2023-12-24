@@ -111,7 +111,7 @@ catkin_package(
 )
 
 catkin_package(
-  CATKIN_DEPENDS roscpp rospy std_msgs turtlebot3_msgs costmap_2d
+  CATKIN_DEPENDS roscpp rospy std_msgs costmap_2d
 )
 
 ###########
@@ -203,12 +203,10 @@ install(DIRECTORY launch
 
 
 catkin_install_python(PROGRAMS
-  nodes/navi_manager
   nodes/mower_unit_smach
   nodes/navi_man
   nodes/smach_exe_path
   nodes/smach_exe_goal
-  # nodes/mapdata.py
 
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

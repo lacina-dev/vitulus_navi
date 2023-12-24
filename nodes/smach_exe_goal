@@ -1,30 +1,26 @@
 #!/usr/bin/env python
-import rospy
-import smach
-import smach_ros
-
-from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
-from std_msgs.msg import Int16, String
-
-from mbf_msgs.msg import ExePathAction
-from mbf_msgs.msg import GetPathAction
-from mbf_msgs.msg import RecoveryAction
-
 import signal
 import sys
 import time
 import actionlib
 import mbf_msgs.msg as mbf_msgs
+import rospy
+import smach
+import smach_ros
+from geometry_msgs.msg import PoseStamped
+from mbf_msgs.msg import ExePathAction
+from mbf_msgs.msg import GetPathAction
+from mbf_msgs.msg import RecoveryAction
+from std_msgs.msg import Int16, String
+
 
 def wait_for_mbf():
-    """
-    Wait for Move Base Flex's move_base action (the last to be started) getting available
-    """
-    mb_ac = actionlib.SimpleActionClient("/move_base_flex/move_base", mbf_msgs.MoveBaseAction)
-    available = mb_ac.wait_for_server(rospy.Duration(30))
+    client = actionlib.SimpleActionClient("/move_base_flex/move_base", mbf_msgs.MoveBaseAction)
+    available = client.wait_for_server(rospy.Duration(30))
     if not available:
-        rospy.logwarn("Move Base Flex not available after 30 seconds")
+        rospy.logwarn("Move Base Flex is not available")
+    else:
+        rospy.loginfo("Move Base Flex is ready")
     return available
 
 def main():
@@ -150,17 +146,16 @@ def main():
 
     def signal_handler(sig, frame):
         print("Shutting down...")
-        # print(node)
         rospy.signal_shutdown("end")
         sm.request_preempt()
         sis.stop()
         sis.clear()
         time.sleep(1)
-        # sys.exit(0)
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Execute SMACH plan
+    # Execute SMACH
     sm.execute()
 
     # Wait for interrupt and stop introspection server

@@ -1,7 +1,5 @@
 local_costmap:
-#  global_frame: t265_odom_frame
   global_frame: map
-#  robot_base_frame: t265_pose_frame
   robot_base_frame: base_link
   update_frequency: 6.0
   publish_frequency: 10.0
@@ -12,15 +10,6 @@ local_costmap:
   width: 4.0
   height: 4.0
   resolution: 0.05  # 0.02
-
-  #observation_sources: point_cloud_sensor point_cloud_sensor2 laser_scan_sensor
-  #observation_sources:  point_cloud_sensor2 point_cloud_sensor
-  #observation_sources: laser_scan_from_points laser_scan point_cloud_sensor2 point_cloud_sensor
-
-  #laser_scan_sensor: {sensor_frame: base_scan, data_type: LaserScan, topic: /scan, marking: true, clearing: true}
-
-  #point_cloud_sensor: {sensor_frame: camera_link, data_type: PointCloud2, topic: /voxel_grid/output_y, marking: true, clearing: true}
-  #point_cloud_sensor: {sensor_frame: camera_link, data_type: PointCloud2, topic: /rtabmap/local_grid_obstacle, marking: true, clearing: false}
 
   rgbd_obstacle_layer:
     enabled:               true
@@ -146,8 +135,6 @@ local_costmap:
     }
   laser_layer:
      enabled: true
-#     observation_sources: laser_scan_clear laser_scan
-#     observation_sources: laser_scan laser_scan_clear
      observation_sources: laser_scan
      track_unknown_space: true
      publish_voxel_map:     true
@@ -198,46 +185,10 @@ local_costmap:
   #  - {name: voxel_layer, type: "costmap_2d::NonPersistentVoxelLayer"}
   #  - {name: voxel_layer, type: "costmap_2d::VoxelLayer"}
   #  - {name: voxel_layer, type: "rtabmap_ros::VoxelLayer"}
-
-#    - {name: laser_layer,      type: "costmap_2d::NonPersistentVoxelLayer"}
-    - {name: laser_layer,      type: "costmap_2d::VoxelLayer"}
-
+  #  - {name: laser_layer,      type: "costmap_2d::NonPersistentVoxelLayer"}
+     - {name: laser_layer,      type: "costmap_2d::VoxelLayer"}
   #  - {name: clear_layer,  type: "costmap_2d::ObstacleLayer"}
-#    - {name: laser_layer,  type: "costmap_2d::ObstacleLayer"}
-#    - {name: rgbd_obstacle_layer, type: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"}
-    - {name: inflation_layer,  type: "costmap_2d::InflationLayer"}
+  #  - {name: laser_layer,  type: "costmap_2d::ObstacleLayer"}
+  #  - {name: rgbd_obstacle_layer, type: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"}
+     - {name: inflation_layer,  type: "costmap_2d::InflationLayer"}
 
-
-  #plugins:
-  #    - {name: above_layer, type: "costmap_2d::ObstacleLayer"}
-  ##    - {name: cliff_layer, type: "costmap_2d::ObstacleLayer"}
-  #
-  #
-  #above_layer:
-  #  enabled: true
-  #  observation_sources: pcloud
-  #  combination_method: 1
-  #  footprint_clearing_enabled: true
-  #
-  #  pcloud:
-  #    topic: /voxel_grid/output_y
-  #    sensor_frame: camera_link
-  #    data_type: PointCloud2
-  #    marking: true
-  #    clearing: true
-  #    min_obstacle_height: 0.1
-  #
-  #cliff_layer:
-  #  enabled: true
-  #  observation_sources: pcloud_cliff
-  #  combination_method: 1
-  #  footprint_clearing_enabled: true
-  #
-  #  pcloud_cliff:
-  #    topic: /voxel_grid/output_y
-  #    sensor_frame: camera_link
-  #    data_type: PointCloud2
-  #    marking: true
-  #    clearing: true
-  #    max_obstacle_height: -0.45
-  #    min_obstacle_height: -1.5

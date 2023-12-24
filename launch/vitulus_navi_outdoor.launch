@@ -1,53 +1,17 @@
 <launch>
     <arg name="map_topic" />
 
-    <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="screen" />
-    <node name="node_smach_exe_path" pkg="vitulus_navi" type="smach_exe_path" respawn="true" respawn_delay="1" output="screen" />
-    <node name="node_exe_goal" pkg="vitulus_navi" type="smach_exe_goal" respawn="true" respawn_delay="1" output="screen" />
-
-
-    <include file="$(find vitulus_navi)/launch/ekf_outdoor.launch">
-    </include>
-
-
-
-<!--    <include file="$(find vitulus_navi)/launch/vitulus_ekf_outdoor.launch">-->
-<!--    </include>-->
-
-<!--    <include file="$(find vitulus_navi)/launch/navsat.launch">-->
-<!--    </include>-->
-
+    <include file="$(find vitulus_navi)/launch/ekf_outdoor.launch"/>
 
     <include file="$(find vitulus_navi)/launch/pointcloud_to_laserscan.launch">
         <!-- arg name="multi_robot_name" value="$(arg multi_robot_name)"/ -->
     </include>
 
-<!--    <include file="$(find vitulus_slam)/launch/rtabmap.launch" pass_all_args="true">-->
-<!--    <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_indoor.launch" pass_all_args="true">-->
+    <include file="$(find vitulus_navi)/launch/vitulus_navi_mbf.launch">
+        <arg name="map_topic" value="$(arg map_topic)"/>
+    </include>
 
-<!--     <include file="$(find vitulus_navi)/launch/vitulus_rtabmap_outdoor.launch" pass_all_args="true" />-->
-
-<!--    <include file="$(find vitulus_slam)/launch/vitulus_rtabmap4wd.launch" pass_all_args="true">-->
-<!--    <include file="$(find vitulus_slam)/launch/rtabmap_t265.launch" pass_all_args="true">-->
-        <!-- arg name="multi_robot_name" value="$(arg multi_robot_name)"/ -->
-<!--     </include> -->
-
-<!--    <include file="$(find vitulus_navi)/launch/obstacles.launch">-->
-<!--        <arg name="multi_robot_name" value="$(arg multi_robot_name)"/>-->
-<!--    </include>-->
-
-
-
-
-   <include file="$(find vitulus_navi)/launch/vitulus_navi_mbf.launch">
-       <arg name="map_topic" value="$(arg map_topic)"/>
-   </include>
-
-
-
-<!--    Proxy for interactive marker usage on web gui-->
+    <!--    Proxy for interactive marker usage on web gui-->
     <node name="proxy" pkg="interactive_marker_proxy" type="proxy" args="topic_ns:=/interactive_marker target_frame:=/map"/>
-
-    <!-- node name="rviz" pkg="rviz" type="rviz" args=""/ -->
 
 </launch>

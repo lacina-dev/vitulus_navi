@@ -1,5 +1,6 @@
 # vitulus_navi
- VITULUS navigation ROS package
+ VITULUS navigation manager
+ ROS package
  It's the backend for webUI and manage maps and navigation.
 
  

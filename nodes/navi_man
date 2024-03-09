@@ -735,6 +735,9 @@ class Node:
             # self.map_status = "Loading"
             self.active_map = msg.data
             self.status_msg_pub.publish("Map {} will be loaded...".format(msg.data))
+            self.indoor = False
+            if msg.data.split("***env*")[1] == "INDOOR":
+                self.indoor = True
             if not init:
                 self.shutdown_navi_launch()
             self.status_msg_pub.publish("Loading the map...")

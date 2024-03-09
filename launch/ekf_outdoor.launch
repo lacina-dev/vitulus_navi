@@ -9,7 +9,8 @@
 
     <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="screen">
           <rosparam command="load" file="$(find vitulus_navi)/config/ekf/navsat.yaml" />
-          <remap from="imu/data" to="/bno085/navheading" />
+<!--          <remap from="imu/data" to="/bno085/navheading" />-->
+          <remap from="imu/data" to="/gnss_heading/navheading" />
           <remap from="gps/fix" to="/gnss/fix" />
           <remap from="odometry/filtered" to="/odometry/odom" />
           <remap from="gps/filtered" to="gps/filtered" />

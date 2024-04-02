@@ -808,6 +808,7 @@ class Node:
             self.nex_log_info_pub.publish("New map created")
             rospy.loginfo("New current map created.")
             self.map_show = 'rtabmap'
+            self.set_map_utm_transform()
             # self.map_status = "Ready"
         else:
             self.status_msg_pub.publish("Empty name.")

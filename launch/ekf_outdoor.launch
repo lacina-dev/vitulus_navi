@@ -14,7 +14,7 @@
           <remap from="gps/fix" to="/gnss/fix" />
           <remap from="odometry/filtered" to="/odometry/odom" />
           <remap from="gps/filtered" to="gps/filtered" />
-          <remap from="odometry/gps" to="odometry/gps" />
+          <remap from="odotrmetry/gps" to="odomey/gps" />
     </node>
 
 </launch>

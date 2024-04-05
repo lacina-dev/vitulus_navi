@@ -36,37 +36,38 @@ odom1_queue_size: 200
 
 
 
-imu1: /gnss_heading/navheading
-imu1_config: [false, false, false,
+imu0: /gnss_heading/navheading
+imu0_config: [false, false, false,
               false,  false,  true,
               false, false, false,
               false,  false,  false,
               false,  false,  false]
 #imu1_nodelay: false
-imu1_differential: false
+imu0_differential: false
 #imu1_relative: false
-imu1_queue_size: 200
+imu0_queue_size: 200
 
-#imu1: /bno085/imu
-#imu1_config: [false, false, false,   # x,   y,   z
-#              true,  true,  true,    # r,   p,   w (yaw)
-#              false, false, false,   # dx,  dy,  dz
-#              true,  true,  true,    # dr,  dp,  dw
-#              true,  true,  true,]   # ddx, ddy, ddz
-#imu1_differential: false
-#imu1_relative: false
-#imu1_queue_size: 200
-#imu1_remove_gravitational_acceleration: true
-
-imu0: /bno085/navheading
-imu0_config: [false, false, false,   # x,   y,   z
+imu1: /bno085/imu
+imu1_config: [false, false, false,   # x,   y,   z
               true,  true,  false,    # r,   p,   w (yaw)
               false, false, false,   # dx,  dy,  dz
               true,  true,  true,    # dr,  dp,  dw
-              true,  true,  true,]   # ddx, ddy, ddz
-imu0_differential: false
-imu0_queue_size: 200
-imu0_remove_gravitational_acceleration: true
+              false,  false,  false,]   # ddx, ddy, ddz
+imu1_differential: true
+imu1_relative: false
+imu1_queue_size: 200
+imu1_remove_gravitational_acceleration: true
+
+
+#imu0: /bno085/navheading
+#imu0_config: [false, false, false,   # x,   y,   z
+#              true,  true,  false,    # r,   p,   w (yaw)
+#              false, false, false,   # dx,  dy,  dz
+#              true,  true,  true,    # dr,  dp,  dw
+#              true,  true,  true,]   # ddx, ddy, ddz
+#imu0_differential: false
+#imu0_queue_size: 200
+#imu0_remove_gravitational_acceleration: true
 
 
 

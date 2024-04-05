@@ -941,7 +941,7 @@ if __name__ == '__main__':
         rate_nr = 30
         rate = rospy.Rate(rate_nr)  # 1hz
         slow_counter = 0
-        slow_nr = int(rate_nr / 2)  # 2x per second
+        slow_nr = int(rate_nr * 5)  # 2x per second
 
         def signal_handler(sig, frame):
             print("Shutting down...")

@@ -1,20 +1,20 @@
 <launch>
 
    <!-- Ekf -->
-    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_global" clear_params="true">
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_global" clear_params="true" output="log">
         <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_global.yaml" />
         <remap from="/odometry/filtered" to="/odometry/odom" />
         <remap from="/set_pose" to="/set_pose_global"/>
     </node>
 
-    <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="screen">
+    <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="log">
           <rosparam command="load" file="$(find vitulus_navi)/config/ekf/navsat.yaml" />
 <!--          <remap from="imu/data" to="/bno085/navheading" />-->
           <remap from="imu/data" to="/gnss_heading/navheading" />
           <remap from="gps/fix" to="/gnss/fix" />
           <remap from="odometry/filtered" to="/odometry/odom" />
           <remap from="gps/filtered" to="gps/filtered" />
-          <remap from="odotrmetry/gps" to="odomey/gps" />
+          <remap from="odometry/gps" to="/odometry/gps" />
     </node>
 
 </launch>

@@ -181,7 +181,7 @@ local_costmap:
   #point_cloud_sensor2: {sensor_frame: camera_link, data_type: PointCloud2, topic: /voxel_grid/output_y, marking: false, clearing: true}
 
   plugins:
-  #  - {name: static_layer, type: "costmap_2d::StaticLayer"}
+     - {name: static_layer, type: "costmap_2d::StaticLayer"}
   #  - {name: voxel_layer, type: "costmap_2d::NonPersistentVoxelLayer"}
   #  - {name: voxel_layer, type: "costmap_2d::VoxelLayer"}
   #  - {name: voxel_layer, type: "rtabmap_ros::VoxelLayer"}

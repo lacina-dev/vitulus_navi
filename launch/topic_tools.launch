@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<launch>
+  <node name="slow_down_local_costmap" pkg="topic_tools" type="throttle"
+      args="messages /move_base_flex/local_costmap/costmap  1.0 /move_base_flex/local_costmap/costmap_slow" />
+
+  <node name="slow_down_local_plan" pkg="topic_tools" type="throttle"
+      args="bytes /move_base_flex/TebLocalPlannerROS/local_plan 8 0.5 /move_base_flex/TebLocalPlannerROS/local_plan_slow" />
+
+  <node name="slow_down_global_plan" pkg="topic_tools" type="throttle"
+      args="messages /move_base_flex/TebLocalPlannerROS/global_plan 0.1 /move_base_flex/TebLocalPlannerROS/global_plan_slow" />
+</launch>

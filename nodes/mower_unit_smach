@@ -495,10 +495,35 @@ def main():
                                        transitions={
                                            'succeeded': 'SET_CUT_HEIGHT',
                                            # 'succeeded': 'PATH_IT',
-                                           'aborted': 'GET_PATH_TO_START',
+                                           'aborted': 'RECOVERY',
                                            'preempted': 'preempted'
                                        }, remapping={'path': 'path_plan'}
                                        )
+
+                # Goal callback for state RECOVERY
+                def recovery_path_goal_to_start_cb(userdata, goal):
+                    pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+                    pub_log_info.publish(String("Recovery"))
+
+                    goal.behavior = 'clear_costmap'
+
+                # Recovery
+                smach.StateMachine.add(
+                    'RECOVERY',
+                    smach_ros.SimpleActionState(
+                        'move_base_flex/recovery',
+                        RecoveryAction,
+                        goal_cb=recovery_path_goal_to_start_cb,
+                        input_keys=["error", "clear_costmap_flag"],
+                        output_keys=["error_status", 'clear_costmap_flag']
+                    ),
+                    transitions={
+                        'succeeded': 'EXE_PATH_TO_START',
+                        'aborted': 'GET_PATH_TO_START',
+                        'preempted': 'preempted'
+                    }
+                )
+
 
                 # Add state SET_CUT_HEIGHT
                 @smach.cb_interface(input_keys=['zone_cut_height'], output_keys=[], outcomes=['success', 'failure'])
@@ -688,10 +713,35 @@ def main():
                         ),
                                                transitions={
                                                    'succeeded': 'CHECK_PLANNER_PATH',
-                                                   'aborted': 'GET_PATH_TO_BEGIN_OF_PATH',
+                                                   'aborted': 'RECOVERY_BEGIN',
                                                    'preempted': 'preempted'
                                                }, remapping={'path': 'path_plan'}
                                                )
+
+                        # Goal callback for state RECOVERY
+                        def recovery_path_goal_to_begin_cb(userdata, goal):
+                            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+                            pub_log_info.publish(String("Recovery"))
+
+                            goal.behavior = 'clear_costmap'
+
+                        # Recovery
+                        smach.StateMachine.add(
+                            'RECOVERY_BEGIN',
+                            smach_ros.SimpleActionState(
+                                'move_base_flex/recovery',
+                                RecoveryAction,
+                                goal_cb=recovery_path_goal_to_begin_cb,
+                                input_keys=["error", "clear_costmap_flag"],
+                                output_keys=["error_status", 'clear_costmap_flag']
+                            ),
+                            transitions={
+                                'succeeded': 'EXE_PATH_TO_BEGIN_OF_PATH',
+                                'aborted': 'GET_PATH_TO_BEGIN_OF_PATH',
+                                'preempted': 'preempted'
+                            }
+                        )
+
 
                         # Add state CHECK_PLANNER_PATH - service call to check path
                         @smach.cb_interface(input_keys=['path', 'zone_name', 'index_path', 'paths'])
@@ -753,11 +803,35 @@ def main():
                         ),
                                                transitions={
                                                    'succeeded': 'continue_path',
-                                                   'aborted': 'GET_PATH_TO_BEGIN_OF_PATH',
+                                                   'aborted': 'RECOVERY_PLANNER',
                                                    'preempted': 'preempted'
                                                }, remapping={'path': 'path',
                                                              'final_pose': 'final_pose'}
                                                )
+
+                        # Goal callback for state RECOVERY
+                        def recovery_path_goal_to_planner_cb(userdata, goal):
+                            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+                            pub_log_info.publish(String("Recovery"))
+
+                            goal.behavior = 'clear_costmap'
+
+                        # Recovery
+                        smach.StateMachine.add(
+                            'RECOVERY_PLANNER',
+                            smach_ros.SimpleActionState(
+                                'move_base_flex/recovery',
+                                RecoveryAction,
+                                goal_cb=recovery_path_goal_to_planner_cb,
+                                input_keys=["error", "clear_costmap_flag"],
+                                output_keys=["error_status", 'clear_costmap_flag']
+                            ),
+                            transitions={
+                                'succeeded': 'EXE_PLANNER_PATH',
+                                'aborted': 'CHECK_PLANNER_PATH',
+                                'preempted': 'preempted'
+                            }
+                        )
 
                     # close processing path
                     Iterator.set_contained_state('PROCESS_PATH', process_path_sm, loop_outcomes=['continue_path'])

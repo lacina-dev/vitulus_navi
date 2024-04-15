@@ -116,12 +116,15 @@ def main():
         def recovery_path_goal_cb(userdata, goal):
             pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
             pub_log_info.publish(String("Recovery"))
-            if userdata.clear_costmap_flag == False:
-                goal.behavior = 'clear_costmap'
-                userdata.clear_costmap_flag = True
-            else:
-                goal.behavior = 'straf_recovery'
-                userdata.clear_costmap_flag = False
+
+            goal.behavior = 'clear_costmap'
+
+            # if userdata.clear_costmap_flag == False:
+            #     goal.behavior = 'clear_costmap'
+            #     userdata.clear_costmap_flag = True
+            # else:
+            #     goal.behavior = 'straf_recovery'
+            #     userdata.clear_costmap_flag = False
 
         # Recovery
         smach.StateMachine.add(
@@ -135,7 +138,7 @@ def main():
             ),
             transitions={
                 'succeeded': 'GET_PATH',
-                'aborted': 'WAIT_FOR_GOAL',
+                'aborted': 'GET_PATH',
                 'preempted': 'preempted'
             }
         )

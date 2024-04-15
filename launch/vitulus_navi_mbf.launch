@@ -19,6 +19,7 @@
       <rosparam file="$(find vitulus_navi)/config/graceful_controller_params.yaml" command="load" />
       <rosparam file="$(find vitulus_navi)/config/neo_local_planner_params.yaml" command="load" />
       <rosparam file="$(find vitulus_navi)/config/global_planner_params.yaml" command="load" />
+      <rosparam file="$(find vitulus_navi)/config/recovery_behavior.yaml" command="load" />
 
       <param name="base_global_planner" value="global_planner/GlobalPlanner" />
       <param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS" />

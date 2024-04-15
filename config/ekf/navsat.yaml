@@ -1,7 +1,6 @@
 frequency: 10
 delay: 5.0
 magnetic_declination_radians: 0
-#magnetic_declination_radians: 0.0846 # weekend house
 zero_altitude: false
 broadcast_utm_transform: true
 broadcast_utm_transform_as_parent_frame: false

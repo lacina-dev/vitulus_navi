@@ -6,6 +6,7 @@ from os import listdir
 from os.path import isfile, join, exists
 import docker
 import roslaunch
+import rospy
 import tf2_ros
 import yaml
 from dynamic_reconfigure.msg import DoubleParameter
@@ -14,12 +15,14 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Bool
+from std_srvs.srv import Empty, EmptyResponse
 from interactive_markers.interactive_marker_server import *
 from visualization_msgs.msg import *
 import actionlib
 from move_base_msgs.msg import MoveBaseAction
 from actionlib_msgs.msg import GoalStatusArray
-from vitulus_msgs.msg import StringList
+from vitulus_msgs.msg import Rtabmap_settings, StringList
+from vitulus_planner.srv import *
 from std_msgs.msg import String
 from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker
@@ -113,6 +116,8 @@ class Node:
         self.nm_map_pub = rospy.Publisher('navi_manager/map', OccupancyGrid, queue_size=1, latch=True)
         self.pub_map_source = rospy.Publisher('navi_manager/map_source', String, queue_size=10, latch=False)
         self.nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+        self.planner_new_map_pub = rospy.Publisher('/web_plan/new_map', String, queue_size=10)
+        self.rtabmap_settings_pub = rospy.Publisher('navi_manager/rtabmap_settings', Rtabmap_settings, queue_size=10)
         self.local_costmap_repub_interval = 3  # Republish every 5th message
         self.local_costmap_repub_index = 0
         self.sub_nm_new_interactive_marker = rospy.Subscriber("/navi_manager/new_interactive_marker", Pose, self.callback_new_interactive_marker)
@@ -149,6 +154,7 @@ class Node:
         rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_rtabmap_grid_map)
         rospy.Subscriber("/web_plan/map_edited", OccupancyGrid, self.callback_web_plan_map)
         rospy.Subscriber("/navi_manager/show_map", String, self.callback_web_plan_show_map)
+        rospy.Subscriber("/navi_manager/rtabmap_settings_set", Rtabmap_settings, self.callback_rtabmap_settings_set)
         self.map_show = 'planner'
         self.is_map_to_publish = True
         self.rtabmap_grid_map_msg = None
@@ -181,6 +187,26 @@ class Node:
             map_msg = String(self.map_name)
             self.callback_load_map(map_msg, init=True)
             rospy.loginfo("Map " + self.params['load_map_on_start'] + " loaded.")
+
+    def callback_rtabmap_settings_set(self, msg):
+        rospy.set_param('/rtabmap/rtabmap/Grid/Sensor', msg.grid_sensor)
+        rospy.set_param('/rtabmap/rtabmap/Grid/RangeMax', msg.grid_sensor_distance)
+        rospy.wait_for_service('/rtabmap/update_parameters')
+        try:
+            srv = rospy.ServiceProxy('/rtabmap/update_parameters', Empty)  # Connect to the service
+            response = srv()
+        except rospy.ServiceException as e:
+            rospy.logerr("Service /rtabmap/update_parameters call failed: %s" % e)
+
+        self.rtabmap_settings_publish()
+
+    def rtabmap_settings_publish(self):
+        msg = Rtabmap_settings()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        msg.grid_sensor = int(rospy.get_param('/rtabmap/rtabmap/Grid/Sensor'))
+        msg.grid_sensor_distance = float(rospy.get_param('/rtabmap/rtabmap/Grid/RangeMax'))
+        self.rtabmap_settings_pub.publish(msg)
 
     def callback_local_costmap(self, msg):
         if (self.local_costmap_repub_interval == self.local_costmap_repub_index):
@@ -459,9 +485,9 @@ class Node:
             srvs_request.config.doubles.append(dbl_param)
             dbl_param = DoubleParameter(name="max_vel_theta", value=0.4)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="acc_lim_x", value=0.02)
+            dbl_param = DoubleParameter(name="acc_lim_x", value=0.1)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="acc_lim_theta", value=0.1)
+            dbl_param = DoubleParameter(name="acc_lim_theta", value=0.2)
             srvs_request.config.doubles.append(dbl_param)
             try:
                 srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
@@ -478,11 +504,11 @@ class Node:
             srvs_request.config.doubles.append(dbl_param)
             dbl_param = DoubleParameter(name="max_vel_x_backwards", value=0.5)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="max_vel_theta", value=1.0)
+            dbl_param = DoubleParameter(name="max_vel_theta", value=1.2)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="acc_lim_x", value=0.5)
+            dbl_param = DoubleParameter(name="acc_lim_x", value=0.15)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="acc_lim_theta", value=1.0)
+            dbl_param = DoubleParameter(name="acc_lim_theta", value=0.25)
             srvs_request.config.doubles.append(dbl_param)
             try:
                 srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
@@ -494,15 +520,15 @@ class Node:
         if msg.data == "FAST":
             rospy.wait_for_service('/move_base_flex/TebLocalPlannerROS/set_parameters')
             srvs_request = ReconfigureRequest()
-            dbl_param = DoubleParameter(name="max_vel_x", value=1.2)
+            dbl_param = DoubleParameter(name="max_vel_x", value=0.75)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="max_vel_x_backwards", value=1.2)
+            dbl_param = DoubleParameter(name="max_vel_x_backwards", value=0.75)
             srvs_request.config.doubles.append(dbl_param)
             dbl_param = DoubleParameter(name="max_vel_theta", value=1.5)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="acc_lim_x", value=0.8)
+            dbl_param = DoubleParameter(name="acc_lim_x", value=0.2)
             srvs_request.config.doubles.append(dbl_param)
-            dbl_param = DoubleParameter(name="acc_lim_theta", value=1.5)
+            dbl_param = DoubleParameter(name="acc_lim_theta", value=0.35)
             srvs_request.config.doubles.append(dbl_param)
             try:
                 srvs = rospy.ServiceProxy('/move_base_flex/TebLocalPlannerROS/set_parameters', Reconfigure)
@@ -532,12 +558,21 @@ class Node:
             if available:
                 m_x = 0
                 m_y = 0
+                m_z = 0
                 if self.running_map_data.is_utm():
                     m_x = trans.transform.translation.x - self.running_map_data.utm_x
                     m_y = trans.transform.translation.y - self.running_map_data.utm_y
+                    m_z = trans.transform.translation.z - self.running_map_data.utm_z
+                    if not hasattr(self, 'running_map_data.utm_orientation_x'):
+                        self.running_map_data.utm_orientation_x = 0
+                        self.running_map_data.utm_orientation_y = 0
+                    m_orientation_x = self.running_map_data.utm_orientation_x
+                    m_orientation_y = self.running_map_data.utm_orientation_y
                     m_orientation_z = self.running_map_data.utm_orientation_z
                     m_orientation_w = self.running_map_data.utm_orientation_w
                 else:
+                    m_orientation_x = 0
+                    m_orientation_y = 0
                     m_orientation_z = 0
                     m_orientation_w = 1
 
@@ -547,6 +582,9 @@ class Node:
                 static_transformStamped.child_frame_id = "odom"
                 static_transformStamped.transform.translation.x = m_x
                 static_transformStamped.transform.translation.y = m_y
+                static_transformStamped.transform.translation.z = m_z
+                static_transformStamped.transform.rotation.x = m_orientation_x
+                static_transformStamped.transform.rotation.y = m_orientation_y
                 static_transformStamped.transform.rotation.z = m_orientation_z
                 static_transformStamped.transform.rotation.w = m_orientation_w
                 self.tf2_TransformBroadcaster.sendTransform(static_transformStamped)
@@ -567,9 +605,15 @@ class Node:
             self.running_map_data.utm_x = trans.transform.translation.x
             self.running_map_data.utm_y = trans.transform.translation.y
             self.running_map_data.utm_z = trans.transform.translation.z
+            self.running_map_data.utm_orientation_x = trans.transform.rotation.x
+            self.running_map_data.utm_orientation_y = trans.transform.rotation.y
             self.running_map_data.utm_orientation_z = trans.transform.rotation.z
             self.running_map_data.utm_orientation_w = trans.transform.rotation.w
+            # rospy.loginfo("Got map coords.")
+            # rospy.sleep(10)
+            # rospy.loginfo("10 seconds exceeded.")
             self.save_running_map_data()
+            rospy.loginfo("Data saved.")
 
     def start_navi_launch(self, args=[]):
         self.status_msg_pub.publish("Starting navi module...")
@@ -657,9 +701,9 @@ class Node:
 
     def shutdown_navi_launch(self):
         self.status_msg_pub.publish("Stopping navi module.")
+        self.rtabmap_mapping.stop()
         if self.navi_launch is not None:
             self.navi_launch.shutdown()
-        self.rtabmap_mapping.stop()
         rospy.loginfo("Vitulus navi stopped.")
         self.status_msg_pub.publish("Vitulus navi stopped.")
 
@@ -669,6 +713,21 @@ class Node:
             ind_outd = "***env*INDOOR"
             if not self.indoor:
                 ind_outd = "***env*OUTDOOR"
+                if msg.data != "" and msg.data != (msg.data + ind_outd).replace(ind_outd, ""):
+
+                    self.planner_new_map_pub.publish(String(msg.data + ind_outd))
+                    rospy.wait_for_service('/web_plan/save_map')
+                    try:
+                        srv = rospy.ServiceProxy('/web_plan/save_map', Save_map)  # Connect to the service
+                        response = srv(msg.data, "OUTDOOR")
+                        if response.result_status == "OK":
+                            rospy.logdebug("Saving map status: %s" % response.result_status)
+                        else:
+                            rospy.logwarn("Saving map status: %s" % response.result_status)
+                            rospy.logwarn("Saving map failed info: %s" % response.result_info)
+                    except rospy.ServiceException as e:
+                        rospy.logerr("Service /web_plan/save_map call failed: %s" % e)
+                    # self.pub_active_map.publish(String(node.active_map))
                 self.save_map_utm_pose()
             self.shutdown_navi_launch()
             self.status_msg_pub.publish("Saving the map...")
@@ -686,7 +745,7 @@ class Node:
                 self.nex_log_info_pub.publish("No map to save.")
                 rospy.loginfo("There is no map to save.")
             self.navi_launch = self.start_navi_launch(["localization:=true"])
-            self.active_map = msg.data
+            self.active_map = msg.data + ind_outd
             # self.map_status = "Ready"
         else:
             self.status_msg_pub.publish("Map not saved. Empty name.")
@@ -966,6 +1025,7 @@ if __name__ == '__main__':
                 node.pub_map_status.publish(String(node.map_status))
                 node.set_map_status()
                 node.publish_map()
+                node.rtabmap_settings_publish()
                 slow_counter = 0
             slow_counter += 1
             rate.sleep()

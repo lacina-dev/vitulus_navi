@@ -186,12 +186,13 @@ def main():
 
         # Goal callback for state RECOVERY
         def recovery_path_goal_cb(userdata, goal):
-            if userdata.clear_costmap_flag == False:
-                goal.behavior = 'clear_costmap'
-                userdata.clear_costmap_flag = True
-            else:
-                goal.behavior = 'straf_recovery'
-                userdata.clear_costmap_flag = False
+            goal.behavior = 'clear_costmap'
+            # if userdata.clear_costmap_flag == False:
+            #     goal.behavior = 'clear_costmap'
+            #     userdata.clear_costmap_flag = True
+            # else:
+            #     goal.behavior = 'straf_recovery'
+            #     userdata.clear_costmap_flag = False
 
         # Recovery
         smach.StateMachine.add(

@@ -1,6 +1,6 @@
 TebLocalPlannerROS:
-  acc_lim_theta: 0.1
-  acc_lim_x: 0.02
+  acc_lim_theta: 0.2
+  acc_lim_x: 0.1
   acc_lim_y: 0.5
   allow_init_with_backwards_motion: false
   alternative_time_cost: false
@@ -13,7 +13,7 @@ TebLocalPlannerROS:
   divergence_detection_enable: false
   divergence_detection_max_chi_squared: 10.0
   dt_hysteresis: 0.05
-  dt_ref: 0.3
+  dt_ref: 0.5  # 0.3
   dynamic_obstacle_inflation_dist: 0.6
   enable_homotopy_class_planning: false
   enable_multithreading: true
@@ -43,7 +43,7 @@ TebLocalPlannerROS:
   free_goal_vel: false
   global_plan_overwrite_orientation: true
   global_plan_prune_distance: 0.2
-  global_plan_viapoint_sep: 0.05
+  global_plan_viapoint_sep: 0.8 # 0.05
   h_signature_prescaler: 0.5
   h_signature_threshold: 0.1
   include_costmap_obstacles: true
@@ -52,7 +52,7 @@ TebLocalPlannerROS:
   is_footprint_dynamic: false
   legacy_obstacle_association: false
   map_frame: map
-  max_global_plan_lookahead_dist: 1.0
+  max_global_plan_lookahead_dist: 1.5
   max_number_classes: 4
   max_number_plans_in_current_class: 1
   max_vel_theta: 0.4

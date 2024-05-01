@@ -1,0 +1,11 @@
+<launch>
+
+   <!-- Ekf -->
+<!--    <env name="ROSCONSOLE_CONFIG_FILE" value="$(find vitulus_navi)/launch/rosconsole.conf"/>-->
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_localization_base" clear_params="true" output="screen">
+        <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base.yaml" />
+        <remap from="odometry/filtered" to="/odometry/odom_base" />
+        <remap from="set_pose" to="/ekf_localization_base/set_pose" />
+    </node>
+
+</launch>

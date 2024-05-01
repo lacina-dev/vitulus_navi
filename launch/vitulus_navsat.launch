@@ -1,0 +1,12 @@
+<launch>
+
+  <rosparam command="load" file="$(find vitulus_navi)/config/ekf/navsat_transform.yaml" />
+
+  <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform" clear_params="true">
+          <remap from="gps/fix" to="/gnss/fix" />
+          <remap from="odometry/filtered" to="/odometry/for_gps" />
+          <remap from="gps/filtered" to="/gnss/fix_filtered" />
+          <remap from="odometry/gps" to="/odometry/gps" />
+  </node>
+
+</launch>

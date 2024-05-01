@@ -1,5 +1,7 @@
 <launch>
     <arg name="map_topic" />
+<!--    <include file="$(find vitulus_gnss)/launch/vitulus_ardusimple_heading.launch"/>-->
+<!--    <include file="$(find vitulus_gnss)/launch/vitulus_ardusimple_gnss.launch"/>-->
 
     <include file="$(find vitulus_navi)/launch/ekf_indoor.launch"/>
 

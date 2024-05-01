@@ -1,0 +1,27 @@
+
+<launch>
+
+  <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_outdoor.yaml" />
+
+  <node pkg="robot_localization" type="ekf_localization_node" name="ekf_wheel_odometry" clear_params="true">
+    <remap from="odometry/filtered" to="/odometry/wheel_odometry"/>
+  </node>
+
+  <node pkg="robot_localization" type="ekf_localization_node" name="ekf_se_odom" clear_params="true">
+    <remap from="odometry/filtered" to="/odometry/odom"/>
+  </node>
+
+  <node pkg="robot_localization" type="ekf_localization_node" name="ekf_se_map" clear_params="true">
+    <remap from="odometry/filtered" to="/odometry/map"/>
+  </node>
+
+  <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform" clear_params="true">
+<!--    <remap from="odometry/filtered" to="odometry/filtered_map"/>-->
+          <remap from="imu/data" to="/gnss_heading/nav_fused" />
+          <remap from="gps/fix" to="/gnss/fix" />
+          <remap from="odometry/filtered" to="/odometry/map" />
+          <remap from="gps/filtered" to="gps/filtered" />
+          <remap from="odometry/gps" to="/odometry/gps" />
+  </node>
+
+</launch>

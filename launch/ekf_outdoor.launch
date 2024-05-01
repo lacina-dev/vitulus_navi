@@ -1,20 +1,38 @@
+<!--<launch>-->
+
+<!--   &lt;!&ndash; Ekf &ndash;&gt;-->
+<!--&lt;!&ndash;    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_global" clear_params="true" output="log">&ndash;&gt;-->
+<!--&lt;!&ndash;        <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_global.yaml" />&ndash;&gt;-->
+<!--&lt;!&ndash;        <remap from="/odometry/filtered" to="/odometry/odom" />&ndash;&gt;-->
+<!--&lt;!&ndash;        <remap from="/set_pose" to="/set_pose_global"/>&ndash;&gt;-->
+<!--&lt;!&ndash;    </node>&ndash;&gt;-->
+
+
+<!--    <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="log">-->
+<!--          <rosparam command="load" file="$(find vitulus_navi)/config/ekf/navsat.yaml" />-->
+<!--          <remap from="gps/fix" to="/gnss/fix" />-->
+<!--          <remap from="odometry/filtered" to="/odometry/for_gps" />-->
+<!--          <remap from="gps/filtered" to="/gnss/fix_filtered" />-->
+<!--          <remap from="odometry/gps" to="/odometry/gps" />-->
+<!--    </node>-->
+
+<!--</launch>-->
+
 <launch>
 
-   <!-- Ekf -->
-    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_global" clear_params="true" output="log">
-        <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_global.yaml" />
-        <remap from="/odometry/filtered" to="/odometry/odom" />
-        <remap from="/set_pose" to="/set_pose_global"/>
-    </node>
+  <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base_outdoor.yaml" />
 
-    <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" respawn="true" output="log">
-          <rosparam command="load" file="$(find vitulus_navi)/config/ekf/navsat.yaml" />
-<!--          <remap from="imu/data" to="/bno085/navheading" />-->
-          <remap from="imu/data" to="/gnss_heading/navheading" />
+  <node pkg="robot_localization" type="ekf_localization_node" name="ekf_wheel_odometry" clear_params="true">
+    <remap from="odometry/filtered" to="/odometry/ekf_wheel_odom"/>
+    <remap from="set_pose" to="/ekf_wheel_odometry/set_pose"/>
+  </node>
+
+
+  <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform" clear_params="true">
           <remap from="gps/fix" to="/gnss/fix" />
-          <remap from="odometry/filtered" to="/odometry/odom" />
-          <remap from="gps/filtered" to="gps/filtered" />
+          <remap from="odometry/filtered" to="/odometry/for_gps" />
+          <remap from="gps/filtered" to="/gnss/fix_filtered" />
           <remap from="odometry/gps" to="/odometry/gps" />
-    </node>
+  </node>
 
 </launch>

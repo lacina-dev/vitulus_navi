@@ -6,6 +6,8 @@
 <!--            <param name="prm_name" value="prm_value"/>-->
 <!--            <remap from="/topic" to="/another_topic" />-->
         </node>
+        <node name="navi_transform" pkg="vitulus_navi" type="navi_transform" respawn="true" respawn_delay="1" output="log">
+        </node>
     </group>
 
     <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="log" />

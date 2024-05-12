@@ -10,19 +10,21 @@ import shapely
 import smach
 import smach_ros
 from geometry_msgs.msg import Quaternion, PoseStamped
-from mbf_msgs.msg import ExePathAction
+from mbf_msgs.msg import ExePathAction, GetPathAction
 from mbf_msgs.msg import RecoveryAction
 from mbf_msgs.srv import CheckPath, CheckPathRequest
 from nav_msgs.msg import Path
 from shapely import geometry
+from smach import CBState
 from smach_ros import ServiceState
+from std_msgs.msg import String, Int16, Bool
 
 
 class GetPathData(smach.State):
     def __init__(self):
         smach.State.__init__(self, outcomes=['available', 'failed'],
                              input_keys=['path', 'path_to_exe'],
-                             output_keys=['path'])
+                             output_keys=['path', 'path_start_pose'])
     def path_to_polygon(self, path):
         # create shapely polygon from path poses
         polygon = geometry.LinearRing([[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
@@ -66,33 +68,35 @@ class GetPathData(smach.State):
 
         # print("Line length: {}".format(line.length))
         segmentize_distance = 0.03
-        if line.length == 0:
-            # print("Outline path")
-            start_offset = 0.18
-            start_poses_offset = int(round(start_offset / segmentize_distance))
-            path_new = Path()
-            path_new.header = path.header
-            polygon = self.path_to_polygon(path)
-            for n in range(0, len(polygon.coords) - 1):
-                line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]],
-                                            [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
-                angle = self.direction(line.coords)
-                line = line.segmentize(segmentize_distance)
-                for point in line.coords:
-                    pose = PoseStamped()
-                    pose.header.frame_id = "map"
-                    pose.header.stamp = rospy.Time.now()
-                    pose.pose.position.x = point[0]
-                    pose.pose.position.y = point[1]
-                    pose.pose.position.z = 0.0
-                    pose.pose.orientation = Quaternion(
-                        *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
-                    path_new.poses.append(pose)
-            path_new.poses = path_new.poses[0:-start_poses_offset]
-            path_new.poses = path_new.poses[start_poses_offset:]
-            path = path_new
-            userdata.path_start_pose = path.poses[0]
-            userdata.final_pose = path.poses[-1]
+        # if line.length == 0:
+        # print("Outline path")
+        start_offset = 0.18
+        start_poses_offset = int(round(start_offset / segmentize_distance))
+        path_new = Path()
+        path_new.header = path.header
+        # polygon = self.path_to_polygon(path)
+        polygon = self.path_to_line(path)
+
+        for n in range(0, len(polygon.coords) - 1):
+            line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]],
+                                        [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
+            angle = self.direction(line.coords)
+            line = line.segmentize(segmentize_distance)
+            for point in line.coords:
+                pose = PoseStamped()
+                pose.header.frame_id = "map"
+                pose.header.stamp = rospy.Time.now()
+                pose.pose.position.x = point[0]
+                pose.pose.position.y = point[1]
+                pose.pose.position.z = 0.0
+                pose.pose.orientation = Quaternion(
+                    *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                path_new.poses.append(pose)
+        path_new.poses = path_new.poses[0:-start_poses_offset]
+        path_new.poses = path_new.poses[start_poses_offset:]
+        path = path_new
+        userdata.path_start_pose = path.poses[0]
+        # userdata.final_pose = path.poses[-1]
         # publish current path
         pub_current_path = rospy.Publisher('/test_path', Path, latch=True, queue_size=1)
         pub_current_path.publish(path)
@@ -110,6 +114,7 @@ def main():
     # Define userdata
     sm.userdata.path_to_exe = None
     sm.userdata.path = None
+    sm.userdata.path_start_pose = None
     sm.userdata.error = None
     sm.userdata.clear_costmap_flag = False
     sm.userdata.error_status = None
@@ -137,8 +142,99 @@ def main():
 
         # Add state GET_PATH_DATA
         smach.StateMachine.add('GET_PATH_DATA', GetPathData(),
-                               transitions={'available': 'CHECK_PATH',
-                                            'failed': 'CHECK_PATH'})
+                               transitions={'available': 'GET_PATH_TO_BEGIN',
+                                            'failed': 'GET_PATH_TO_BEGIN'})
+
+
+
+        # Get path to begin
+        def get_path_result_cb(userdata, status, result):
+            print("get path status: {}".format(status))
+            print("get path result: {}".format(result.message))
+            if sm.preempt_requested():
+                sm.service_preempt()
+                return 'preempted'
+            if result.outcome == 2:
+                return 'aborted'
+            else:
+                pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+                pub_log_info.publish(String("Executing goal."))
+                pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+                # pub_pm_play_melody.publish(Int16(5))  # 5:short_beep, 1:beep, 2:double beep,
+                return 'succeeded'
+
+        smach.StateMachine.add(
+            'GET_PATH_TO_BEGIN',
+            smach_ros.SimpleActionState(
+                '/move_base_flex/get_path',
+                GetPathAction,
+                goal_slots=['target_pose'],
+                result_slots=['path'],
+                result_cb=get_path_result_cb
+            ),
+            transitions={
+                'succeeded': 'EXE_PATH_TO_BEGIN',
+                'aborted': 'WAIT_FOR_PATH',
+                'preempted': 'PREEMPTED_STOP'
+            },
+            remapping={
+                'target_pose': 'path_start_pose',
+                'path': 'path_to_begin',
+            }
+        )
+
+        # Execute path
+        smach.StateMachine.add(
+            'EXE_PATH_TO_BEGIN',
+            smach_ros.SimpleActionState(
+                '/move_base_flex/exe_path',
+                ExePathAction,
+                goal_slots=['path']
+            ),
+            transitions={
+                'succeeded': 'CHECK_PATH',
+                'aborted': 'RECOVERY_TO_BEGIN',
+                'preempted': 'PREEMPTED_STOP'
+            },
+            remapping={
+                'path': 'path_to_begin',
+            }
+        )
+
+        # Goal callback for state RECOVERY_TO_BEGIN
+        def recovery_path_goal_cb(userdata, goal):
+            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+            pub_log_info.publish(String("Recovery"))
+            goal.behavior = 'clear_costmap'
+
+            if sm.preempt_requested():
+                sm.service_preempt()
+                return 'preempted'
+
+
+        # Recovery RECOVERY_TO_BEGIN
+        smach.StateMachine.add(
+            'RECOVERY_TO_BEGIN',
+            smach_ros.SimpleActionState(
+                'move_base_flex/recovery',
+                RecoveryAction,
+                goal_cb=recovery_path_goal_cb,
+                input_keys=["error", "clear_costmap_flag"],
+                output_keys=["error_status", 'clear_costmap_flag']
+            ),
+            transitions={
+                'succeeded': 'GET_PATH_TO_BEGIN',
+                'aborted': 'WAIT_FOR_PATH',
+                'preempted': 'PREEMPTED_STOP'
+            }
+        )
+
+
+
+
+
+
+
 
         # Add state CHECK_PATH - service call to check path
         @smach.cb_interface(input_keys=['path'])
@@ -167,7 +263,7 @@ def main():
                                             input_keys=['path']),
                                transitions={'succeeded': 'EXE_PATH',
                                             'aborted': 'CHECK_PATH',
-                                            'preempted': 'preempted'})
+                                            'preempted': 'PREEMPTED_STOP'})
 
         # Execute path
         smach.StateMachine.add(
@@ -180,7 +276,7 @@ def main():
             transitions={
                 'succeeded': 'WAIT_FOR_PATH',
                 'aborted': 'RECOVERY',
-                'preempted': 'preempted'
+                'preempted': 'PREEMPTED_STOP'
             }
         )
 
@@ -202,18 +298,40 @@ def main():
                 RecoveryAction,
                 goal_cb=recovery_path_goal_cb,
                 input_keys=["error", "clear_costmap_flag"],
-                output_keys = ["error_status", 'clear_costmap_flag']
+                output_keys=["error_status", 'clear_costmap_flag']
             ),
             transitions={
                 'succeeded': 'CHECK_PATH',
                 'aborted': 'WAIT_FOR_PATH',
-                'preempted': 'preempted'
+                'preempted': 'PREEMPTED_STOP'
             }
         )
+
+        # Add state PREEMPTED_STOP
+        @smach.cb_interface(input_keys=[], output_keys=[], outcomes=['success', 'failure'])
+        def preempted_stop_cb(userdata):
+            rospy.loginfo(
+                '[{}]Stopping program - state PREEMPTED_STOP'.format(rospy.get_caller_id()))
+            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+            pub_log_info.publish(String("Goal canceled"))
+            # pub_pm_play_melody.publish(Int16(1))  # 5:short_beep, 1:beep, 2:double beep,
+            rospy.sleep(1.5)
+            sm.recall_preempt()
+            return 'failure'
+
+        smach.StateMachine.add('PREEMPTED_STOP', CBState(preempted_stop_cb),
+                               {'success': 'WAIT_FOR_PATH', 'failure': 'WAIT_FOR_PATH'})
 
     # Create and start introspection server
     sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT_PATH')
     sis.start()
+
+    def callback_stop(msg):
+        print(msg)
+        if msg.data:
+            sm.request_preempt()
+
+    rospy.Subscriber("/smach_goal/cancel", Bool, callback_stop)
 
     def signal_handler(sig, frame):
         print("Shutting down...")

@@ -31,6 +31,7 @@ import os
 import sys, time
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped
 from tf import TransformListener
+from vitulus_navi.srv import Point_pose, Point_poseResponse
 
 from navi_man import mapdata
 sys.modules['mapdata'] = mapdata
@@ -118,6 +119,7 @@ class Node:
         self.waypoint_list_pub = rospy.Publisher('navi_manager/waypoint_list', Path, queue_size=10)
         self.status_msg_pub = rospy.Publisher('navi_manager/status', String, queue_size=10)
         self.map_point_pub = rospy.Publisher('navi_manager/map_point', Marker, queue_size=10)
+        self.map_point_pose_pub = rospy.Publisher('navi_manager/map_point_pose', PoseStamped, queue_size=10)
         self.map_point_list_pub = rospy.Publisher('navi_manager/map_point_list', String, queue_size=10)
         self.map_point_str_list_pub = rospy.Publisher('navi_manager/map_point_str_list', StringList, queue_size=10)
         self.map_path_list_pub = rospy.Publisher('navi_manager/map_path_list', String, queue_size=10)
@@ -156,6 +158,7 @@ class Node:
         rospy.Subscriber("/navi_manager/speed", String, self.callback_speed)
         rospy.Subscriber("/navi_manager/save_waypoint", String, self.callback_save_waypoint)
         rospy.Subscriber("/navi_manager/publish_point", String, self.callback_publish_point)
+        rospy.Subscriber("/navi_manager/publish_point_pose", String, self.callback_publish_point_pose)
         rospy.Subscriber("/navi_manager/goal_point", String, self.callback_goal_point)
         rospy.Subscriber("/navi_manager/remove_point", String, self.callback_remove_point)
         rospy.Subscriber("/navi_manager/save_path", String, self.callback_save_path)
@@ -177,6 +180,7 @@ class Node:
         self.is_map_to_publish = True
         self.rtabmap_grid_map_msg = None
         self.planner_map_msg = None
+        self.point_pose_srvs = rospy.Service("navi_manager/get_point_pose", Point_pose, self.srv_cb_map_point_pose)
 
 
 
@@ -458,6 +462,16 @@ class Node:
             self.status_msg_pub.publish("{} point is published".format(msg.data))
             rospy.loginfo("{} point is published".format(msg.data))
             self.publish_map_point(msg.data)
+        else:
+            self.status_msg_pub.publish("The name is empty!")
+            rospy.loginfo("The name is empty!")
+
+    def callback_publish_point_pose(self, msg):
+        if msg.data != "":
+            self.point_to_publish = msg.data
+            self.status_msg_pub.publish("{} point is published".format(msg.data))
+            rospy.loginfo("{} point is published".format(msg.data))
+            self.publish_map_point_pose(msg.data)
         else:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
@@ -747,46 +761,11 @@ class Node:
             ind_outd = "***env*INDOOR"
             if not self.indoor:
                 ind_outd = "***env*OUTDOOR"
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
-                print("PreSaving new map")
+
                 print(self.active_map)
                 # if msg.data != "" and msg.data != (msg.data + ind_outd).replace(ind_outd, ""):
                 if self.active_map == "New":
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
-                    print("Saving new map")
+
                     self.save_map_utm_pose()
                     self.planner_new_map_pub.publish(String(msg.data + ind_outd))
                     rospy.wait_for_service('/web_plan/save_map')
@@ -812,6 +791,10 @@ class Node:
                                 "/home/vitulus/.vitulus/saves/maps_data/" + msg.data + ind_outd + ".pkl")
                 self.status_msg_pub.publish("Map " + msg.data + " saved.")
                 self.nex_log_info_pub.publish(msg.data + " saved.")
+                if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
+                    shutil.copyfile("/home/vitulus/.vitulus/running/planner_data.pkl",
+                                    "/home/vitulus/.vitulus/saves/planner_data/" + msg.data + ind_outd + ".pkl")
+                    rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
                 rospy.loginfo("Map " + msg.data + " saved.")
             else:
                 self.status_msg_pub.publish("There is no map to save.")
@@ -1034,6 +1017,20 @@ class Node:
             point.marker_message.header.stamp = rospy.Time.now()
             self.map_point_pub.publish(point.marker_message)
 
+    def srv_cb_map_point_pose(self, srv):
+        point = self.running_map_data.get_map_point(srv.name)
+        if point:
+            msg = PoseStamped()
+            msg.header.stamp = rospy.Time.now()
+            msg.header.frame_id = "map"
+            msg.pose = point.pose
+            self.map_point_pose_pub.publish(msg)
+            resp = Point_poseResponse()
+            resp.point_pose = msg
+            resp.result = True
+            return resp
+
+
     def publish_map_point_list(self):
         self.map_point_list_pub.publish(self.running_map_data.get_map_point_list())
 
@@ -1089,6 +1086,7 @@ if __name__ == '__main__':
         while not rospy.is_shutdown():
             node.set_map_utm_transform()
             node.publish_pose_cov_stamped()
+            node.publish_map_coords()
             if (slow_nr == slow_counter):
                 node.get_maplist()
                 node.publish_map_point_list()
@@ -1101,7 +1099,7 @@ if __name__ == '__main__':
                 node.set_map_status()
                 node.publish_map()
                 node.rtabmap_settings_publish()
-                node.publish_map_coords()
+                # node.publish_map_coords()
                 slow_counter = 0
             slow_counter += 1
             rate.sleep()

@@ -4,15 +4,18 @@ import time
 
 import rospy
 import tf2_ros
+import roslaunch
 from geometry_msgs.msg import TransformStamped, PoseStamped, Pose, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from robot_localization.srv import SetPose, SetPoseRequest, SetPoseResponse
 from sensor_msgs.msg import MagneticField, Imu
 from sensor_msgs_ext.msg import magnetometer, accelerometer
 from std_srvs.srv import Empty, EmptyResponse
+from vitulus_msgs.msg import Navi_transform
 from tf import TransformListener
 from vitulus_msgs.msg import Imu_status
 from std_msgs.msg import Bool, Float32MultiArray
+from vitulus_navi.srv import Point_pose, Point_poseResponse
 import sys
 import serial
 import signal
@@ -40,6 +43,9 @@ def pol2cart(rho, phi):
 class NavTfNode:
 
     def __init__(self):
+        self.launch_ekf = None
+        self.launch_navsat = None
+        self.roslaunch_ekf()
         self.base_odom_msg = Odometry()
         self.base_odom_msg.pose.pose.orientation.w = 1
         self.navheading_msg = Imu()
@@ -106,6 +112,7 @@ class NavTfNode:
         self.wheel_odom_pub = rospy.Publisher("/nav_tf/odom_wheel", Odometry, queue_size=100)
         self.fused_odom_pub = rospy.Publisher("/nav_tf/odom_fused", Odometry, queue_size=100)
         self.nav_wheel_odom_pub = rospy.Publisher("/nav_tf/odom_wheel_nav", Odometry, queue_size=100)
+        self.nav_odom_status_pub = rospy.Publisher("/nav_tf/odom_status", Navi_transform, queue_size=1)
 
         self.navheading_gnss_fix_sub = rospy.Subscriber("/gnss/fix", NavSatFix, self.callback_gnss_fix, queue_size=10)
         self.navheading_gnss_heading_fix_sub = rospy.Subscriber("/gnss_heading/fix", NavSatFix, self.callback_gnss_heading_fix, queue_size=10)
@@ -119,6 +126,7 @@ class NavTfNode:
         self.map_coords_sub = rospy.Subscriber("/navi_manager/map_coords", PoseStamped, self.callback_map_coords)
         self.navi_indoor_sub = rospy.Subscriber("/navi_manager/is_indoor", Bool, self.callback_navi_indoor)
         self.set_pose_sub = rospy.Subscriber("/nav_tf/set_pose", PoseWithCovarianceStamped, self.callback_set_pose)
+        self.set_dock_pose_sub = rospy.Subscriber("/nav_tf/set_dock_pose", Bool, self.callback_set_dock_pose)
 
         self.tf2_Buffer = tf2_ros.Buffer()
         self.tf2_TransformListener = tf2_ros.TransformListener(self.tf2_Buffer)
@@ -132,62 +140,96 @@ class NavTfNode:
 
         rospy.loginfo("<{}> GNSSNode initiated.".format(rospy.get_caller_id()))
 
+    def roslaunch_ekf(self):
+        uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
+        roslaunch.configure_logging(uuid)
+        self.launch_ekf = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_ekf_outdoor.launch"])
+        self.launch_ekf.start()
+        rospy.loginfo("<{}> EKF launched.".format(rospy.get_caller_id()))
+
+    def roslaunch_navsat(self):
+        uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
+        roslaunch.configure_logging(uuid)
+        self.launch_navsat = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navsat.launch"])
+        self.launch_navsat.start()
+        rospy.loginfo("<{}> Navsat launched.".format(rospy.get_caller_id()))
+
+    def init_navsat(self):
+        if self.launch_navsat is None:
+            if self.fused_fix_time < 1.0 and self.fused_nav_time < 1.0:
+                self.roslaunch_navsat()
+
+
     def callback_set_pose(self, msg):
         print("Set pose")
         print(msg.pose.pose)
         self.set_nav_pose(msg.pose.pose)
         self.set_wheel_base_nav_pose(msg.pose.pose)
 
+    def callback_set_dock_pose(self, msg):
+        if msg.data:
+            rospy.wait_for_service('/navi_manager/get_point_pose')
+            try:
+                srv = rospy.ServiceProxy('/navi_manager/get_point_pose', Point_pose)  # Connect to the service
+                response = srv("dock")
+                if response.result:
+                    rospy.logdebug("Dock point pose: %s" % response.point_pose)
+                    self.set_nav_pose(response.point_pose.pose)
+                    self.set_wheel_base_nav_pose(response.point_pose.pose)
+                else:
+                    rospy.logwarn("Dock point pose not found.")
+            except rospy.ServiceException as e:
+                rospy.logerr("Service /navi_manager/get_point_pose call failed: %s" % e)
 
     def callback_navi_indoor(self, msg):
         self.is_indoor = msg.data
 
     def callback_map_coords(self, msg):
-        if msg.pose != self.map_coords_msg.pose:
-            print("Map changed")
-            print(msg.pose)
+        # if msg.pose != self.map_coords_msg.pose:
+        #     print("Map changed")
+        #     print(msg.pose)
+        trans = None
+        try:
+            trans = self.tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+        except:
             trans = None
-            try:
-                trans = self.tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
-            except:
-                trans = None
 
-            if trans is not None:
-                print(trans)
+        if trans is not None:
+            # print(trans)
 
-                map_roll, map_pitch, map_yaw = euler_from_quaternion(
-                    [msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w])
-                odom_roll, odom_pitch, odom_yaw = euler_from_quaternion([trans.transform.rotation.x,
-                                                                         trans.transform.rotation.y,
-                                                                         trans.transform.rotation.z,
-                                                                         trans.transform.rotation.w])
-                yaw_offset = odom_yaw - map_yaw
-                print("Map  Yaw offset: ", yaw_offset)
-                quaternion = quaternion_from_euler(map_roll, map_pitch, yaw_offset)
+            map_roll, map_pitch, map_yaw = euler_from_quaternion(
+                [msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w])
+            odom_roll, odom_pitch, odom_yaw = euler_from_quaternion([trans.transform.rotation.x,
+                                                                     trans.transform.rotation.y,
+                                                                     trans.transform.rotation.z,
+                                                                     trans.transform.rotation.w])
+            yaw_offset = odom_yaw - map_yaw
+            # print("Map  Yaw offset: ", yaw_offset)
+            quaternion = quaternion_from_euler(map_roll, map_pitch, yaw_offset)
 
-                p_x = 0
-                p_y = 0
-                p_z = 0
+            p_x = 0
+            p_y = 0
+            p_z = 0
 
-                if (msg.pose.position.x + msg.pose.position.y + msg.pose.position.z) != 0:
-                    p_x = trans.transform.translation.x - msg.pose.position.x
-                    p_y = trans.transform.translation.y - msg.pose.position.y
-                    p_z = trans.transform.translation.z - msg.pose.position.z
+            if (msg.pose.position.x + msg.pose.position.y + msg.pose.position.z) != 0:
+                p_x = trans.transform.translation.x - msg.pose.position.x
+                p_y = trans.transform.translation.y - msg.pose.position.y
+                p_z = trans.transform.translation.z - msg.pose.position.z
 
-                map_odom_transform = TransformStamped()
-                map_odom_transform.header.stamp = rospy.Time.now()
-                map_odom_transform.header.frame_id = "map"
-                map_odom_transform.child_frame_id = "odom"
-                map_odom_transform.transform.translation.x = p_x
-                map_odom_transform.transform.translation.y = p_y
-                map_odom_transform.transform.translation.z = p_z
-                map_odom_transform.transform.rotation.x = quaternion[0]
-                map_odom_transform.transform.rotation.y = quaternion[1]
-                map_odom_transform.transform.rotation.z = quaternion[2]
-                map_odom_transform.transform.rotation.w = quaternion[3]
-                print(map_odom_transform)
+            map_odom_transform = TransformStamped()
+            map_odom_transform.header.stamp = rospy.Time.now()
+            map_odom_transform.header.frame_id = "map"
+            map_odom_transform.child_frame_id = "odom"
+            map_odom_transform.transform.translation.x = p_x
+            map_odom_transform.transform.translation.y = p_y
+            map_odom_transform.transform.translation.z = p_z
+            map_odom_transform.transform.rotation.x = quaternion[0]
+            map_odom_transform.transform.rotation.y = quaternion[1]
+            map_odom_transform.transform.rotation.z = quaternion[2]
+            map_odom_transform.transform.rotation.w = quaternion[3]
+            # print(map_odom_transform)
 
-                self.map_odom_transform = map_odom_transform
+            self.map_odom_transform = map_odom_transform
         self.map_coords_msg = msg
 
     def callback_base_odom(self, msg):
@@ -216,7 +258,11 @@ class NavTfNode:
                 and msg.position_covariance[0] <= 0.000197 \
                 and msg.position_covariance[4] <= 0.000197:
             if msg.status.status == 2:
-                usable = True
+                if self.launch_navsat is None:
+                    if self.heading_fix_usable:
+                        usable = True
+                else:
+                    usable = True
                 # self.set_nav_wheel_odom()
                 # self.reset_wheel_odom()
                 # self.set_wheel_base_pose()
@@ -315,7 +361,10 @@ class NavTfNode:
             map_odom_tf.transform.translation = self.map_odom_transform.transform.translation
             if odom_base_tf is not None:
                 map_odom_tf.transform.translation.z = (odom_base_tf.transform.translation.z * -1)
-            map_odom_tf.transform.rotation = self.map_odom_transform.transform.rotation
+            map_odom_tf.transform.rotation.x = 0
+            map_odom_tf.transform.rotation.y = 0
+            map_odom_tf.transform.rotation.z = 0
+            map_odom_tf.transform.rotation.w = 1
 
             self.tf2_TransformBroadcaster.sendTransform(map_odom_tf)
 
@@ -619,7 +668,7 @@ class NavTfNode:
         if delay <= 6 and self.fix_usable and self.heading_fix_usable:
 
             # if rtk_error_z <= 0.00068 and rtk_error_z >= 0.00042:
-            if rtk_error_z <= 0.00065 and rtk_error_z >= 0.00050:
+            if rtk_error_z <= 0.00065 and rtk_error_z >= 0.00051:
                 self.nav_last_fused_time = rospy.Time.now()
                 (imu_roll, imu_pitch, imu1_yaw) = euler_from_quaternion([self.imu_msg.orientation.x,
                                                                         self.imu_msg.orientation.y,
@@ -643,6 +692,37 @@ class NavTfNode:
         print("fused fix: {:.3f}s fused nav: {:.3f}s fix_usable: {:1} heading_usable: {:1} rtk_err: {:.5f}"
               .format(self.fused_fix_time, self.fused_nav_time, self.fix_usable, self.heading_fix_usable, self.rtk_err))
 
+    def publish_status(self):
+        msg = Navi_transform()
+        msg.header.stamp = rospy.Time.now()
+
+        msg.position = 0
+        if self.fused_fix_time < 1.0:
+            msg.position = 1
+        msg.heading = 0
+        if self.fused_nav_time < 1.0:
+            msg.heading = 1
+        msg.status = 'IMU'
+        if self.launch_navsat is not None:
+            msg.status = 'SAT'
+
+        if self.fused_fix_time > 9999:
+            fix_time = "inf"
+        else:
+            fix_time = "{:.1f}s".format(self.fused_fix_time)
+
+        if self.fused_nav_time > 9999:
+            nav_time = "inf"
+        else:
+            nav_time = "{:.1f}s".format(self.fused_nav_time)
+
+        if self.rtk_err > 999:
+            rtk_err = "inf"
+        else:
+            rtk_err = "e{:.5f}".format(self.rtk_err)
+
+        msg.info = "{}, {}, {}".format(fix_time, nav_time, rtk_err)
+        self.nav_odom_status_pub.publish(msg)
 
 
     def publish_imu_baselink(self):
@@ -782,6 +862,7 @@ class NavTfNode:
         self.marker_pub.publish(m_array)
 
     def loop10hz(self, event=None):
+
         node_gnss.publish_yaws()
 
         # node_gnss.publish_markers()
@@ -792,14 +873,21 @@ class NavTfNode:
 
     def loop1hz(self, event=None):
         node_gnss.print_info()
+        node_gnss.publish_status()
 
     def loop3sec(self, event=None):
         # print(sum(self.fix_usable_history))
+
         if sum(self.fix_usable_history) == 3:
-            self.fix_last_fused_time = rospy.Time.now()
-            # self.set_nav_wheel_odom()
-            self.set_wheel_base_nav_pose()
-            # print("############################################ fuse_rtk_and_wheel_odom ############################################")
+            if self.launch_navsat is not None:
+                if self.heading_fix_usable:
+                    self.fix_last_fused_time = rospy.Time.now()
+                    self.set_wheel_base_nav_pose()
+            else:
+                self.fix_last_fused_time = rospy.Time.now()
+                # self.set_nav_wheel_odom()
+                self.set_wheel_base_nav_pose()
+
 
     def loop30hz(self, event=None):
         self.publish_relative_wheel_odom()
@@ -810,6 +898,7 @@ class NavTfNode:
         self.transform_map_to_odom()
         self.fused_nav_time = (int(str(rospy.Time.now())) - int(str(self.nav_last_fused_time))) / 1000000000
         self.fused_fix_time = (int(str(rospy.Time.now())) - int(str(self.fix_last_fused_time))) / 1000000000
+        self.init_navsat()
 
 
 if __name__ == '__main__':

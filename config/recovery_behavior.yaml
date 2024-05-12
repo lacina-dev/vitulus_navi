@@ -1,9 +1,31 @@
 recovery_behaviors:
+  - name: 'clear_costmap_laser'
+    type: 'clear_costmap_recovery/ClearCostmapRecovery'
+  - name: 'clear_costmap_static'
+    type: 'clear_costmap_recovery/ClearCostmapRecovery'
   - name: 'clear_costmap'
     type: 'clear_costmap_recovery/ClearCostmapRecovery'
 
 clear_costmap:
-  reset_distance: 0.0
+  reset_distance: 2
   force_updating: true
+  invert_area_to_clear: true
+#  both, local, global
   affected_maps: both
   layer_names: [laser_layer, static_layer]
+
+clear_costmap_laser:
+  reset_distance: 1
+  force_updating: true
+  invert_area_to_clear: false
+#  both, local, global
+  affected_maps: both
+  layer_names: [laser_layer]
+
+clear_costmap_static:
+  reset_distance: 2
+  force_updating: true
+  invert_area_to_clear: true
+#  both, local, global
+  affected_maps: both
+  layer_names: [static_layer]

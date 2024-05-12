@@ -11,7 +11,8 @@ from geometry_msgs.msg import PoseStamped
 from mbf_msgs.msg import ExePathAction
 from mbf_msgs.msg import GetPathAction
 from mbf_msgs.msg import RecoveryAction
-from std_msgs.msg import Int16, String
+from smach import CBState
+from std_msgs.msg import Int16, String, Bool
 
 
 def wait_for_mbf():
@@ -29,6 +30,7 @@ def main():
 
     # Wait for Move Base Flex's move_base action (the last to be started) getting available
     wait_for_mbf()
+    pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
 
     # Create SMACH state machine
     sm = smach.StateMachine(outcomes=['succeeded', 'aborted', 'preempted'])
@@ -47,6 +49,9 @@ def main():
             rospy.loginfo("[{}] Goal received".format(rospy.get_caller_id()))
             nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
             nex_log_info_pub.publish(String("Goal received"))
+            if sm.preempt_requested():
+                sm.service_preempt()
+                return 'preempted'
             return False
 
         # Monitor topic to get MeshGoal from RViz plugin
@@ -61,7 +66,7 @@ def main():
             transitions={
                 'invalid': 'GET_PATH',
                 'valid': 'WAIT_FOR_GOAL',
-                'preempted': 'preempted'
+                'preempted': 'PREEMPTED_STOP'
             }
         )
 
@@ -69,13 +74,16 @@ def main():
         def get_path_result_cb(userdata, status, result):
             print("get path status: {}".format(status))
             print("get path result: {}".format(result.message))
+            if sm.preempt_requested():
+                sm.service_preempt()
+                return 'preempted'
             if result.outcome == 2:
                 return 'aborted'
             else:
                 pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
                 pub_log_info.publish(String("Executing goal."))
                 pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
-                pub_pm_play_melody.publish(Int16(5))  # 5:short_beep, 1:beep, 2:double beep,
+                # pub_pm_play_melody.publish(Int16(5))  # 5:short_beep, 1:beep, 2:double beep,
                 return 'succeeded'
 
         smach.StateMachine.add(
@@ -90,7 +98,7 @@ def main():
             transitions={
                 'succeeded': 'EXE_PATH',
                 'aborted': 'WAIT_FOR_GOAL',
-                'preempted': 'preempted'
+                'preempted': 'PREEMPTED_STOP'
             },
             remapping={
                 'target_pose': 'goal'
@@ -108,7 +116,7 @@ def main():
             transitions={
                 'succeeded': 'WAIT_FOR_GOAL',
                 'aborted': 'RECOVERY',
-                'preempted': 'preempted'
+                'preempted': 'PREEMPTED_STOP'
             }
         )
 
@@ -117,14 +125,22 @@ def main():
             pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
             pub_log_info.publish(String("Recovery"))
 
-            goal.behavior = 'clear_costmap'
 
-            # if userdata.clear_costmap_flag == False:
-            #     goal.behavior = 'clear_costmap'
-            #     userdata.clear_costmap_flag = True
-            # else:
-            #     goal.behavior = 'straf_recovery'
-            #     userdata.clear_costmap_flag = False
+            # goal.behavior = 'clear_costmap'
+            if sm.preempt_requested():
+                sm.service_preempt()
+                return 'preempted'
+
+            if userdata.clear_costmap_flag == False:
+                goal.behavior = 'clear_costmap_laser'
+                userdata.clear_costmap_flag = True
+                pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+                pub_pm_play_melody.publish(Int16(2))  # 5:short_beep, 1:beep, 2:double beep,
+            else:
+                goal.behavior = 'clear_costmap_static'
+                userdata.clear_costmap_flag = False
+                pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+                pub_pm_play_melody.publish(Int16(1))  # 5:short_beep, 1:beep, 2:double beep,
 
         # Recovery
         smach.StateMachine.add(
@@ -134,18 +150,43 @@ def main():
                 RecoveryAction,
                 goal_cb=recovery_path_goal_cb,
                 input_keys=["error", "clear_costmap_flag"],
-                output_keys = ["error_status", 'clear_costmap_flag']
+                output_keys=["error_status", 'clear_costmap_flag']
             ),
             transitions={
                 'succeeded': 'GET_PATH',
-                'aborted': 'GET_PATH',
-                'preempted': 'preempted'
+                'aborted': 'WAIT_FOR_GOAL',
+                'preempted': 'PREEMPTED_STOP'
             }
         )
+
+        # Add state PREEMPTED_STOP
+        @smach.cb_interface(input_keys=[], output_keys=[], outcomes=['success', 'failure'])
+        def preempted_stop_cb(userdata):
+            rospy.loginfo(
+                '[{}]Stopping program - state PREEMPTED_STOP'.format(rospy.get_caller_id()))
+            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+            pub_log_info.publish(String("Goal canceled"))
+            show_map_planner_pub = rospy.Publisher("/web_plan/show_map_layer", String, latch=True, queue_size=1)
+            show_map_planner_pub.publish(String("SMACH|MAP|FULL"))
+            pub_pm_play_melody.publish(Int16(1))  # 5:short_beep, 1:beep, 2:double beep,
+            rospy.sleep(1.5)
+            sm.recall_preempt()
+            return 'failure'
+
+        smach.StateMachine.add('PREEMPTED_STOP', CBState(preempted_stop_cb),
+                               {'success': 'WAIT_FOR_GOAL', 'failure': 'WAIT_FOR_GOAL'})
 
     # Create and start introspection server
     sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT_GOAL')
     sis.start()
+
+    def callback_stop(msg):
+        print(msg)
+        if msg.data:
+            sm.request_preempt()
+
+
+    rospy.Subscriber("/smach_goal/cancel", Bool, callback_stop)
 
     def signal_handler(sig, frame):
         print("Shutting down...")

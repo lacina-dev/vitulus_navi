@@ -396,7 +396,7 @@ def main():
 
         # Program callback for mower status WAIT_FOR_MOWER_ON
         def callback_mower_status(userdata, msg):
-            if msg.status == 'WAIT':
+            if msg.status == 'READY':
                 pub_log_info.publish(String("Mower is ready"))
                 pub_smach_status.publish(String("Mower ready"))
                 pub_pm_play_melody.publish(Int16(1))  # 5:short_beep, 1:beep, 2:double beep,
@@ -549,7 +549,7 @@ def main():
                     if process_path_sm.preempt_requested():
                         process_path_sm.service_preempt()
                         return 'preempted'
-                    if msg.status == 'WAIT':
+                    if msg.status == 'READY':
                         return False
                     else:
                         return True
@@ -860,7 +860,7 @@ def main():
 
                 # Callback for mower turn off WAIT_SET_MOTOR_OFF_AND_HOME
                 def callback_set_motor_off(userdata, msg):
-                    if msg.status == 'WAIT':
+                    if msg.status == 'READY':
                         return False
                     else:
                         return True

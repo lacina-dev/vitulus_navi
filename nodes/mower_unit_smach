@@ -853,6 +853,13 @@ def main():
                     msg.data = True
                     pub_status = pub_mower_set_motor_off.publish(msg)
                     time.sleep(1.5)
+
+                    pub_mower_set_motor_off = rospy.Publisher('/mower/set_motor_on', Bool, latch=True, queue_size=1)
+                    msg = Bool()
+                    msg.data = False
+                    pub_status = pub_mower_set_motor_off.publish(msg)
+                    time.sleep(1.5)
+
                     if pub_status is None:
                         return 'success'
 

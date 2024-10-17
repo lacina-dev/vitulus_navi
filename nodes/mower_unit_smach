@@ -599,7 +599,7 @@ def main():
                     if process_path_sm.preempt_requested():
                         process_path_sm.service_preempt()
                         return 'preempted'
-                    if userdata.zone_rpm - 10 < msg.moto_rpm < userdata.zone_rpm + 10:
+                    if userdata.zone_rpm - 100 < msg.moto_rpm < userdata.zone_rpm + 100:
                         pub_log_info.publish(String("Mowing started..."))
                         pub_smach_status.publish(String("Mowing started"))
                         return False

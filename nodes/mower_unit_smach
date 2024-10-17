@@ -518,7 +518,8 @@ def main():
                         output_keys=["error_status", 'clear_costmap_flag']
                     ),
                     transitions={
-                        'succeeded': 'EXE_PATH_TO_START',
+                        # 'succeeded': 'EXE_PATH_TO_START',
+                        'succeeded': 'GET_PATH_TO_START',
                         'aborted': 'GET_PATH_TO_START',
                         'preempted': 'preempted'
                     }

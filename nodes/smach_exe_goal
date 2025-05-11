@@ -1,36 +1,145 @@
 #!/usr/bin/env python
+# Standard library imports
 import signal
 import sys
 import time
+
+# Third-party imports
 import actionlib
-import mbf_msgs.msg as mbf_msgs
 import rospy
 import smach
 import smach_ros
+
+# ROS message imports
 from geometry_msgs.msg import PoseStamped
-from mbf_msgs.msg import ExePathAction
-from mbf_msgs.msg import GetPathAction
-from mbf_msgs.msg import RecoveryAction
+from mbf_msgs.msg import ExePathAction, GetPathAction, RecoveryAction, MoveBaseAction, GetPathResult
+from std_msgs.msg import Bool, Int16, String
 from smach import CBState
-from std_msgs.msg import Int16, String, Bool
 
+MAX_GET_PATH_ATTEMPTS = 3  # Maximum number of attempts for GET_PATH
 
+# Helper Functions
 def wait_for_mbf():
-    client = actionlib.SimpleActionClient("/move_base_flex/move_base", mbf_msgs.MoveBaseAction)
+    """Waits for the Move Base Flex action server to become available."""
+    client = actionlib.SimpleActionClient("/move_base_flex/move_base", MoveBaseAction)
+    rospy.loginfo("Waiting for Move Base Flex server...")
     available = client.wait_for_server(rospy.Duration(30))
     if not available:
-        rospy.logwarn("Move Base Flex is not available")
+        rospy.logwarn("Move Base Flex is not available after 30 seconds.")
     else:
-        rospy.loginfo("Move Base Flex is ready")
+        rospy.loginfo("Move Base Flex is ready.")
     return available
 
+
+# SMACH State Callbacks
+def goal_cb(userdata, msg):
+    """Callback for the WAIT_FOR_GOAL state. Stores the received goal."""
+    userdata.goal = msg
+    userdata.current_get_path_attempt = 0  # Reset attempt counter for new goal
+    rospy.loginfo("[{}] Goal received".format(rospy.get_caller_id()))
+    rospy.loginfo("Goal: %s", msg)
+    nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+    nex_log_info_pub.publish(String("Goal received"))
+    return False  # Returning False means the condition for 'invalid' transition is met.
+
+
+def get_path_result_cb(userdata, status, result):
+    """Callback for the GET_PATH action state. Handles the result of path planning."""
+    rospy.loginfo("Get_path action returned status: %s", actionlib.GoalStatus.to_string(status))
+    if result:
+        rospy.loginfo("Get_path action returned outcome: %d, message: %s", result.outcome, result.message)
+
+    if result and result.outcome == GetPathResult.SUCCESS:  # Use imported GetPathResult
+        nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+        nex_log_info_pub.publish(String("Executing goal."))
+        return 'succeeded'
+    else:
+        return 'aborted'  # Will trigger retry via PREPARE_GET_PATH
+
+
+@smach.cb_interface(input_keys=['current_get_path_attempt'],
+                    output_keys=['current_get_path_attempt'],
+                    outcomes=['attempt', 'max_attempts_reached', 'mbf_not_ready'])  # Added 'mbf_not_ready'
+def prepare_get_path_cb(userdata):
+    """Prepares for a GET_PATH attempt, manages retry counts and delays, and checks MBF availability."""
+    rospy.loginfo("PREPARE_GET_PATH: Checking MBF server availability...")
+    if not wait_for_mbf():  # Call wait_for_mbf()
+        rospy.logwarn("PREPARE_GET_PATH: MBF not ready. Will not attempt to get path yet.")
+        return 'mbf_not_ready'  # New outcome if MBF is not available
+
+    # MBF is ready, proceed with attempt logic
+    userdata.current_get_path_attempt += 1
+    rospy.loginfo(f"PREPARE_GET_PATH: MBF is ready. Initiating GET_PATH attempt {userdata.current_get_path_attempt}/{MAX_GET_PATH_ATTEMPTS}.")
+    if userdata.current_get_path_attempt <= MAX_GET_PATH_ATTEMPTS:
+        if userdata.current_get_path_attempt > 1:  # Add delay only for retries
+            rospy.loginfo("PREPARE_GET_PATH: Waiting 1 second before retrying GET_PATH...")
+            rospy.sleep(1.0)
+        return 'attempt'
+    else:
+        rospy.logwarn(f"PREPARE_GET_PATH: GET_PATH failed after {MAX_GET_PATH_ATTEMPTS} attempts. Aborting current goal.")
+        return 'max_attempts_reached'
+
+
+def recovery_path_goal_cb(userdata, goal):
+    """Goal callback for the RECOVERY action state. Sets the recovery behavior."""
+    nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+    nex_log_info_pub.publish(String("Recovery"))
+    pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+
+    if userdata.clear_costmap_flag == False:
+        goal.behavior = 'clear_costmap_laser'
+        userdata.clear_costmap_flag = True
+        pub_pm_play_melody.publish(Int16(2))  # 2:double beep
+    else:
+        goal.behavior = 'clear_costmap_static'
+        userdata.clear_costmap_flag = False
+        pub_pm_play_melody.publish(Int16(1))  # 1:beep
+    return goal  # Return the modified goal
+
+
+@smach.cb_interface(input_keys=[], output_keys=[], outcomes=['success', 'failure'])
+def preempted_stop_cb(userdata):
+    """Callback for the PREEMPTED_STOP state. Handles goal cancellation."""
+    rospy.loginfo('[{}] Goal canceled. Entering PREEMPTED_STOP state.'.format(rospy.get_caller_id()))
+    nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+    nex_log_info_pub.publish(String("Goal canceled"))
+    show_map_planner_pub = rospy.Publisher("/web_plan/show_map_layer", String, latch=True, queue_size=1)
+    show_map_planner_pub.publish(String("SMACH|MAP|FULL"))
+    pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+    pub_pm_play_melody.publish(Int16(1))  # 1:beep
+    rospy.sleep(1.5)
+    return 'failure'
+
+
+# Subscriber Callbacks
+def callback_stop(msg, sm_instance):
+    """Callback for the /smach_goal/cancel topic. Requests preemption."""
+    rospy.loginfo("Received cancel request: %s", msg.data)
+    if msg.data:
+        sm_instance.request_preempt()
+
+
+# Signal Handling
+def signal_handler(sig, frame, sm_instance, sis_instance):
+    """Handles SIGINT (Ctrl+C) for graceful shutdown."""
+    rospy.loginfo("SIGINT received, shutting down...")
+    if sm_instance:
+        sm_instance.request_preempt()
+    if sis_instance:
+        sis_instance.stop()
+    rospy.signal_shutdown("SIGINT received")
+    rospy.sleep(1)
+    sys.exit(0)
+
+
 def main():
+    """Main function to initialize ROS, set up and run the SMACH state machine."""
     rospy.init_node('mbf_state_machine_goal')
     rospy.loginfo("<{}> Initialising...".format(rospy.get_caller_id()))
 
-    # Wait for Move Base Flex's move_base action (the last to be started) getting available
-    wait_for_mbf()
-    pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
+    if not wait_for_mbf():
+        rospy.logerr("Failed to connect to Move Base Flex. Exiting.")
+        return
 
     # Create SMACH state machine
     sm = smach.StateMachine(outcomes=['succeeded', 'aborted', 'preempted'])
@@ -38,66 +147,55 @@ def main():
     # Define userdata
     sm.userdata.goal = None
     sm.userdata.path = None
-    sm.userdata.error = None
     sm.userdata.clear_costmap_flag = False
-    sm.userdata.error_status = None
+    sm.userdata.current_get_path_attempt = 0  # Initialize attempt counter
 
     with sm:
-        # Goal callback for state WAIT_FOR_GOAL
-        def goal_cb(userdata, msg):
-            userdata.goal = msg
-            rospy.loginfo("[{}] Goal received".format(rospy.get_caller_id()))
-            nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
-            nex_log_info_pub.publish(String("Goal received"))
-            if sm.preempt_requested():
-                sm.service_preempt()
-                return 'preempted'
-            return False
-
-        # Monitor topic to get MeshGoal from RViz plugin
+        # State: WAIT_FOR_GOAL
         smach.StateMachine.add(
             'WAIT_FOR_GOAL',
             smach_ros.MonitorState(
-                '/move_base_smach/goal',
-                PoseStamped,
-                goal_cb,
-                output_keys=['goal']
+                topic='/move_base_smach/goal',
+                msg_type=PoseStamped,
+                cond_cb=goal_cb,
+                output_keys=['goal', 'current_get_path_attempt']  # Added current_get_path_attempt
             ),
             transitions={
-                'invalid': 'GET_PATH',
+                'invalid': 'PREPARE_GET_PATH',  # Changed from GET_PATH
                 'valid': 'WAIT_FOR_GOAL',
                 'preempted': 'PREEMPTED_STOP'
             }
         )
 
-        # Get path
-        def get_path_result_cb(userdata, status, result):
-            print("get path status: {}".format(status))
-            print("get path result: {}".format(result.message))
-            if sm.preempt_requested():
-                sm.service_preempt()
-                return 'preempted'
-            if result.outcome == 2:
-                return 'aborted'
-            else:
-                pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
-                pub_log_info.publish(String("Executing goal."))
-                pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
-                # pub_pm_play_melody.publish(Int16(5))  # 5:short_beep, 1:beep, 2:double beep,
-                return 'succeeded'
+        # State: PREPARE_GET_PATH (New state)
+        smach.StateMachine.add(
+            'PREPARE_GET_PATH',
+            CBState(prepare_get_path_cb,
+                    input_keys=['current_get_path_attempt'],
+                    output_keys=['current_get_path_attempt'],
+                    outcomes=['attempt', 'max_attempts_reached', 'mbf_not_ready']),  # Added outcomes to CBState
+            transitions={
+                'attempt': 'GET_PATH',
+                'max_attempts_reached': 'WAIT_FOR_GOAL',  # Give up on this goal, wait for a new one
+                'mbf_not_ready': 'WAIT_FOR_GOAL'  # If MBF not ready, go back to wait for goal
+            }
+        )
 
+        # State: GET_PATH
         smach.StateMachine.add(
             'GET_PATH',
             smach_ros.SimpleActionState(
-                '/move_base_flex/get_path',
-                GetPathAction,
+                action_name='/move_base_flex/get_path',
+                action_spec=GetPathAction,
                 goal_slots=['target_pose'],
-                result_slots=['path'],
-                result_cb=get_path_result_cb
+                result_slots=['path', 'outcome', 'message'],
+                result_cb=get_path_result_cb,
+                output_keys=['path'],
+                server_wait_timeout=rospy.Duration(10.0)
             ),
             transitions={
                 'succeeded': 'EXE_PATH',
-                'aborted': 'WAIT_FOR_GOAL',
+                'aborted': 'PREPARE_GET_PATH',  # Changed from WAIT_FOR_GOAL to retry
                 'preempted': 'PREEMPTED_STOP'
             },
             remapping={
@@ -105,12 +203,12 @@ def main():
             }
         )
 
-        # Execute path
+        # State: EXE_PATH
         smach.StateMachine.add(
             'EXE_PATH',
             smach_ros.SimpleActionState(
-                '/move_base_flex/exe_path',
-                ExePathAction,
+                action_name='/move_base_flex/exe_path',
+                action_spec=ExePathAction,
                 goal_slots=['path']
             ),
             transitions={
@@ -120,37 +218,15 @@ def main():
             }
         )
 
-        # Goal callback for state RECOVERY
-        def recovery_path_goal_cb(userdata, goal):
-            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
-            pub_log_info.publish(String("Recovery"))
-
-
-            # goal.behavior = 'clear_costmap'
-            if sm.preempt_requested():
-                sm.service_preempt()
-                return 'preempted'
-
-            if userdata.clear_costmap_flag == False:
-                goal.behavior = 'clear_costmap_laser'
-                userdata.clear_costmap_flag = True
-                pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
-                pub_pm_play_melody.publish(Int16(2))  # 5:short_beep, 1:beep, 2:double beep,
-            else:
-                goal.behavior = 'clear_costmap_static'
-                userdata.clear_costmap_flag = False
-                pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
-                pub_pm_play_melody.publish(Int16(1))  # 5:short_beep, 1:beep, 2:double beep,
-
-        # Recovery
+        # State: RECOVERY
         smach.StateMachine.add(
             'RECOVERY',
-             smach_ros.SimpleActionState(
-                'move_base_flex/recovery',
-                RecoveryAction,
+            smach_ros.SimpleActionState(
+                action_name='move_base_flex/recovery',
+                action_spec=RecoveryAction,
                 goal_cb=recovery_path_goal_cb,
-                input_keys=["error", "clear_costmap_flag"],
-                output_keys=["error_status", 'clear_costmap_flag']
+                input_keys=['clear_costmap_flag'],
+                output_keys=['clear_costmap_flag']
             ),
             transitions={
                 'succeeded': 'GET_PATH',
@@ -159,52 +235,35 @@ def main():
             }
         )
 
-        # Add state PREEMPTED_STOP
-        @smach.cb_interface(input_keys=[], output_keys=[], outcomes=['success', 'failure'])
-        def preempted_stop_cb(userdata):
-            rospy.loginfo(
-                '[{}]Stopping program - state PREEMPTED_STOP'.format(rospy.get_caller_id()))
-            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
-            pub_log_info.publish(String("Goal canceled"))
-            show_map_planner_pub = rospy.Publisher("/web_plan/show_map_layer", String, latch=True, queue_size=1)
-            show_map_planner_pub.publish(String("SMACH|MAP|FULL"))
-            pub_pm_play_melody.publish(Int16(1))  # 5:short_beep, 1:beep, 2:double beep,
-            rospy.sleep(1.5)
-            sm.recall_preempt()
-            return 'failure'
+        # State: PREEMPTED_STOP
+        smach.StateMachine.add(
+            'PREEMPTED_STOP',
+            CBState(preempted_stop_cb),
+            transitions={
+                'success': 'WAIT_FOR_GOAL',
+                'failure': 'WAIT_FOR_GOAL'
+            }
+        )
 
-        smach.StateMachine.add('PREEMPTED_STOP', CBState(preempted_stop_cb),
-                               {'success': 'WAIT_FOR_GOAL', 'failure': 'WAIT_FOR_GOAL'})
-
-    # Create and start introspection server
+    # Create and start introspection server for debugging
     sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT_GOAL')
     sis.start()
 
-    def callback_stop(msg):
-        print(msg)
-        if msg.data:
-            sm.request_preempt()
+    # Subscribe to the cancel topic
+    rospy.Subscriber("/smach_goal/cancel", Bool, callback_stop, callback_args=sm)
 
+    # Setup signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, sm, sis))
 
-    rospy.Subscriber("/smach_goal/cancel", Bool, callback_stop)
+    rospy.loginfo("SMACH state machine starting.")
+    outcome = sm.execute()
+    rospy.loginfo("SMACH state machine finished with outcome: %s", outcome)
 
-    def signal_handler(sig, frame):
-        print("Shutting down...")
-        rospy.signal_shutdown("end")
-        sm.request_preempt()
-        sis.stop()
-        sis.clear()
-        time.sleep(1)
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-
-    # Execute SMACH
-    sm.execute()
-
-    # Wait for interrupt and stop introspection server
     rospy.spin()
-    sis.stop()
+    if sis.is_running():
+        sis.stop()
+    rospy.loginfo("Shutting down introspection server.")
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()

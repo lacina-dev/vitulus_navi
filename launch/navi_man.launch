@@ -2,10 +2,10 @@
 
     <arg name="arg_ns" default="/"/>
     <group ns="$(arg arg_ns)">
-        <node name="navi_man" pkg="vitulus_navi" type="navi_man" respawn="true" respawn_delay="1" output="log">
+        <node name="navi_man" pkg="vitulus_navi" type="navi_man" respawn="true" respawn_delay="1" output="screen" />
 <!--            <param name="prm_name" value="prm_value"/>-->
 <!--            <remap from="/topic" to="/another_topic" />-->
-        </node>
+        <!-- </node> -->
         <node name="navi_transform" pkg="vitulus_navi" type="navi_transform" respawn="true" respawn_delay="1" output="log">
         </node>
     </group>

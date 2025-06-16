@@ -1,5 +1,8 @@
 <launch>
 
+<!-- Vitulus costmap launch file -->
+<include file="$(find vitulus_local_costmap)/launch/local_costmap.launch" />
+
     <arg name="arg_ns" default="/"/>
     <group ns="$(arg arg_ns)">
         <node name="navi_man" pkg="vitulus_navi" type="navi_man" respawn="true" respawn_delay="1" output="screen" />

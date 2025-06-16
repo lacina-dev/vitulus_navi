@@ -114,6 +114,9 @@ class Node:
         self.map_data.utm_orientation_y = 0
         self.map_data.utm_orientation_z = 0
         self.map_data.utm_orientation_w = 1
+
+        self.autopath_name = None
+        self.autopath_last_pose = None
         
         self.map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
         self.map_coords = rospy.Publisher('navi_manager/map_coords', PoseStamped, queue_size=10)
@@ -165,6 +168,8 @@ class Node:
         rospy.Subscriber("/navi_manager/remove_point", String, self.callback_remove_point)
         rospy.Subscriber("/navi_manager/save_path", String, self.callback_save_path)
         rospy.Subscriber("/navi_manager/save_path_point", String, self.callback_save_path_point)
+        rospy.Subscriber("/navi_manager/start_new_autopath", String, self.callback_start_new_autopath)
+        rospy.Subscriber("/navi_manager/stop_autopath", Bool, self.callback_stop_autopath)
         rospy.Subscriber("/navi_manager/publish_path", String, self.callback_publish_path)
         rospy.Subscriber("/navi_manager/remove_path", String, self.callback_remove_path)
         rospy.Subscriber("/move_base_flex/exe_path/status", GoalStatusArray, self.callback_move_base_client_state)
@@ -379,6 +384,24 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.logwarn("The name is empty!")
 
+    def add_autopath_point(self):
+        if self.autopath_name is not None and self.autopath_last_pose is not None:
+            # if self.autopath.pose is in distance 0.3m or more from current pose, the add point to path
+            pose, tf_frame = self.getCurrentPose()           
+            distance = ((self.autopath_last_pose.position.x - pose.position.x) ** 2 +
+                        (self.autopath_last_pose.position.y - pose.position.y) ** 2 +
+                        (self.autopath_last_pose.position.z - pose.position.z) ** 2) ** 0.5
+            if distance > 0.3:
+                self.running_map_data.add_map_path_point(self.autopath_name, pose)
+                self.autopath_last_pose = pose
+                self.save_running_map_data()
+                self.status_msg_pub.publish("Current position added to {} path.".format(self.autopath_name))
+                rospy.loginfo("Current position added to {} path.".format(self.autopath_name))
+            # else:
+            #     self.status_msg_pub.publish("Current position is too close to last point in {} path.".format(self.autopath_name))
+            #     rospy.loginfo("Current position is too close to last point in {} path.".format(self.autopath_name))
+            
+
     def callback_save_path_point(self, msg):
         if msg.data != "":
             pose, tf_frame = self.getCurrentPose()
@@ -441,6 +464,38 @@ class Node:
             rospy.loginfo("The name is empty!")
             self.nex_log_info_pub.publish("The name is empty!")
 
+    def callback_stop_autopath(self, msg):
+        self.autopath_name = None
+        self.autopath_last_pose = None
+        if self.autopath_name is not None and self.autopath_last_pose is not None:     
+            self.status_msg_pub.publish("Autopath stopped.")
+            rospy.loginfo("Autopath stopped.")
+        else:
+            self.status_msg_pub.publish("Autopath is not running!")
+            rospy.loginfo("Autopath is not running!")
+
+    def callback_start_new_autopath(self, msg):
+        if msg.data != "":
+            pose, tf_frame = self.getCurrentPose()
+            path = MapPath(msg.data, tf_frame)
+            path.add_pose(pose)
+            path_exist = self.running_map_data.get_map_path(msg.data)
+            self.autopath_name = msg.data
+            self.autopath_last_pose = pose
+            if not path_exist:
+                self.running_map_data.add_map_path(path)
+                self.save_running_map_data()
+                self.status_msg_pub.publish("New path {} added with first waypoint.".format(msg.data))
+                rospy.loginfo("New path {} with first waypoint.".format(msg.data))
+            else:
+                path_exist = path
+                self.save_running_map_data()
+                self.status_msg_pub.publish("{} path changed.".format(msg.data))
+                rospy.loginfo("{} path changed.".format(msg.data))
+        else:
+            self.status_msg_pub.publish("The name is empty!")
+            rospy.loginfo("The name is empty!")
+    
     def callback_save_path(self, msg):
         if msg.data != "":
             pose, tf_frame = self.getCurrentPose()
@@ -1116,6 +1171,7 @@ if __name__ == '__main__':
             node.set_map_utm_transform()
             node.publish_pose_cov_stamped()
             node.publish_map_coords()
+            node.add_autopath_point()
             if (slow_nr == slow_counter):
                 node.get_maplist()
                 node.publish_map_point_list()
@@ -1128,6 +1184,7 @@ if __name__ == '__main__':
                 node.set_map_status()
                 node.publish_map()
                 node.rtabmap_settings_publish()
+                
                 # node.publish_map_coords()
                 slow_counter = 0
             slow_counter += 1

@@ -157,6 +157,11 @@ class NavTfNode:
     def init_navsat(self):
         if self.launch_navsat is None:
             if self.fused_fix_time < 1.0 and self.fused_nav_time < 1.0:
+                rospy.logwarn(
+                    f"[navi_transform] Launching navsat_transform: "
+                    f"fused_fix={self.fused_fix_time:.3f}s fused_nav={self.fused_nav_time:.3f}s "
+                    f"fix_usable={self.fix_usable} heading_usable={self.heading_fix_usable} "
+                    f"rtk_err={self.rtk_err:.5f} is_indoor={self.is_indoor}")
                 self.roslaunch_navsat()
 
 
@@ -182,7 +187,25 @@ class NavTfNode:
                 rospy.logerr("Service /navi_manager/get_point_pose call failed: %s" % e)
 
     def callback_navi_indoor(self, msg):
+        was_indoor = self.is_indoor
         self.is_indoor = msg.data
+        rospy.loginfo_throttle(10, f"[navi_transform] is_indoor={self.is_indoor}")
+        if was_indoor and not self.is_indoor:
+            # Transitioning indoor→outdoor: restart navsat_transform_node so it
+            # re-initialises with the current (accurate, post-stabilisation) GPS.
+            # Without this, navsat could have been initialised near the dock where
+            # GPS multipath causes a systematic ~1 m bias in the utm→odom TF.
+            rospy.logwarn("[navi_transform] Indoor→outdoor transition detected: "
+                          "restarting navsat_transform for fresh GPS datum away from dock.")
+            if self.launch_navsat is not None:
+                try:
+                    self.launch_navsat.shutdown()
+                    rospy.loginfo("[navi_transform] navsat_transform stopped — will relaunch on next init_navsat() call")
+                except Exception as e:
+                    rospy.logwarn(f"[navi_transform] Error stopping navsat: {e}")
+                self.launch_navsat = None
+            else:
+                rospy.loginfo("[navi_transform] navsat_transform was not running — will launch fresh on GPS ready")
 
     def callback_map_coords(self, msg):
         # if msg.pose != self.map_coords_msg.pose:
@@ -195,8 +218,6 @@ class NavTfNode:
             trans = None
 
         if trans is not None:
-            # print(trans)
-
             map_roll, map_pitch, map_yaw = euler_from_quaternion(
                 [msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w])
             odom_roll, odom_pitch, odom_yaw = euler_from_quaternion([trans.transform.rotation.x,
@@ -204,7 +225,6 @@ class NavTfNode:
                                                                      trans.transform.rotation.z,
                                                                      trans.transform.rotation.w])
             yaw_offset = odom_yaw - map_yaw
-            # print("Map  Yaw offset: ", yaw_offset)
             quaternion = quaternion_from_euler(map_roll, map_pitch, yaw_offset)
 
             p_x = 0
@@ -215,6 +235,13 @@ class NavTfNode:
                 p_x = trans.transform.translation.x - msg.pose.position.x
                 p_y = trans.transform.translation.y - msg.pose.position.y
                 p_z = trans.transform.translation.z - msg.pose.position.z
+
+            rospy.loginfo_throttle(5,
+                f"[map->odom] utm_odom=({trans.transform.translation.x:.3f}, {trans.transform.translation.y:.3f}) "
+                f"utm_map=({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}) "
+                f"map_odom=({p_x:.3f}, {p_y:.3f}) "
+                f"yaw_diff={math.degrees(yaw_offset):.2f}deg "
+                f"navsat_running={self.launch_navsat is not None}")
 
             map_odom_transform = TransformStamped()
             map_odom_transform.header.stamp = rospy.Time.now()
@@ -227,7 +254,6 @@ class NavTfNode:
             map_odom_transform.transform.rotation.y = quaternion[1]
             map_odom_transform.transform.rotation.z = quaternion[2]
             map_odom_transform.transform.rotation.w = quaternion[3]
-            # print(map_odom_transform)
 
             self.map_odom_transform = map_odom_transform
         self.map_coords_msg = msg

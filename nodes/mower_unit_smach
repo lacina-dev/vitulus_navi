@@ -4,42 +4,239 @@ import shapely
 import smach
 import smach_ros
 from smach_ros import ServiceState
-from smach import Iterator, CBState
+from smach import State, StateMachine, Concurrence, Iterator, CBState
 import math
 from shapely import geometry
 import signal
 import time
+import tf
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool, String, Int16
-from vitulus_msgs.msg import PlannerProgram, Mower, Device_icon_status
-from mbf_msgs.msg import ExePathAction
+from std_msgs.msg import Bool, String, Int16, Int8
+from vitulus_msgs.msg import DockProgram, StringList
+from vitulus_msgs.msg import PlannerProgram, Mower, Device_icon_status, Power_status
+from mbf_msgs.msg import ExePathAction, ExePathGoal, ExePathActionFeedback
 from mbf_msgs.msg import GetPathAction
 from rtabmap_msgs.msg import Info
-from mbf_msgs.msg import RecoveryAction
+from mbf_msgs.msg import RecoveryAction, RecoveryGoal
 from mbf_msgs.srv import CheckPath, CheckPathRequest, CheckPathResponse
 import PyKDL as kdl
+from geometry_msgs.msg import PoseStamped, Quaternion
+
+
+def _direction_angle(line_coords):
+    x = line_coords[1][0] - line_coords[0][0]
+    y = line_coords[1][1] - line_coords[0][1]
+    diagonal = math.sqrt(x ** 2 + y ** 2)
+    if diagonal == 0:
+        return 0.0
+    if y < 0:
+        if x >= 0:
+            return math.asin(y / diagonal)
+        return math.acos(x / diagonal) * -1
+    if x >= 0:
+        return math.asin(y / diagonal)
+    return math.acos(x / diagonal)
+
+
+def segmentize_raw_path(raw_path, segmentize_distance=0.03, outline_start_offset=0.18):
+    """Segmentize a raw planner path the same way GetPathData does.
+
+    Returns a Path with poses spaced ~segmentize_distance apart. Mirrors the
+    logic inside GetPathData.execute so the resume index (path_window_start_index)
+    stays consistent between the producer (WindowPlannerPath) and the consumer
+    (GetZoneData on resume).
+    """
+    line = geometry.LineString([[p.pose.position.x, p.pose.position.y] for p in raw_path.poses])
+    path_new = Path()
+    path_new.header.frame_id = "map"
+    path_new.header.stamp = rospy.Time.now()
+
+    if line.length == 0:
+        # Outline (closed polygon) path
+        start_poses_offset = int(round(outline_start_offset / segmentize_distance))
+        polygon = geometry.LinearRing([[p.pose.position.x, p.pose.position.y] for p in raw_path.poses])
+        polygon = shapely.remove_repeated_points(polygon)
+        for n in range(0, len(polygon.coords) - 1):
+            seg = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]],
+                                       [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
+            angle = _direction_angle(list(seg.coords))
+            seg = seg.segmentize(segmentize_distance)
+            for point in seg.coords:
+                pose = PoseStamped()
+                pose.header.frame_id = "map"
+                pose.header.stamp = rospy.Time.now()
+                pose.pose.position.x = point[0]
+                pose.pose.position.y = point[1]
+                pose.pose.position.z = 0.0
+                pose.pose.orientation = Quaternion(
+                    *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                path_new.poses.append(pose)
+        if start_poses_offset > 0 and len(path_new.poses) > 2 * start_poses_offset:
+            path_new.poses = path_new.poses[start_poses_offset:-start_poses_offset]
+        return path_new
+
+    # Coverage infill path
+    line = line.segmentize(segmentize_distance)
+    for pose_id in range(0, len(line.coords) - 1):
+        angle = _direction_angle([[line.coords[pose_id][0], line.coords[pose_id][1]],
+                                  [line.coords[pose_id + 1][0], line.coords[pose_id + 1][1]]])
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = rospy.Time.now()
+        pose.pose.position.x = line.coords[pose_id][0]
+        pose.pose.position.y = line.coords[pose_id][1]
+        pose.pose.position.z = 0.0
+        pose.pose.orientation = Quaternion(
+            *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+        path_new.poses.append(pose)
+    return path_new
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
 import actionlib
 import mbf_msgs.msg as mbf_msgs
+
+
+def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0):
+    """Stop the cutting motor and raise the blade to max_height before power-off.
+
+    The mower v4 firmware automatically triggers a HOME cycle whenever
+    ``/mower/set_power(False)`` is published while the blade is not parked at
+    ``max_height``. To suppress that auto-HOME, this helper:
+
+      1. Reads the current /mower/status (max_height, current_height, RPM).
+      2. Publishes ``set_motor_on(False)`` and waits until the FW leaves the
+         ``RUN`` state (status only reaches READY/WAIT once the motor is off).
+      3. If the blade is not already at ``max_height``, publishes
+         ``set_cut_height(max_height)`` and polls /mower/status until the blade
+         actually reaches the target (or the timeout expires).
+
+    Idempotent: a second call is a cheap no-op once the blade is at max_height.
+    Returns ``True`` on success, ``False`` on timeout (the caller continues
+    regardless because this lives on the shutdown path).
+    """
+    caller = rospy.get_caller_id()
+    log_prefix = '[{}][safe_blade_shutdown:{}]'.format(caller, source)
+
+    # 1. Snapshot current mower state ------------------------------------------------
+    max_height = 80
+    current_height = -1
+    status0 = 'UNKNOWN'
+    rpm0 = -1
+    try:
+        s0 = rospy.wait_for_message('/mower/status', Mower, timeout=5.0)
+        max_height = int(s0.max_height) if s0.max_height else 80
+        current_height = int(s0.current_height)
+        status0 = s0.status
+        rpm0 = int(s0.moto_rpm)
+    except rospy.ROSException as e:
+        rospy.logwarn('{} cannot read /mower/status ({}); using fallback max_height=80'.format(
+            log_prefix, e))
+
+    rospy.loginfo('{} entry: status={} current_height={} max_height={} rpm={}'.format(
+        log_prefix, status0, current_height, max_height, rpm0))
+
+    # 2. Stop the cutting motor first so FW can leave RUN ---------------------------
+    pub_motor = rospy.Publisher('/mower/set_motor_on', Bool, latch=True, queue_size=1)
+    rospy.sleep(0.1)  # allow latched publisher to register
+    pub_motor.publish(Bool(False))
+    rospy.loginfo('{} published set_motor_on(False)'.format(log_prefix))
+
+    motor_off_deadline = rospy.Time.now() + rospy.Duration(timeout_motor)
+    motor_stopped = (status0 != 'RUN' and rpm0 == 0)
+    while not rospy.is_shutdown() and not motor_stopped and rospy.Time.now() < motor_off_deadline:
+        try:
+            s = rospy.wait_for_message('/mower/status', Mower, timeout=1.0)
+            if s.status != 'RUN' and int(s.moto_rpm) == 0:
+                motor_stopped = True
+                current_height = int(s.current_height)
+                rospy.loginfo('{} motor stopped (status={}, height={})'.format(
+                    log_prefix, s.status, current_height))
+                break
+        except rospy.ROSException:
+            continue
+    if not motor_stopped:
+        rospy.logwarn('{} timeout waiting for motor to stop (continuing anyway)'.format(log_prefix))
+
+    # 3. Raise blade to max_height if needed ----------------------------------------
+    if current_height == max_height:
+        rospy.loginfo('{} blade already at max_height={}, no raise needed'.format(
+            log_prefix, max_height))
+        return True
+
+    pub_height = rospy.Publisher('/mower/set_cut_height', Int16, latch=True, queue_size=1)
+    rospy.sleep(0.1)
+    pub_height.publish(Int16(max_height))
+    rospy.loginfo('{} published set_cut_height({}) (was {})'.format(
+        log_prefix, max_height, current_height))
+
+    height_deadline = rospy.Time.now() + rospy.Duration(timeout_height)
+    last_log = rospy.Time.now()
+    while not rospy.is_shutdown() and rospy.Time.now() < height_deadline:
+        try:
+            s = rospy.wait_for_message('/mower/status', Mower, timeout=1.0)
+            if int(s.current_height) == max_height:
+                rospy.loginfo('{} blade reached max_height={} (status={})'.format(
+                    log_prefix, max_height, s.status))
+                return True
+            if (rospy.Time.now() - last_log).to_sec() > 3.0:
+                rospy.loginfo('{} waiting: current_height={} target={} status={}'.format(
+                    log_prefix, s.current_height, max_height, s.status))
+                last_log = rospy.Time.now()
+        except rospy.ROSException:
+            continue
+
+    rospy.logwarn('{} TIMEOUT: blade did not reach max_height={} within {}s; '
+                  'FW HOME may trigger on power-off'.format(log_prefix, max_height, timeout_height))
+    return False
 import sys
 
 
 class GetZoneData(smach.State):
     def __init__(self):
-        smach.State.__init__(self, outcomes=['available', 'failed', 'preempted'],
+        smach.State.__init__(self, outcomes=['available', 'failed', 'preempted', 'skip_zone'],
                              input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index', 'zone_name',
-                                         'zone_start_pose', 'paths'],
-                             output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 'zone_start_pose', 'paths', 'controller'])
+                                         'zone_start_pose', 'paths', 'unfinished_active', 'unfinished_zone', 'unfinished_path', 'path_window_start_index', 'unfinished_window'],
+                             output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 
+                                          'zone_start_pose', 'paths', 'controller', 'unfinished_active', 'unfinished_zone', 'unfinished_path', 'path_window_start_index'])
 
     def execute(self, userdata):
         rospy.loginfo('[{}]Getting zone data - state GET_ZONE_DATA'.format(rospy.get_caller_id()))
+        
+        current_zone_name = userdata.program.zone_list[userdata.index].name
+
+        if userdata.unfinished_active and current_zone_name != userdata.unfinished_zone:
+            rospy.loginfo('[{}]Skipping zone {} to resume at {}'.format(rospy.get_caller_id(), current_zone_name, userdata.unfinished_zone))
+            return 'skip_zone'
+        
+        if userdata.unfinished_active and current_zone_name == userdata.unfinished_zone:
+            rospy.loginfo('[{}]Resuming at unfinished zone ################: {} path: {}'.format(rospy.get_caller_id(), userdata.unfinished_zone, userdata.unfinished_path))
+
         userdata.zone_cut_height = userdata.program.zone_list[userdata.index].cut_height
         userdata.zone_rpm = userdata.program.zone_list[userdata.index].rpm
         userdata.zone_name = userdata.program.zone_list[userdata.index].name
-        userdata.zone_start_pose = userdata.program.zone_list[userdata.index].paths[0].poses[0]
         userdata.paths = userdata.program.zone_list[userdata.index].paths
+        if userdata.unfinished_active and current_zone_name == userdata.unfinished_zone:
+            # Resume: navigate directly to the pose where mowing was interrupted.
+            # path_window_start_index indexes the segmentized (~3 cm spacing) path,
+            # so we must segmentize the raw path the same way GetPathData does.
+            resume_path_idx = int(userdata.unfinished_path)
+            resume_window = int(userdata.unfinished_window) if userdata.unfinished_window else 0
+            raw_resume_path = userdata.paths[resume_path_idx]
+            try:
+                segmented = segmentize_raw_path(raw_resume_path)
+                if not segmented.poses:
+                    raise ValueError("segmented path is empty")
+                resume_window = max(0, min(resume_window, len(segmented.poses) - 1))
+                userdata.zone_start_pose = segmented.poses[resume_window]
+                rospy.loginfo('[{}]Resume: navigating directly to path {} window {} (segmented poses={})'.format(
+                    rospy.get_caller_id(), resume_path_idx, resume_window, len(segmented.poses)))
+            except Exception as e:
+                rospy.logwarn('[{}]Resume pose computation failed ({}); falling back to raw path[{}].poses[0]'.format(
+                    rospy.get_caller_id(), e, resume_path_idx))
+                userdata.zone_start_pose = raw_resume_path.poses[0]
+        else:
+            userdata.zone_start_pose = userdata.program.zone_list[userdata.index].paths[0].poses[0]
         userdata.controller = 'base_local_planner/TrajectoryPlannerROS'
-        print(userdata.zone_name)
+        # print(userdata.zone_name)
         # print(userdata.zone_cut_height)
         show_map_planner_pub = rospy.Publisher("/web_plan/show_map_layer", String, latch=True, queue_size=1)
         show_map_planner_pub.publish(String("SMACH|MAP|FULL"))
@@ -53,13 +250,17 @@ class GetZoneData(smach.State):
 
 
 class GetPathData(smach.State):
-    def __init__(self):
-        smach.State.__init__(self, outcomes=['available', 'preempted'],
+    def __init__(self, save_prg_pub):
+        smach.State.__init__(self, outcomes=['available', 'preempted', 'skip_path'],
                              input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index', 'zone_name', 'path_planner',
                                          'zone_start_pose', 'path_plan', 'index_path', 'paths', 'path_start_pose',
-                                         'path', 'final_pose'],
-                             output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 'zone_start_pose', 'path_planner',
-                                          'path_plan', 'paths', 'path_start_pose', 'path', 'final_pose'])
+                                         'path', 'final_pose', 'unfinished_active', 'unfinished_zone', 'unfinished_path', 
+                                         'unfinished_window', 'path_window_start_index'],
+                             output_keys=['program', 'zone_cut_height', 'zone_rpm', 'zone_name', 'zone_start_pose', 'path_planner',
+                                          'path_plan', 'paths', 'path_start_pose', 'path', 'final_pose', 
+                                          'unfinished_active', 'unfinished_zone', 'unfinished_path' 'unfinished_window', 
+                                          'path_window_start_index'])
+        self.save_prg_pub = save_prg_pub
     def path_to_polygon(self, path):
         # create shapely polygon from path poses
         polygon = geometry.LinearRing([[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
@@ -97,9 +298,23 @@ class GetPathData(smach.State):
 
     def execute(self, userdata):
         rospy.loginfo('[{}]Getting path data - state GET_PATH_DATA'.format(rospy.get_caller_id()))
+        # Check if resumed program and skip to resumed path 
+        if userdata.unfinished_active and str(userdata.index_path) != userdata.unfinished_path:
+            rospy.loginfo('[{}]Skipping path {} to resume at {}'.format(rospy.get_caller_id(), userdata.index_path, userdata.unfinished_path))
+            return 'skip_path'
+        
+        # Continue as normal if resumed path
         path = userdata.paths[userdata.index_path]
+        userdata.path_start_pose = path.poses[0] 
         userdata.path_planner = path
-        userdata.path_start_pose = path.poses[0]
+        # userdata.path_start_pose = path.poses[0]
+
+        # Save current zone and path as last failed to resume later will be overwritten at  
+        # the end of the program if successful
+        # userdata.program.last_result = f'failed: on_path-{userdata.zone_name}-{userdata.index_path}'
+        userdata.program.last_result = f'failed: on_path-{userdata.zone_name}-{userdata.index_path}-{userdata.path_window_start_index}'
+        self.save_prg_pub.publish(userdata.program)
+
         show_map_planner_pub = rospy.Publisher("/web_plan/show_map_layer", String, latch=True, queue_size=1)
         show_map_planner_pub.publish(String("SMACH|ZONE|{}".format(userdata.zone_name)))
         line = geometry.LineString([[path.poses[0].pose.position.x, path.poses[0].pose.position.y],
@@ -107,8 +322,11 @@ class GetPathData(smach.State):
 
         # print("Line length: {}".format(line.length))
         segmentize_distance = 0.03
+        # segmentize_distance = 1.5
+
+        # Coverage outline path
         if line.length == 0:
-            print("Outline path")
+            # print("Outline path")
             start_offset = 0.18
             start_poses_offset = int(round(start_offset / segmentize_distance))
             path_new = Path()
@@ -135,8 +353,9 @@ class GetPathData(smach.State):
             userdata.path_start_pose = path.poses[0]
             userdata.final_pose = path.poses[-1]
 
+        # Coverage infill path
         else:
-            print("Coverage path")
+            # print("Coverage path")
             line = self.path_to_line(path)
             path_new = Path()
             path_new.header.frame_id = "map"
@@ -157,6 +376,14 @@ class GetPathData(smach.State):
                 path_new.poses.append(pose)
             path = path_new
 
+        # If resumed program on this path, set the start pose to the unfinished window
+        if userdata.unfinished_active and str(userdata.index_path) == userdata.unfinished_path:
+            rospy.loginfo('[{}]Resuming at unfinished path ################: {}'.format(rospy.get_caller_id(), userdata.unfinished_path))
+            rospy.loginfo(f'[{rospy.get_caller_id()}] Path poses: {len(path.poses)}  unfinished_window: {userdata.unfinished_window}  index_path: {userdata.index_path}')
+            userdata.path_window_start_index = userdata.unfinished_window
+            userdata.path_start_pose = path.poses[userdata.path_window_start_index]
+            userdata.unfinished_active = False
+        
         # publish current path
         pub_current_path = rospy.Publisher('/test_path', Path, latch=True, queue_size=1)
         pub_current_path.publish(path)
@@ -186,6 +413,104 @@ class CheckDistance(smach.State):
             return 'exe_path'
 
 
+class WindowPlannerPath(smach.State):
+    def __init__(self, save_prg_pub):
+        smach.State.__init__(self, outcomes=['available', 'finished', 'preempted'],
+                             input_keys=['path', 'path_window_start_index', 'zone_name', 
+                                         'index_path', 'program'],
+                             output_keys=['path_chunk', 'path_window_start_index', 'program',
+                                          'path_chunk_trim_count'])
+        self.window_size = 200
+        self.step_size = 100  # Execute 100 poses, but advance the window by 50 (50% overlap)
+        self.save_prg_pub = save_prg_pub
+
+    def execute(self, userdata):
+        rospy.loginfo('[{}]Windowing path - state WINDOW_PLANNER_PATH'.format(rospy.get_caller_id()))
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+
+        userdata.path_chunk_trim_count = 0  # Reset trim counter for each new window
+        start_index = userdata.path_window_start_index
+        full_path = userdata.path
+
+        # If the start index is at or beyond the end of the path, we're done.
+        if start_index >= len(full_path.poses):
+            userdata.path_window_start_index = 0  # Reset for the next full path
+            return 'finished'
+
+        end_index = start_index + self.window_size
+        
+        path_chunk = Path()
+        path_chunk.header = full_path.header
+        # The new chunk is from the current start index to the end of the window
+        path_chunk.poses = full_path.poses[start_index:end_index]
+        
+        userdata.path_chunk = path_chunk
+        # The *next* window will start 'step_size' poses after the current one
+
+        # Save current zone and path as last failed to resume later will be overwritten at  
+        # the end of the program if successful
+        userdata.program.last_result = f'failed: on_path-{userdata.zone_name}-{userdata.index_path}-{userdata.path_window_start_index}'
+        #self.save_prg_pub.publish(userdata.program)
+
+
+        userdata.path_window_start_index = start_index + self.step_size
+        
+        # rospy.loginfo('Path window: {} to {}. Next start: {}'.format(start_index, end_index, userdata.path_window_start_index))
+
+        # If the created chunk is empty, it means we are at the end.
+        if not path_chunk.poses:
+            userdata.path_window_start_index = 0 # Reset for the next full path
+            return 'finished'
+
+        return 'available'
+
+
+class TrimAndRetry(smach.State):
+    """Progressively trims poses from the end of a path chunk when CHECK_PLANNER_PATH fails.
+
+    Useful when GPS drift creates a phantom obstacle near the end of a short chunk.
+    After max_trims attempts the state bypasses the check and lets the executor
+    handle any real obstacle via RECOVERY_PLANNER.
+    """
+    def __init__(self):
+        smach.State.__init__(self,
+                             outcomes=['retry', 'bypass_check', 'preempted'],
+                             input_keys=['path_chunk', 'path_chunk_trim_count'],
+                             output_keys=['path_chunk', 'path_chunk_trim_count'])
+        self.trim_step = 15    # poses trimmed per attempt (~45 cm at 3 cm spacing)
+        self.max_trims = 5     # after 5 trims (~2.25 m) give up checking and execute
+        self.min_chunk_size = 20  # never send a chunk shorter than this
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+
+        trim_count = userdata.path_chunk_trim_count
+        chunk = userdata.path_chunk
+
+        if trim_count >= self.max_trims or len(chunk.poses) <= self.min_chunk_size:
+            rospy.loginfo('[{}]TrimAndRetry: max trims reached ({}), bypassing check'.format(
+                rospy.get_caller_id(), trim_count))
+            return 'bypass_check'
+
+        trimmed = Path()
+        trimmed.header = chunk.header
+        trimmed.poses = chunk.poses[:-self.trim_step]
+
+        if not trimmed.poses:
+            return 'bypass_check'
+
+        userdata.path_chunk = trimmed
+        userdata.path_chunk_trim_count = trim_count + 1
+        rospy.loginfo('[{}]TrimAndRetry: trimmed {} poses, chunk now {} poses (attempt {}/{})'.format(
+            rospy.get_caller_id(), self.trim_step, len(trimmed.poses),
+            trim_count + 1, self.max_trims))
+        return 'retry'
+
+
 def wait_for_mbf():
     client = actionlib.SimpleActionClient("/move_base_flex/move_base", mbf_msgs.MoveBaseAction)
     available = client.wait_for_server(rospy.Duration(30))
@@ -202,7 +527,8 @@ def main():
     pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
     pub_active_prg = rospy.Publisher('/mower_smach/active_program', String, latch=True, queue_size=1)
     pub_pm_play_melody = rospy.Publisher('/pm/play_melody', Int16, queue_size=10)
-    rospy.Publisher("/web_plan/program_new", PlannerProgram, queue_size=1)
+    pub_dock_cancel = rospy.Publisher('/dock_smach/stop', Bool, queue_size=1)
+    save_prg_pub = rospy.Publisher("/web_plan/program_new", PlannerProgram, queue_size=1)
     pub_active_prg.publish(String(" "))
     wait_for_mbf()
     # Create SMACH state machine
@@ -222,15 +548,49 @@ def main():
     sm.userdata.path_cost = None
     sm.userdata.final_pose = None
     sm.userdata.prg_start_time = None
-
+    sm.userdata.path_window_start_index = 0
+    sm.userdata.path_chunk = None
+    sm.userdata.path_chunk_trim_count = 0
+    sm.userdata.unfinished_active = False
+    sm.userdata.unfinished_zone = None
+    sm.userdata.unfinished_path = None
+    sm.userdata.unfinished_window = 0 
+    sm.userdata.battery_capacity_checking = True
+    sm.userdata.stop_in_docking = False  
     pub_smach_status.publish(String("Ready"))
 
 
+    # Define the periodic save callback
+    def periodic_save_callback(event, sm_userdata, pub):
+        # This function will be called periodically by the rospy.Timer
+        # It checks if a program is running and then saves its current state.
+        if sm_userdata.program is not None:
+            try:
+                # The last_result is updated by states like GetPathData and WindowPlannerPath.
+                # This timer just ensures it's published periodically.
+                pub.publish(sm_userdata.program)
+            except Exception as e:
+                rospy.logwarn(f"Periodic save failed: {e}")
+
     with sm:
-        # Program callback for state WAIT_FOR_PROGRAM
+
+        # Reinit userdata for new program
+        def reinit_userdata(userdata):
+            userdata.path_window_start_index = 0
+            userdata.path_chunk = None
+            userdata.path_chunk_trim_count = 0
+            userdata.unfinished_active = False
+            userdata.battery_capacity_checking = True
+
+        # Program callback for state MONITOR_PROGRAM_ACTIVE
         def callback_program(userdata, msg):
+            
+            reinit_userdata(userdata)
+
             userdata.program = msg
-            rospy.loginfo('[{}]Get new program to run - state WAIT_FOR_PROGRAM'.format(rospy.get_caller_id()))
+            
+            userdata.program.last_result = 'failed: on_init'
+            rospy.loginfo('[{}]Get new program to run - state MONITOR_PROGRAM_ACTIVE'.format(rospy.get_caller_id()))
             pub_active_program = rospy.Publisher('/mower_smach/active_program', String, latch=True, queue_size=1)
             pub_active_program.publish(String(msg.name))
             pub_log_info.publish(String("Executing program: {}".format(msg.name)))
@@ -242,18 +602,176 @@ def main():
                 sm.service_preempt()
                 return 'preempted'
             return False
+        
+        # Program callback for state MONITOR_PROGRAM_UNFINISHED
+        def callback_program_unfinished(userdata, msg):
+            
+            reinit_userdata(userdata)
+            userdata.program = msg
 
-        # Monitor topic to get program
-        smach.StateMachine.add('WAIT_FOR_PROGRAM', smach_ros.MonitorState('/web_plan/program_active', PlannerProgram,
-                callback_program, output_keys=['program', 'prg_start_time'], input_keys=['program']
-            ),
+            # userdata.program.last_result = f'failed: on_path-{userdata.zone_name}-{userdata.index_path}'
+            # userdata.program.last_result = 'failed: on_path-ZonefrontNewDiagonal-23-0'
+            print("Program unfinished: {}".format(userdata.program.last_result))
+            last_result = userdata.program.last_result.split(': ')
+            print("Last result: {}".format(last_result[0]))
+            if last_result[0] == 'failed':
+                failure_reason = last_result[1].split('-')
+                print("Failure reason: {}".format(failure_reason))
+                if failure_reason[0] == 'on_path':
+                    userdata.unfinished_zone = failure_reason[1]
+                    userdata.unfinished_path = failure_reason[2]
+                    userdata.unfinished_window =  int(failure_reason[3]) if len(failure_reason) > 3 else 0
+                    pub_log_info.publish(String(f"Program unfinished: {userdata.program.last_result}"))
+                    userdata.unfinished_active = True
+
+            print("Unfinished active: {}".format(userdata.unfinished_active))
+            userdata.program.last_result = 'failed: on_init'
+            rospy.loginfo('[{}]Get new program to run - state MONITOR_PROGRAM_UNFINISHED'.format(rospy.get_caller_id()))
+            pub_active_program = rospy.Publisher('/mower_smach/active_program', String, latch=True, queue_size=1)
+            pub_active_program.publish(String(msg.name))
+            pub_log_info.publish(String("Executing unfinished program: {}".format(msg.name)))
+            pub_pm_play_melody.publish(Int16(2))  # 5:short_beep, 1:beep, 2:double beep,
+            pub_smach_status.publish(String("Initiating unfinished"))
+            rospy.sleep(1.0)
+            userdata.prg_start_time = rospy.Time.now()
+            if sm.preempt_requested():
+                sm.service_preempt()
+                return 'preempted'
+            return False
+
+        def concurrence_outcome_cb(outcome_map):
+            if outcome_map.get('MONITOR_PROGRAM_ACTIVE') == 'invalid' or outcome_map.get('MONITOR_PROGRAM_UNFINISHED') == 'invalid':
+                return 'program_received'
+            return 'preempted'
+
+        # To monitor two topics, we use a Concurrence container.
+        # It will run two MonitorState children in parallel and terminate when one of them does.
+        wait_for_program_cc = smach.Concurrence(
+            outcomes=['program_received', 'preempted'],
+            default_outcome='preempted',
+            child_termination_cb=lambda so: True,  # Terminate all children if one terminates
+            output_keys=['program', 'prg_start_time', 'unfinished_active', 
+                         'unfinished_zone', 'unfinished_path', 'path_window_start_index', 
+                         'path_chunk', 'unfinished_window', 'battery_capacity_checking'],
+            input_keys=['program', 'unfinished_active', 'unfinished_zone', 'unfinished_path', 
+                        'path_window_start_index', 'path_chunk', 'prg_start_time', 
+                        'unfinished_window', 'battery_capacity_checking'],
+            outcome_cb=concurrence_outcome_cb
+        )
+
+        with wait_for_program_cc:
+            smach.Concurrence.add('MONITOR_PROGRAM_ACTIVE',
+                                  smach_ros.MonitorState('/web_plan/program_active',
+                                                         PlannerProgram,
+                                                         callback_program,
+                                                         output_keys=['program', 'prg_start_time', 'unfinished_active', 'unfinished_zone', 
+                                                                      'unfinished_path', 'path_window_start_index', 'path_chunk', 
+                                                                      'battery_capacity_checking'],
+                                                         input_keys=['program', 'unfinished_active', 'unfinished_zone', 'unfinished_active',
+                                                                     'unfinished_path', 'path_window_start_index', 'path_chunk', 
+                                                                     'prg_start_time', 'battery_capacity_checking']))
+
+            smach.Concurrence.add('MONITOR_PROGRAM_UNFINISHED',
+                                  smach_ros.MonitorState('/web_plan/program_active_unfinished',
+                                                         PlannerProgram,
+                                                         callback_program_unfinished,
+                                                         output_keys=['program', 'prg_start_time', 'unfinished_active', 'unfinished_zone', 
+                                                                      'unfinished_path', 'path_window_start_index', 'path_chunk', 
+                                                                      'unfinished_window', 'battery_capacity_checking'],
+                                                         input_keys=['program', 'unfinished_active', 'unfinished_zone', 'unfinished_path', 
+                                                                     'path_window_start_index', 'path_chunk', 'prg_start_time', 
+                                                                     'unfinished_window', 'battery_capacity_checking']))
+
+        # Add the Concurrence container to the main state machine
+        smach.StateMachine.add('WAIT_FOR_PROGRAM', wait_for_program_cc,
             transitions={
-                'invalid': 'LOAD_MAP',
-                # 'invalid': 'ZONE_IT',
-                'valid': 'WAIT_FOR_PROGRAM',
+                'program_received': 'CHECK_IF_DOCKED',
                 'preempted': 'PREEMPTED_STOP'
             }
         )
+
+        ########################################  UNDOCK  ########################################
+        # Add state UNDOCK and check if mower is docked. If yes, then send undocking message and go 
+        # to state WAIT_TO_UNDOCKED. If not, then go to state LOAD_MAP.
+        
+        # A custom state to check dock status with multiple outcomes
+        class CheckIfDockedState(smach.State):
+            def __init__(self):
+                smach.State.__init__(self, outcomes=['proceed_to_undock', 'skip_undocking', 'wait', 'preempted'])
+                # It's better practice to initialize publishers once if they are used frequently,
+                # but for simplicity in this state, we'll re-declare it.
+                self.pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+
+            def execute(self, userdata):
+                if self.preempt_requested():
+                    self.service_preempt()
+                    return 'preempted'
+
+                try:
+                    # Wait for one message from the topic, with a timeout.
+                    msg = rospy.wait_for_message('/dock_smach/dock_status', Int8, timeout=5.0)
+                    
+                    if msg.data == 3:  # Undocked
+                        self.pub_log_info.publish(String("Mower is already undocked."))
+                        return 'skip_undocking'
+                    elif msg.data == 0:  # Docked
+                        self.pub_log_info.publish(String("Mower is docked, starting undock."))
+                        return 'proceed_to_undock'
+                    else: # For other states, wait and check again.
+                        self.pub_log_info.publish(String("Waiting for dock status, current: {}".format(msg.data)))
+                        return 'wait'
+
+                except rospy.ROSException:
+                    rospy.logwarn("Timeout waiting for /dock_smach/dock_status message.")
+                    return 'wait' # Or another outcome for error handling
+
+        smach.StateMachine.add('CHECK_IF_DOCKED', CheckIfDockedState(),
+                               transitions={'proceed_to_undock': 'GET_UNDOCK_PROGRAM',
+                                            'skip_undocking': 'LOAD_MAP',
+                                            'wait': 'CHECK_IF_DOCKED',
+                                            'preempted': 'PREEMPTED_STOP'})
+
+        # Callback to get the undock program
+        def undock_program_cb(userdata, msg):
+            userdata.undock_program = msg
+            pub_log_info.publish(String("Received undock program."))
+            pub_smach_status.publish(String("Undocking"))
+            return False
+
+        smach.StateMachine.add('GET_UNDOCK_PROGRAM',
+                               smach_ros.MonitorState('/dock_manager/undock_program',
+                                                      DockProgram,
+                                                      undock_program_cb,
+                                                      output_keys=['undock_program']),
+                               transitions={'invalid': 'SEND_UNDOCK_PROGRAM', 'valid': 'GET_UNDOCK_PROGRAM', 'preempted': 'PREEMPTED_STOP'})
+
+        # State to send the undock program
+        @smach.cb_interface(input_keys=['undock_program'], outcomes=['succeeded'])
+        def send_undock_program_cb(userdata):
+            pub_undock = rospy.Publisher('/dock_smach/start_docking', DockProgram, queue_size=1, latch=True)
+            pub_undock.publish(userdata.undock_program)
+            pub_log_info.publish(String("Sent undock program."))
+            rospy.sleep(1.0)  # Give it a moment to publish
+            return 'succeeded'
+
+        smach.StateMachine.add('SEND_UNDOCK_PROGRAM', CBState(send_undock_program_cb),
+                               transitions={'succeeded': 'WAIT_FOR_UNDOCKED'})
+
+        # Callback to wait for undocked status
+        def wait_for_undocked_cb(userdata, msg):
+            if msg.data == 3:  # Undocked
+                pub_log_info.publish(String("Mower successfully undocked."))
+                return False
+            elif msg.data == 4: # Failed
+                pub_log_info.publish(String("Undocking failed."))
+                return False # This will cause a transition to 'invalid' -> 'LOAD_MAP'
+            return True  # Continue waiting
+
+        smach.StateMachine.add('WAIT_FOR_UNDOCKED',
+                               smach_ros.MonitorState('/dock_smach/dock_status',
+                                                      Int8,
+                                                      wait_for_undocked_cb),
+                               transitions={'invalid': 'LOAD_MAP', 'valid': 'WAIT_FOR_UNDOCKED', 'preempted': 'PREEMPTED_STOP'})
 
         ########################################  LOAD MAP  ########################################
         # Load desired map running by program
@@ -269,7 +787,9 @@ def main():
                 pub = rospy.Publisher('/navi_manager/load_map', String, latch=True, queue_size=1)
             msg = String()
             msg.data = userdata.program.map_name
+            rospy.sleep(1.0)  # Wait for publisher-subscriber TCP connection to establish before publishing
             pub_status = pub.publish(msg)
+            rospy.loginfo(f'[{{}}]LOAD_MAP: published map={userdata.program.map_name}'.format(rospy.get_caller_id()))
             pub_log_info.publish(String("Loading the map"))
             pub_smach_status.publish(String("Loading map"))
             rospy.sleep(4.0)
@@ -321,7 +841,8 @@ def main():
         ########################################  GPS_FIX  ########################################
         # Program callback rtabmap ready
         def callback_gps_status(userdata, msg):
-            print("GNSS status: {}".format(msg))
+            # print("GNSS status: {}".format(msg))
+            userdata.program.last_result = 'failed: on_gps'
             if sm.preempt_requested():
                 sm.service_preempt()
                 # sm.recall_preempt()
@@ -337,7 +858,7 @@ def main():
         # Add state WAIT_FOR_GPS_FIX
         smach.StateMachine.add('WAIT_FOR_GPS_FIX',
                                smach_ros.MonitorState('/device_state_pub/icon_status', Device_icon_status, callback_gps_status,
-                                                      input_keys=[], output_keys=[]),
+                                                      input_keys=['program'], output_keys=['program']),
                                transitions={
                                    'valid': 'WAIT_FOR_GPS_FIX',
                                    'invalid': 'WAIT_FOR_PLANNER',
@@ -346,9 +867,10 @@ def main():
         ########################################  PLANNER  ########################################
         # Program callback for planner is ready
         def callback_map_status(userdata, msg):
-            print("map status: {}".format(msg))
+            # print("map status: {}".format(msg))
             show_map_planner_pub = rospy.Publisher("/web_plan/show_map_layer", String, latch=True, queue_size=1)
             show_map_planner_pub.publish(String("SMACH|MAP|FULL"))
+            userdata.program.last_result = 'failed: on_planner'
             if sm.preempt_requested():
                 sm.service_preempt()
                 sm.recall_preempt()
@@ -365,19 +887,19 @@ def main():
         # Add state WAIT_FOR_PLANNER
         smach.StateMachine.add('WAIT_FOR_PLANNER',
                                smach_ros.MonitorState('/web_plan/planner_loaded', String, callback_map_status,
-                                                      input_keys=['program'], output_keys=[]),
+                                                      input_keys=['program'], output_keys=['program']),
                                transitions={
                                    'valid': 'WAIT_FOR_PLANNER',
                                    'invalid': 'POWER_ON_MOWER',
-                                   # 'invalid': 'ZONE_IT',
                                    'preempted': 'PREEMPTED_STOP'})
 
 
 
         ########################################  MOWER  ########################################
         # Add state POWER_ON_MOWER
-        @smach.cb_interface(input_keys=[], output_keys=[], outcomes=['success', 'failure'])
+        @smach.cb_interface(input_keys=['program'], output_keys=['program'], outcomes=['success', 'failure'])
         def turn_on_mower_cb(userdata):
+            userdata.program.last_result = 'failed: on_mower'
             rospy.loginfo('[{}]Turning on mower - state POWER_ON_MOWER'.format(rospy.get_caller_id()))
             pub_mower_set_power = rospy.Publisher('/mower/set_power', Bool, latch=True, queue_size=1)
             msg = Bool()
@@ -419,10 +941,10 @@ def main():
         # Iterator for zones
         zone_it = Iterator(outcomes=['succeeded', 'preempted', 'aborted'],
                            input_keys=['program', 'zone_cut_height', 'zone_rpm', 'zone_name', 'zone_start_pose',
-                                       'path_plan', 'paths'],
+                                       'path_plan', 'paths', 'path_window_start_index'],
                            it=lambda: range(0, len(sm.userdata.program.zone_list)),
                            output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 'zone_start_pose', 'path_plan',
-                                        'paths'],
+                                        'paths', 'path_window_start_index'],
                            it_label='index',
                            exhausted_outcome='succeeded')
         zone_it.userdata = sm.userdata
@@ -430,9 +952,8 @@ def main():
             # Create smach state machine for processing zone
             process_zone_sm = smach.StateMachine(outcomes=['succeeded', 'preempted', 'aborted', 'continue'],
                                                  input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index',
-                                                             'zone_name', 'zone_start_pose', 'path_plan', 'paths'],
-                                                 output_keys=['zone_cut_height', 'zone_rpm', 'zone_name',
-                                                              'zone_start_pose', 'path_plan', 'paths'])
+                                                             'zone_name', 'zone_start_pose', 'path_plan', 'paths', 'path_window_start_index'],
+                                                 output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 'zone_start_pose', 'path_plan', 'paths', 'path_window_start_index'])
             process_zone_sm.userdata = zone_it.userdata
 
             with process_zone_sm:
@@ -440,12 +961,13 @@ def main():
                 smach.StateMachine.add('GET_ZONE_DATA', GetZoneData(),
                                        transitions={'available': 'GET_PATH_TO_START',
                                                     'failed': 'aborted',
-                                                    'preempted': 'preempted'})
+                                                    'preempted': 'preempted',
+                                                    'skip_zone': 'continue'})
 
                 # Add state GET_PATH_TO_START - Get path to start point of the zone
                 def get_path_result_cb(userdata, status, result):
-                    print("get path status: {}".format(status))
-                    print("get path result: {}".format(result.message))
+                    # print("get path status: {}".format(status))
+                    # print("get path result: {}".format(result.message))
                     if process_path_sm.preempt_requested():
                         process_path_sm.service_preempt()
                         return 'preempted'
@@ -468,7 +990,7 @@ def main():
                 ),
                                        transitions={
                                            'succeeded': 'EXE_PATH_TO_START',
-                                           # 'succeeded': 'WAIT_SET_MOTOR_OFF_AND_HOME',
+                                        #    'succeeded': 'WAIT_SET_MOTOR_OFF_AND_HOME',
                                            'aborted': 'GET_PATH_TO_START',
                                            'preempted': 'preempted'
                                        },
@@ -482,7 +1004,7 @@ def main():
                 def get_exe_result_cb(userdata, status, result):
                     if process_path_sm.preempt_requested():
                         process_path_sm.service_preempt()
-                        return 'preempted'
+                        return 'preempt'
                     if result.outcome == 2:
                         return 'aborted'
                     else:
@@ -494,7 +1016,6 @@ def main():
                 ),
                                        transitions={
                                            'succeeded': 'SET_CUT_HEIGHT',
-                                           # 'succeeded': 'PATH_IT',
                                            'aborted': 'RECOVERY',
                                            'preempted': 'preempted'
                                        }, remapping={'path': 'path_plan'}
@@ -549,7 +1070,7 @@ def main():
                 def callback_set_cut_height(userdata, msg):
                     if process_path_sm.preempt_requested():
                         process_path_sm.service_preempt()
-                        return 'preempted'
+                        return 'preempt'
                     if msg.status == 'READY':
                         return False
                     else:
@@ -595,7 +1116,7 @@ def main():
                 smach.StateMachine.add('SET_MOTOR_ON', CBState(set_motor_on_cb),
                                        {'success': 'WAIT_FOR_SET_RPM', 'failure': 'SET_MOTOR_ON'})
 
-                # Callback for mower set cut height WAIT_FOR_SET_RPM
+                # Callback for mower set cut height WAIT_SET_RPM
                 def callback_set_rpm(userdata, msg):
                     if process_path_sm.preempt_requested():
                         process_path_sm.service_preempt()
@@ -624,10 +1145,10 @@ def main():
                 # Iterator for paths
                 path_it = Iterator(outcomes=['succeeded', 'preempted', 'aborted'],
                                    input_keys=['program', 'path_plan', 'zone_cut_height', 'zone_rpm',
-                                               'zone_name', 'zone_start_pose', 'paths'],
+                                               'zone_name', 'zone_start_pose', 'paths', 'path_window_start_index'],
                                    it=lambda: range(0, len(process_zone_sm.userdata.paths)),
                                    output_keys=['path_plan', 'zone_cut_height', 'zone_rpm', 'zone_name',
-                                                'zone_start_pose', 'index_path'],
+                                                'zone_start_pose', 'index_path', 'path_window_start_index'],
                                    it_label='index_path',
                                    exhausted_outcome='succeeded')
                 path_it.userdata = process_zone_sm.userdata
@@ -636,24 +1157,26 @@ def main():
                     # Create smach state machine for processing path
                     process_path_sm = smach.StateMachine(
                         outcomes=['succeeded_path', 'preempted', 'aborted_path', 'continue_path'],
-                        input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index',
-                                    'zone_name', 'zone_start_pose', 'path_plan', 'index_path', 'paths'],
-                        output_keys=['zone_cut_height', 'zone_rpm', 'zone_name',
-                                     'zone_start_pose', 'path_plan'])
+                        input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index', 
+                                    'zone_name', 'zone_start_pose', 'path_plan', 'index_path', 'paths', 'path_window_start_index', 'path'],
+                        output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 'program', 
+                                     'zone_start_pose', 'path_plan', 'path_window_start_index'])
                     process_path_sm.userdata = path_it.userdata
 
                     with process_path_sm:
                         # Add state GET_PATH_DATA
-                        smach.StateMachine.add('GET_PATH_DATA', GetPathData(),
+                        smach.StateMachine.add('GET_PATH_DATA', GetPathData(save_prg_pub),
                                                transitions={'available': 'GET_PATH_TO_BEGIN_OF_PATH',
-                                                            'preempted': 'preempted'})
+                                                            'preempted': 'preempted',
+                                                            'skip_path': 'continue_path'})
 
                         # Add state GET_PATH_TO_BEGIN_OF_PATH - Get path to start point of the zone
                         def get_path_to_path_result_cb(userdata, status, result):
-                            print("get path status: {}".format(status))
-                            print("get path result.message: {}".format(result.message))
-                            print("get path result outcome: {}".format(result.outcome))
-                            print("get path result: {}".format(result.cost))
+                            
+                            # print("get path status: {}".format(status))
+                            # print("get path result.message: {}".format(result.message))
+                            # print("get path result outcome: {}".format(result.outcome))
+                            # print("get path result: {}".format(result.cost))
                             # print("get path result: {}".format(result))
                             pub_log_info.publish(String("{}: go to path {}/{}".format(userdata.zone_name, userdata.index_path+1, len(userdata.paths))))
                             pub_smach_status.publish(String("{}: go to path {}/{}".format(userdata.zone_name, userdata.index_path+1, len(userdata.paths))))
@@ -671,8 +1194,8 @@ def main():
                         smach.StateMachine.add('GET_PATH_TO_BEGIN_OF_PATH', smach_ros.SimpleActionState(
                                             '/move_base_flex/get_path', GetPathAction, goal_slots=['target_pose'],
                                             result_slots=['path'], input_keys=['path_start_pose', 'path', 'path_planner', 'path_cost',
-                                                                               'zone_name', 'index_path', 'paths'],
-                                            output_keys=['path_cost'], result_cb=get_path_to_path_result_cb
+                                                                               'zone_name', 'index_path', 'paths', 'program'],
+                                            output_keys=['path_cost', 'program' ], result_cb=get_path_to_path_result_cb
                                         ),
                                         transitions={
                                            'succeeded': 'CHECK_DISTANCE',
@@ -692,9 +1215,9 @@ def main():
 
                         # Add state EXE_PATH_TO_BEGIN_OF_PATH - Execute path to start point
                         def get_exe_to_path_result_cb(userdata, status, result):
-                            print("get path status: {}".format(status))
-                            print("get path result: {}".format(result.message))
-                            print("get paths: {}".format(len(userdata.paths)))
+                            # print("get path status: {}".format(status))
+                            # print("get path result: {}".format(result.message))
+                            # print("get paths: {}".format(len(userdata.paths)))
                             pub_log_info.publish(
                                 String("{}: go to path {}/{}".format(userdata.zone_name, userdata.index_path+1, len(userdata.paths))))
                             pub_smach_status.publish(
@@ -765,7 +1288,7 @@ def main():
                             return srvs_request
 
                         def check_path_response_cb(userdata, response):
-                            print("result: {}".format(response))
+                            # print("result: {}".format(response))
                             return 'succeeded'
 
                         smach.StateMachine.add('CHECK_PLANNER_PATH',
@@ -774,62 +1297,186 @@ def main():
                                                             request_cb=check_path_request_cb,
                                                             response_cb=check_path_response_cb,
                                                             input_keys=['path', 'zone_name', 'index_path', 'paths']),
-                                               transitions={'succeeded': 'EXE_PLANNER_PATH',
-                                                            'aborted': 'CHECK_PLANNER_PATH',
+                                               transitions={'succeeded': 'WINDOW_PLANNER_PATH',
+                                                            'aborted': 'TRIM_AND_RETRY',
                                                             'preempted': 'preempted'})
 
-                        # Add state EXE_PLANNER_PATH - Execute path from planner
-                        def get_exe_planner_path_result_cb(userdata, status, result):
-                            print("exe path status: {}".format(status))
-                            print("exe path result: {}".format(result.message))
-                            print("exe paths len: {}".format(len(userdata.paths)))
-                            print("exe outcome: {}".format(result.outcome))
-                            print("exe result: {}".format(result))
-                            pub_log_info.publish(
-                                String("{}: path {}/{} done".format(userdata.zone_name, userdata.index_path+1, len(userdata.paths))))
-                            pub_smach_status.publish(
-                                String("{}: path {}/{} done".format(userdata.zone_name, userdata.index_path+1, len(userdata.paths))))
-                            if process_path_sm.preempt_requested():
-                                process_path_sm.service_preempt()
-                                return 'preempted'
-                            if result.outcome == 0:
-                                return 'succeeded'
-                            else:
-                                return 'aborted'
+                        # Add state TRIM_AND_RETRY - trim chunk end on costmap check failure
+                        smach.StateMachine.add('TRIM_AND_RETRY', TrimAndRetry(),
+                                               transitions={'retry': 'CHECK_PLANNER_PATH',
+                                                            'bypass_check': 'EXE_PLANNER_PATH',
+                                                            'preempted': 'preempted'})
 
-                        smach.StateMachine.add('EXE_PLANNER_PATH', smach_ros.SimpleActionState(
-                            '/move_base_flex/exe_path', ExePathAction, goal_slots=['path'],
-                            result_cb=get_exe_planner_path_result_cb,
-                            input_keys=['paths', 'final_pose', 'zone_name', 'index_path']
-                        ),
+                        # Add state WINDOW_PLANNER_PATH
+                        smach.StateMachine.add('WINDOW_PLANNER_PATH', WindowPlannerPath(save_prg_pub),
+                                               transitions={'available': 'EXE_PLANNER_PATH',
+                                                            'finished': 'continue_path',
+                                                            'preempted': 'preempted'})
+
+                        # Custom state to execute a path and get feedback
+                        class ExecutePathWithFeedback(smach.State):
+                            def __init__(self):
+                                smach.State.__init__(self,
+                                                     outcomes=['succeeded', 'aborted', 'preempted', 'replan_needed'],
+                                                     input_keys=['path_chunk', 'paths', 'zone_name', 'index_path',
+                                                                 'final_pose', 'path', 'path_window_start_index'])
+                                self._client = actionlib.SimpleActionClient('/move_base_flex/exe_path', ExePathAction)
+                                self._feedback_sub = None
+                                self.last_feedback = None
+                                self.step_size = 100  # Must match WindowPlannerPath
+                                if not self._client.wait_for_server(rospy.Duration(5.0)):
+                                    rospy.logerr("Action server '/move_base_flex/exe_path' not available")
+                                    raise RuntimeError("Action server '/move_base_flex/exe_path' not available")
+
+                            def feedback_cb(self, msg):
+                                # rospy.loginfo('Distance to goal: %.2f m' % msg.feedback.dist_to_goal)
+                                self.last_feedback = msg.feedback
+
+                            def execute(self, userdata):
+                                if self.preempt_requested():
+                                    self.service_preempt()
+                                    return 'preempted'
+
+                                # Determine if the *next* window would be out of bounds.
+                                # If so, this is the last executable chunk, and we should let it finish completely.
+                                is_last_chunk = (userdata.path_window_start_index + self.step_size) >= len(
+                                    userdata.path.poses)
+
+                                self.last_feedback = None
+                                self._feedback_sub = rospy.Subscriber('/move_base_flex/exe_path/feedback',
+                                                                      ExePathActionFeedback, self.feedback_cb)
+
+                                goal = ExePathGoal()
+                                goal.path = userdata.path_chunk
+                                self._client.send_goal(goal)
+
+                                # Loop while the action is running
+                                while self._client.get_state() in [actionlib.GoalStatus.PENDING,
+                                                                   actionlib.GoalStatus.ACTIVE]:
+                                    if self.preempt_requested():
+                                        self._client.cancel_goal()
+                                        if self._feedback_sub:
+                                            self._feedback_sub.unregister()
+                                        self.service_preempt()
+                                        return 'preempted'
+
+                                    # If we are close to the end of the current chunk, and it's not the final one,
+                                    # return 'replan_needed' to trigger the next window planning.
+                                    # The action server will get the new path and transition smoothly.
+                                    if not is_last_chunk and self.last_feedback and self.last_feedback.dist_to_goal < 0.4:
+                                        rospy.loginfo("Nearing end of chunk, planning next window for smooth transition.")
+                                        if self._feedback_sub:
+                                            self._feedback_sub.unregister()
+                                        return 'replan_needed'
+
+                                    rospy.sleep(0.1)
+
+                                # Action is finished (not pending or active anymore)
+                                if self._feedback_sub:
+                                    self._feedback_sub.unregister()
+                                    self._feedback_sub = None
+
+                                result = self._client.get_result()
+                                status = self._client.get_state()
+
+                                # rospy.loginfo("exe path status: %s", str(status))
+                                # rospy.loginfo("exe path result message: %s", result.message)
+                                # rospy.loginfo("exe path outcome: %d", result.outcome)
+                                pub_log_info.publish(
+                                    String("{}: path {}/{} done".format(userdata.zone_name, userdata.index_path + 1,
+                                                                        len(userdata.paths))))
+                                pub_smach_status.publish(
+                                    String("{}: path {}/{} done".format(userdata.zone_name, userdata.index_path + 1,
+                                                                        len(userdata.paths))))
+
+                                if result is None:
+                                    rospy.logerr("None result received from action server.")
+                                    return 'aborted'
+                                if result.outcome == 0:  # SUCCESS
+                                    return 'succeeded'
+                                else:
+                                    return 'aborted'
+
+                        smach.StateMachine.add('EXE_PLANNER_PATH', ExecutePathWithFeedback(),
                                                transitions={
-                                                   'succeeded': 'continue_path',
+                                                   'succeeded': 'WINDOW_PLANNER_PATH',
+                                                   'replan_needed': 'WINDOW_PLANNER_PATH',
                                                    'aborted': 'RECOVERY_PLANNER',
                                                    'preempted': 'preempted'
-                                               }, remapping={'path': 'path',
-                                                             'final_pose': 'final_pose'}
-                                               )
+                                               },
+                                               remapping={'path_chunk': 'path_chunk',
+                                                          'paths': 'paths',
+                                                          'zone_name': 'zone_name',
+                                                          'index_path': 'index_path',
+                                                          'final_pose': 'final_pose',
+                                                          'path': 'path',
+                                                          'path_window_start_index': 'path_window_start_index'})
 
-                        # Goal callback for state RECOVERY
-                        def recovery_path_goal_to_planner_cb(userdata, goal):
-                            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
-                            pub_log_info.publish(String("Recovery"))
+                        # Custom state to check distance to goal before recovery
+                        class RecoveryPlannerWithDistanceCheck(smach.State):
+                            def __init__(self):
+                                smach.State.__init__(self,
+                                                     outcomes=['continue_path', 'retry_path', 'preempted'],
+                                                     input_keys=['path', 'path_chunk', 'zone_name', 'index_path', 'paths'])
+                                self._recovery_client = actionlib.SimpleActionClient('move_base_flex/recovery', RecoveryAction)
+                                if not self._recovery_client.wait_for_server(rospy.Duration(5.0)):
+                                    rospy.logerr("Recovery action server not available")
 
-                            goal.behavior = 'clear_costmap'
+                            def execute(self, userdata):
+                                if self.preempt_requested():
+                                    self.service_preempt()
+                                    return 'preempted'
+
+                                # Get current robot position
+                                try:
+                                    tf_listener = tf.TransformListener()
+                                    tf_listener.waitForTransform('map', 'base_link', rospy.Time(), rospy.Duration(4.0))
+                                    (trans, rot) = tf_listener.lookupTransform('map', 'base_link', rospy.Time())
+                                    current_pos = Point(x=trans[0], y=trans[1], z=trans[2])
+                                    
+                                    # Calculate distance to the goal (last pose in the path)
+                                    goal_pos = userdata.path.poses[-1].pose.position
+                                    distance_to_goal = ((current_pos.x - goal_pos.x)**2 + 
+                                                       (current_pos.y - goal_pos.y)**2)**0.5
+                                    
+                                    rospy.loginfo("Distance to goal: %.2f m", distance_to_goal)
+                                    pub_log_info.publish(String("Distance to goal: {:.2f}m".format(distance_to_goal)))
+                                    
+                                    # If close to goal (<=0.3m), continue to next path
+                                    if distance_to_goal <= 0.3:
+                                        pub_log_info.publish(String("{}: path {}/{} completed (close to goal)".format(
+                                            userdata.zone_name, userdata.index_path+1, len(userdata.paths))))
+                                        pub_smach_status.publish(String("{}: path {}/{} completed".format(
+                                            userdata.zone_name, userdata.index_path+1, len(userdata.paths))))
+                                        return 'continue_path'
+                                    
+                                except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+                                    rospy.logwarn("Failed to get robot position for distance check: %s", str(e))
+                                
+                                # If not close to goal, perform recovery
+                                pub_log_info.publish(String("Recovery - distance to goal > 0.5m"))
+                                
+                                goal = RecoveryGoal()
+                                goal.behavior = 'clear_costmap'
+                                
+                                self._recovery_client.send_goal(goal)
+                                self._recovery_client.wait_for_result()
+                                
+                                result = self._recovery_client.get_result()
+                                status = self._recovery_client.get_state()
+                                
+                                if status == actionlib.GoalStatus.SUCCEEDED:
+                                    return 'retry_path'
+                                else:
+                                    return 'retry_path'  # Try again even if recovery failed
 
                         # Recovery
                         smach.StateMachine.add(
                             'RECOVERY_PLANNER',
-                            smach_ros.SimpleActionState(
-                                'move_base_flex/recovery',
-                                RecoveryAction,
-                                goal_cb=recovery_path_goal_to_planner_cb,
-                                input_keys=["error", "clear_costmap_flag"],
-                                output_keys=["error_status", 'clear_costmap_flag']
-                            ),
+                            RecoveryPlannerWithDistanceCheck(),
                             transitions={
-                                'succeeded': 'EXE_PLANNER_PATH',
-                                'aborted': 'CHECK_PLANNER_PATH',
+                                'continue_path': 'continue_path',
+                                'retry_path': 'EXE_PLANNER_PATH',
                                 'preempted': 'preempted'
                             }
                         )
@@ -842,26 +1489,19 @@ def main():
                                        {'succeeded': 'SET_MOTOR_OFF_AND_HOME', 'aborted': 'aborted'})
 
                 # Add state SET_MOTOR_OFF_AND_HOME
-                @smach.cb_interface(input_keys=[], output_keys=[], outcomes=['success', 'failure'])
+                @smach.cb_interface(input_keys=['program', 'zone_name', 'index_path'], output_keys=['program'], outcomes=['success', 'failure'])
                 def set_motor_off_cb(userdata):
                     rospy.loginfo(
-                        '[{}]Setting mower motor on - state SET_MOTOR_OFF_AND_HOME'.format(rospy.get_caller_id()))
+                        '[{}]Raising blade to max and turning motor off - state SET_MOTOR_OFF_AND_HOME'.format(rospy.get_caller_id()))
+                    userdata.program.last_result = f'succeeded'
                     show_map_planner_pub = rospy.Publisher("/web_plan/show_map_layer", String, latch=True, queue_size=1)
                     show_map_planner_pub.publish(String("SMACH|MAP|FULL"))
-                    pub_mower_set_motor_off = rospy.Publisher('/mower/set_home', Bool, latch=True, queue_size=1)
-                    msg = Bool()
-                    msg.data = True
-                    pub_status = pub_mower_set_motor_off.publish(msg)
-                    time.sleep(1.5)
+                    pub_smach_status.publish(String("Raising blade to max"))
 
-                    pub_mower_set_motor_off = rospy.Publisher('/mower/set_motor_on', Bool, latch=True, queue_size=1)
-                    msg = Bool()
-                    msg.data = False
-                    pub_status = pub_mower_set_motor_off.publish(msg)
-                    time.sleep(1.5)
-
-                    if pub_status is None:
-                        return 'success'
+                    # Stop motor + raise blade to max_height before any power-off so
+                    # the FW does not trigger an automatic HOME cycle.
+                    safe_blade_shutdown(source='SET_MOTOR_OFF_AND_HOME')
+                    return 'success'
 
                 smach.StateMachine.add('SET_MOTOR_OFF_AND_HOME', CBState(set_motor_off_cb),
                                        {'success': 'WAIT_SET_MOTOR_OFF_AND_HOME', 'failure': 'SET_MOTOR_OFF_AND_HOME'})
@@ -888,10 +1528,11 @@ def main():
         smach.StateMachine.add('ZONE_IT', zone_it, {'succeeded': 'POWER_OFF_MOWER', 'aborted': 'aborted', 'preempted': 'PREEMPTED_STOP'})
 
         # Add state PREEMPTED_STOP
-        @smach.cb_interface(input_keys=[], output_keys=[], outcomes=['success', 'failure'])
+        @smach.cb_interface(input_keys=['stop_in_docking'], output_keys=['stop_in_docking'], outcomes=['success', 'failure', 'reset'])
         def preempted_stop_cb(userdata):
             rospy.loginfo(
-                '[{}]Stopping program - state PREEMPTED_STOP'.format(rospy.get_caller_id()))
+                '[{}]Stopping program - state PREEMPTED_STOP (stop_in_docking={})'.format(
+                    rospy.get_caller_id(), userdata.stop_in_docking))
             pub_log_info.publish(String("Stopping program"))
             pub_smach_status.publish(String("Stopping program"))
             show_map_planner_pub = rospy.Publisher("/web_plan/show_map_layer", String, latch=True, queue_size=1)
@@ -903,20 +1544,33 @@ def main():
             process_zone_sm.recall_preempt()
             path_it.recall_preempt()
             process_path_sm.recall_preempt()
+            if userdata.stop_in_docking:
+                pub_dock_cancel.publish(Bool(data=True))  # Cancel any active docking SMACH goals
+                userdata.stop_in_docking = False
+                rospy.loginfo('[{}]PREEMPTED_STOP -> reset (stop_in_docking)'.format(rospy.get_caller_id()))
+                return 'reset'
+            rospy.loginfo('[{}]PREEMPTED_STOP -> failure (will go to POWER_OFF_MOWER)'.format(rospy.get_caller_id()))
             return 'failure'
 
         smach.StateMachine.add('PREEMPTED_STOP', CBState(preempted_stop_cb),
-                               {'success': 'WAIT_MOWER_OFF', 'failure': 'POWER_OFF_MOWER'})
+                               {'success': 'WAIT_MOWER_OFF', 'failure': 'POWER_OFF_MOWER', 'reset': 'WAIT_FOR_PROGRAM'})
 
         # Add state POWER_OFF_MOWER
         @smach.cb_interface(input_keys=[], output_keys=[], outcomes=['success', 'failure'])
         def set_mower_off_cb(userdata):
             rospy.loginfo(
                 '[{}]Setting mower off - state POWER_OFF_MOWER'.format(rospy.get_caller_id()))
+
+            # Universal exit: ensure motor is off and blade is at max_height before
+            # cutting power. Without this the FW auto-HOMEs on every preempted run
+            # because PREEMPTED_STOP bypasses SET_MOTOR_OFF_AND_HOME.
+            safe_blade_shutdown(source='POWER_OFF_MOWER')
+
             pub_mower_off = rospy.Publisher('/mower/set_power', Bool, latch=True, queue_size=1)
             msg = Bool()
             msg.data = False
             pub_status = pub_mower_off.publish(msg)
+            rospy.loginfo('[{}]POWER_OFF_MOWER: published set_power(False)'.format(rospy.get_caller_id()))
             rospy.sleep(1.5)
             if pub_status is None:
                 return 'success'
@@ -931,7 +1585,7 @@ def main():
                 if userdata.prg_start_time is not None:
                     save_prg_pub = rospy.Publisher("/web_plan/program_new", PlannerProgram, queue_size=1)
                     duration = (rospy.Time.now() - userdata.prg_start_time).to_sec() / 60
-                    print("duration: {}".format(duration))
+                    # print("duration: {}".format(duration))
                     userdata.program.last_duration_minutes = int(round(duration))
                     save_prg_pub.publish(userdata.program)
                     userdata.prg_start_time = None
@@ -949,26 +1603,130 @@ def main():
                                                       output_keys=['prg_start_time'], input_keys=['program', 'prg_start_time']),
                                transitions={
                                    'valid': 'WAIT_MOWER_OFF',
-                                   'invalid': 'WAIT_FOR_PROGRAM',
+                                   'invalid': 'CHECK_FOR_DOCK_POINT',
                                    'preempted': 'preempted'})
+        
+        ##########################################   DOCKING  ##########################################
+        # Add state DOCKING check if DOCK point in the point list. if not, continue to WAIT_FOR_PROGRAM 
+        # state. If yes, get the dock program and execute it. Then wait for the docked status and 
+        # continue to WAIT_FOR_PROGRAM state.
+
+        @smach.cb_interface(outcomes=['dock_point_found', 'no_dock_point', 'preempted'])
+        def check_for_dock_point_cb(userdata):
+            rospy.loginfo('[{}]Checking for DOCK point'.format(rospy.get_caller_id()))
+            try:
+                point_list_msg = rospy.wait_for_message('/navi_manager/map_point_str_list', StringList, timeout=5.0)
+                if 'DOCK' in point_list_msg.string_list:
+                    pub_log_info.publish(String("DOCK point found, starting docking sequence."))
+                    return 'dock_point_found'
+                else:
+                    pub_log_info.publish(String("DOCK point not found, skipping docking."))
+                    return 'no_dock_point'
+            except rospy.ROSException:
+                pub_log_info.publish(String("Could not get map point list."))
+                return 'no_dock_point'
+
+        smach.StateMachine.add('CHECK_FOR_DOCK_POINT', CBState(check_for_dock_point_cb),
+                               transitions={'dock_point_found': 'GET_DOCK_PROGRAM',
+                                            'no_dock_point': 'WAIT_FOR_PROGRAM',
+                                            'preempted': 'PREEMPTED_STOP'})
+
+        def dock_program_cb(userdata, msg):
+            userdata.dock_program = msg
+            pub_log_info.publish(String("Received dock program."))
+            pub_smach_status.publish(String("Docking"))
+            return False
+
+        smach.StateMachine.add('GET_DOCK_PROGRAM',
+                               smach_ros.MonitorState('/dock_manager/dock_program',
+                                                      DockProgram,
+                                                      dock_program_cb,
+                                                      output_keys=['dock_program']),
+                               transitions={'invalid': 'SEND_DOCK_PROGRAM', 'valid': 'GET_DOCK_PROGRAM', 'preempted': 'PREEMPTED_STOP'})
+
+        @smach.cb_interface(input_keys=['dock_program'], outcomes=['succeeded'])
+        def send_dock_program_cb(userdata):
+            pub_dock = rospy.Publisher('/dock_smach/start_docking', DockProgram, queue_size=1, latch=True)
+            pub_dock.publish(userdata.dock_program)
+            pub_log_info.publish(String("Sent dock program."))
+            rospy.sleep(1.0)
+            return 'succeeded'
+
+        smach.StateMachine.add('SEND_DOCK_PROGRAM', CBState(send_dock_program_cb),
+                               transitions={'succeeded': 'WAIT_FOR_DOCKED'})
+
+        class WaitForDockedState(smach.State):
+            def __init__(self):
+                smach.State.__init__(self, outcomes=['succeeded', 'failed', 'preempted'], 
+                                     input_keys=['stop_in_docking'],
+                                     output_keys=['stop_in_docking'])
+                self.pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+                self.pub_smach_status = rospy.Publisher('/mower_smach/status', String, latch=True, queue_size=1)
+
+            def execute(self, userdata):
+                rospy.loginfo("Waiting for docked status...")
+                while not rospy.is_shutdown():
+                    if self.preempt_requested():
+                        # Custom operation on preemption
+                        userdata.stop_in_docking = True
+                        rospy.logwarn("Docking sequence preempted by user.")
+                        self.pub_log_info.publish(String("Docking preempted."))
+                        self.service_preempt()
+                        return 'preempted'
+                    
+                    try:
+                        msg = rospy.wait_for_message('/dock_smach/dock_status', Int8, timeout=1.0)
+                        if msg.data == 0:  # Docked
+                            self.pub_log_info.publish(String("Mower successfully docked."))
+                            self.pub_smach_status.publish(String("Ready"))
+                            return 'succeeded'
+                        elif msg.data == 4: # Failed
+                            self.pub_log_info.publish(String("Docking failed."))
+                            return 'failed'
+                        # For other status codes, continue waiting
+                    except rospy.ROSException:
+                        # This handles the timeout, effectively looping to wait for the message
+                        pass
+
+        smach.StateMachine.add('WAIT_FOR_DOCKED',
+                               WaitForDockedState(),
+                               transitions={'succeeded': 'WAIT_FOR_PROGRAM', 
+                                            'failed': 'WAIT_FOR_PROGRAM', 
+                                            'preempted': 'PREEMPTED_STOP'})
+
 
     # Create and start introspection server
     sis = smach_ros.IntrospectionServer('smach_server', sm, '/WAIT_FOR_PROGRAM')
+    # sis = smach_ros.IntrospectionServer('smach_server', sm, '/CHECK_FOR_DOCK_POINT')
     sis.start()
+
+    rospy.Timer(rospy.Duration(60), lambda event: periodic_save_callback(event, sm.userdata, save_prg_pub))
+
+    def preempt_all_states():
+        sm.request_preempt()
+        zone_it.request_preempt()
+        process_zone_sm.request_preempt()
+        path_it.request_preempt()
+        process_path_sm.request_preempt()
 
     def callback_stop(msg):
         if msg.data:
-            sm.request_preempt()
-            zone_it.request_preempt()
-            process_zone_sm.request_preempt()
-            path_it.request_preempt()
-            process_path_sm.request_preempt()
+            preempt_all_states()
+
+    
+    
+    def callback_pm_status(msg):
+        if msg.battery_capacity <= 25 and sm.userdata.battery_capacity_checking:
+            sm.userdata.battery_capacity_checking = False
+            rospy.loginfo("Battery capacity <= 25 %, shutting down mower SMACH.")
+            preempt_all_states()
+
 
     rospy.Subscriber("/mower_smach/stop", Bool, callback_stop)
+    rospy.Subscriber("/pm/power_status", Power_status, callback_pm_status)
 
     def signal_handler(sig, frame):
         print("Shutting down...")
-        # print(node)
         rospy.signal_shutdown("end")
         sm.request_preempt()
         sis.stop()

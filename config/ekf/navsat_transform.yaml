@@ -1,5 +1,6 @@
 
 ############################################## NAVSAT  ##############################################
+# This is the currently active configuration
 
 navsat_transform:
   frequency: 10

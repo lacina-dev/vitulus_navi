@@ -3,8 +3,9 @@ global_costmap:
   global_frame: map
   robot_base_frame: base_link
 
-  update_frequency: 1.5  # 3.0
-  publish_frequency: 1.5  # 3.0
+  update_frequency: 0.5  # 3.0
+  publish_frequency: 0.5  # 3.0
+  inflation_radius: 0.85
   static_map: true
   plugins:
     - name: static_layer

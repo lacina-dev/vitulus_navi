@@ -1,0 +1,16 @@
+# Python compiled files
+*.py[cod]
+*$py.class
+__pycache__/
+
+# ROS bag files
+*.bag
+
+# Editor temp files
+*.swp
+*.swo
+*~
+
+# Backup files
+*.backupworking
+*.backup

@@ -166,8 +166,7 @@ class NavTfNode:
 
 
     def callback_set_pose(self, msg):
-        print("Set pose")
-        print(msg.pose.pose)
+        rospy.logdebug("Set pose: %s" % msg.pose.pose)
         self.set_nav_pose(msg.pose.pose)
         self.set_wheel_base_nav_pose(msg.pose.pose)
 
@@ -617,14 +616,13 @@ class NavTfNode:
         :param srv: geometry_msgs/Pose
         :return:
         """
-        print("Set pose ")
-        print(pose)
+        rospy.logdebug("Set pose: %s" % pose)
         self.set_pose_pose = pose
         self.set_pose_yaw = euler_from_quaternion([pose.orientation.x,
                                                    pose.orientation.y,
                                                    pose.orientation.z,
                                                    pose.orientation.w])[2]
-        print("Set pose yaw: ", self.set_pose_yaw)
+        rospy.logdebug("Set pose yaw: %s" % self.set_pose_yaw)
 
     def set_nav_wheel_odom(self):
         self.offset_navheading_wheel_odom_msg = copy.deepcopy(self.wheel_odom_msg)
@@ -650,7 +648,7 @@ class NavTfNode:
 
             srv = rospy.ServiceProxy('/ekf_wheel_odometry/set_pose', SetPose)  # Connect to the service
             response = srv(pose_srv)
-            print("Response: ", response)
+            rospy.logdebug("Response: %s" % response)
         except rospy.ServiceException as e:
             rospy.logerr("Service /ekf_wheel_odometry/set_pose call failed: %s" % e)
 
@@ -715,7 +713,7 @@ class NavTfNode:
 
         # print("fused: {:.3f}s fix_usable: {:1} heading_usable: {:1} rtk_err: {:.5f} imu_delay: {:2} diff_yaw: {:.5f}"
         #       .format(fused_nav_time, self.fix_usable, self.heading_fix_usable, self.rtk_err, self.imu_delay, self.diff_yaw))
-        print("fused fix: {:.3f}s fused nav: {:.3f}s fix_usable: {:1} heading_usable: {:1} rtk_err: {:.5f}"
+        rospy.logdebug("fused fix: {:.3f}s fused nav: {:.3f}s fix_usable: {:1} heading_usable: {:1} rtk_err: {:.5f}"
               .format(self.fused_fix_time, self.fused_nav_time, self.fix_usable, self.heading_fix_usable, self.rtk_err))
 
     def publish_status(self):
@@ -945,7 +943,7 @@ if __name__ == '__main__':
         rospy.Timer(rospy.Duration(1.0 / 3.0), node_gnss.loop3hz)
         rospy.Timer(rospy.Duration(1.0 / 30.0), node_gnss.loop30hz)
         rospy.Timer(rospy.Duration(1.0 / 10.0), node_gnss.loop10hz)
-        rospy.Timer(rospy.Duration(1.0/10), node_gnss.loop3sec)
+        rospy.Timer(rospy.Duration(1.0 / 10.0), node_gnss.loop3sec)
 
         rospy.spin()
 

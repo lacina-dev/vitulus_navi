@@ -205,6 +205,7 @@ install(DIRECTORY launch
 catkin_install_python(PROGRAMS
   nodes/mower_unit_smach
   nodes/navi_man
+  nodes/node_tester
   nodes/smach_exe_path
   nodes/smach_exe_goal
   nodes/navi_transform

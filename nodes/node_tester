@@ -1,28 +1,157 @@
 #!/usr/bin/env python
 import rospy
-import time
-from std_msgs.msg import Bool, String
-import sys
-import signal
+from std_msgs.msg import String
+from geometry_msgs.msg import Point32
 from vitulus_msgs.msg import PlannerProgram
-from nav_msgs.msg import Path
+from visualization_msgs.msg import Marker, MarkerArray
+
+
+# colours  [r, g, b, a]
+COLOR_DONE    = [0.25, 0.25, 0.25, 0.6]   # grey  – already executed
+COLOR_PENDING = [0.1,  0.1,  0.6,  0.6]   # dim blue – not yet executed
+COLOR_ACTIVE  = [1.0,  0.85, 0.0,  1.0]   # yellow – current path
+SCALE_NORMAL  = 0.05
+SCALE_ACTIVE  = 0.10
+PATH_INTERVAL = 3.0   # seconds per path step
+
+
+def _make_cube_marker(position, ns, uid, color, scale=0.15):
+    m = Marker()
+    m.header.frame_id = "map"
+    m.header.stamp = rospy.Time.now()
+    m.ns = ns
+    m.id = uid
+    m.type = Marker.CUBE
+    m.action = Marker.ADD
+    m.scale.x = scale
+    m.scale.y = scale
+    m.scale.z = scale
+    m.color.r = color[0]
+    m.color.g = color[1]
+    m.color.b = color[2]
+    m.color.a = color[3]
+    m.pose.position.x = position.x
+    m.pose.position.y = position.y
+    m.pose.position.z = position.z
+    m.pose.orientation.w = 1.0
+    return m
+
+
+def _make_line_marker(points, ns, uid, color, scale):
+    m = Marker()
+    m.header.frame_id = "map"
+    m.header.stamp = rospy.Time.now()
+    m.ns = ns
+    m.id = uid
+    m.type = Marker.LINE_LIST
+    m.action = Marker.ADD
+    m.scale.x = scale
+    m.color.r = color[0]
+    m.color.g = color[1]
+    m.color.b = color[2]
+    m.color.a = color[3]
+    m.pose.orientation.w = 1.0
+    m.points = points
+    return m
+
+
+def _path_to_points(path):
+    pts = []
+    for i in range(len(path.poses) - 1):
+        p0 = path.poses[i].pose.position
+        p1 = path.poses[i + 1].pose.position
+        pts.append(Point32(p0.x, p0.y, p0.z))
+        pts.append(Point32(p1.x, p1.y, p1.z))
+    return pts
+
+
+def _build_marker_array(program, active_zone_idx, active_path_idx):
+    """Build full MarkerArray – all paths coloured by state relative to active position."""
+    ma = MarkerArray()
+    uid = 0
+    path_global = 0
+    active_global = sum(
+        len(program.zone_list[zi].paths) for zi in range(active_zone_idx)
+    ) + active_path_idx
+
+    for zi, zone in enumerate(program.zone_list):
+        for pi, path in enumerate(zone.paths):
+            if not path.poses:
+                path_global += 1
+                continue
+            pts = _path_to_points(path)
+            if not pts:
+                path_global += 1
+                continue
+            if path_global < active_global:
+                color, scale = COLOR_DONE, SCALE_NORMAL
+            elif path_global == active_global:
+                color, scale = COLOR_ACTIVE, SCALE_ACTIVE
+            else:
+                color, scale = COLOR_PENDING, SCALE_NORMAL
+            ns = "{}_path_{}".format(zone.name, pi)
+            ma.markers.append(_make_line_marker(pts, ns, uid, color, scale))
+            uid += 1
+            # start marker – green cube
+            start_pos = path.poses[0].pose.position
+            ma.markers.append(_make_cube_marker(start_pos, ns + "_start", uid, [0.0, 1.0, 0.0, 1.0]))
+            uid += 1
+            # end marker – red cube
+            end_pos = path.poses[-1].pose.position
+            ma.markers.append(_make_cube_marker(end_pos, ns + "_end", uid, [1.0, 0.0, 0.0, 1.0]))
+            uid += 1
+            path_global += 1
+    return ma
+
 
 class Node:
 
     def __init__(self):
-        self.pub_test = rospy.Publisher('/test_path', Path, queue_size=10)
-        self.sub_test = rospy.Subscriber("/program_active", PlannerProgram, self.callback_program)
-
-    def publish_test(self, msg):
-        msg = String()
-        msg.data = "TEST"
-        self.pub_test.publish(msg)
+        self.program = None
+        self.pub_markers = rospy.Publisher('/web_plan/program_marker', MarkerArray, queue_size=1)
+        self.pub_status  = rospy.Publisher('/mower_smach/status', String, queue_size=1)
+        self.sub_program = rospy.Subscriber('/web_plan/program_to_show_marker', PlannerProgram, self.callback_program)
 
     def callback_program(self, msg):
-        for path in msg.zone_list[0].paths:
-            self.pub_test.publish(path)
-            time.sleep(10)
-        rospy.loginfo("<{}> Finished program {}".format(rospy.get_caller_id(), msg.name))
+        if msg.name == '' or msg.name == 'none':
+            return
+        if self.program is None:
+            rospy.loginfo("<{}> Received program: {}".format(rospy.get_caller_id(), msg.name))
+            self.program = msg
+
+    def run(self):
+        rospy.loginfo("<{}> Waiting for Show in web UI...".format(rospy.get_caller_id()))
+        self.pub_status.publish(String("Tester: waiting for program"))
+        r = rospy.Rate(1)
+        while not rospy.is_shutdown() and self.program is None:
+            r.sleep()
+        if rospy.is_shutdown():
+            return
+
+        program = self.program
+        total_paths = sum(len(z.paths) for z in program.zone_list)
+        path_count  = 0
+
+        rospy.loginfo("<{}> Starting preview: {}".format(rospy.get_caller_id(), program.name))
+
+        for zi, zone in enumerate(program.zone_list):
+            for pi, path in enumerate(zone.paths):
+                if rospy.is_shutdown():
+                    return
+                path_count += 1
+                status_msg = "Preview {}: zone {} path {}/{} ({}/{})".format(
+                    program.name, zone.name, pi + 1, len(zone.paths), path_count, total_paths)
+                rospy.loginfo("<{}> {}".format(rospy.get_caller_id(), status_msg))
+                self.pub_status.publish(String(status_msg))
+                ma = _build_marker_array(program, zi, pi)
+                self.pub_markers.publish(ma)
+                rospy.sleep(PATH_INTERVAL)
+
+        # Restore full dim view at the end
+        ma = _build_marker_array(program, len(program.zone_list), 0)
+        self.pub_markers.publish(ma)
+        rospy.loginfo("<{}> Finished preview: {}".format(rospy.get_caller_id(), program.name))
+        self.pub_status.publish(String("Preview done: {}".format(program.name)))
 
 
 if __name__ == '__main__':
@@ -30,16 +159,6 @@ if __name__ == '__main__':
         rospy.init_node('test_node')
         rospy.loginfo("<{}> Initialising...".format(rospy.get_caller_id()))
         node = Node()
-        r = rospy.Rate(1)  # Hz
-
-        def signal_handler():
-            rospy.signal_shutdown("end")
-            sys.exit(0)
-        signal.signal(signal.SIGINT, signal_handler)
-
-        while not rospy.is_shutdown():
-            # node.publish_test()
-            r.sleep()
-
+        node.run()
     except rospy.ROSInterruptException:
-        rospy.logerr("<{}> error.".format(rospy.get_caller_id()))
+        rospy.logerr("<{}> interrupted.".format(rospy.get_caller_id()))

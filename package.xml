@@ -24,6 +24,8 @@
     <exec_depend>move_base_flex</exec_depend>
   <exec_depend>move_base</exec_depend>
   <exec_depend>costmap_2d</exec_depend>
+  <exec_depend>weather_alert</exec_depend>
+  <exec_depend>vitulus_msgs</exec_depend>
 
 <!--  <export>-->
 <!--        <costmap_2d plugin="${vitulus_navi}/costmap_plugins.xml"/>-->

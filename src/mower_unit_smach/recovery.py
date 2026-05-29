@@ -9,6 +9,7 @@ import smach
 import actionlib
 
 from std_msgs.msg import Bool, String, Int16
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import Path
 from vitulus_msgs.msg import Mower
 from mbf_msgs.msg import ExePathAction, ExePathGoal, RecoveryAction, RecoveryGoal
@@ -301,7 +302,7 @@ def build_nav_recovery_sm(pubs):
         class NavBladeOffWait(smach.State):
             """Stop blade and wait 10s (preemptable) for dynamic obstacle to clear."""
 
-            WAIT_SECONDS = 10
+            WAIT_SECONDS = 5
 
             def __init__(self):
                 smach.State.__init__(self, outcomes=['done', 'preempted'])
@@ -386,17 +387,61 @@ def build_nav_recovery_sm(pubs):
         def blade_on_cb(ud):
             pubs.mower_set_motor_on.publish(Bool(True))
             rospy.sleep(1.0)
-            ud.consecutive_nav_failures = 0
+            # NOTE: consecutive_nav_failures is intentionally NOT reset here.
+            # It is reset only after a *genuine* full-chunk completion in
+            # ExecutePathWithFeedback. Resetting on every recovery retry let the
+            # robot loop forever against a re-appearing map ghost (each tiny nudge
+            # reset the escalation counter, so it never reached skip/critical).
             rospy.loginfo("[NAV_RECOVERY] Path retry succeeded, blade on")
             return 'done'
 
         smach.StateMachine.add('NAV_BLADE_ON', smach.CBState(blade_on_cb),
                                transitions={'done': 'recovered'})
 
+        # Physical backup maneuver: reverse a short distance to break free of a
+        # real obstacle and re-seed the local planner before retrying. Publishes
+        # directly to /cmd_vel (the base command topic) — no MBF goal is active
+        # during recovery, so the topic is free. Blind reverse, kept short/slow.
+        class NavBackup(smach.State):
+            BACKUP_SPEED = 0.1       # m/s magnitude (reverse)
+            BACKUP_DISTANCE = 0.4    # m
+            RATE_HZ = 10.0
+
+            def __init__(self):
+                smach.State.__init__(self, outcomes=['done', 'preempted'])
+                self._cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+
+            def execute(self, userdata):
+                if self.preempt_requested():
+                    self.service_preempt()
+                    return 'preempted'
+                rospy.loginfo("[NAV_RECOVERY] Backing up %.2fm at %.2fm/s",
+                              self.BACKUP_DISTANCE, self.BACKUP_SPEED)
+                pubs.mower_set_motor_on.publish(Bool(False))
+                twist = Twist()
+                twist.linear.x = -abs(self.BACKUP_SPEED)
+                duration = self.BACKUP_DISTANCE / self.BACKUP_SPEED
+                rate = rospy.Rate(self.RATE_HZ)
+                deadline = rospy.Time.now() + rospy.Duration(duration)
+                while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+                    if self.preempt_requested():
+                        self._cmd_pub.publish(Twist())  # stop
+                        self.service_preempt()
+                        return 'preempted'
+                    self._cmd_pub.publish(twist)
+                    rate.sleep()
+                self._cmd_pub.publish(Twist())  # stop
+                rospy.sleep(0.3)
+                return 'done'
+
+        smach.StateMachine.add('NAV_BACKUP', NavBackup(),
+                               transitions={'done': 'NAV_CLEAR_COSTMAP',
+                                            'preempted': 'preempted'})
+
         smach.StateMachine.add('NAV_RETRY_GATE',
                                RetryLimitedAction('nav_retry_count', max_retries=2),
                                transitions={
-                                   'retry': 'NAV_BLADE_OFF_WAIT',
+                                   'retry': 'NAV_BACKUP',
                                    'give_up': 'NAV_SKIP_CHECK',
                                    'preempted': 'preempted'
                                })

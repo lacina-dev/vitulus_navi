@@ -215,6 +215,7 @@ class PreStartCheck(smach.State):
             if rain.rain_now == 1:
                 self.pubs.log_info.publish(String("Start rejected: raining now"))
                 self.pubs.smach_status.publish(String("Rejected: rain"))
+                self.pubs.stop_reason.publish(String("rejected:rain"))
                 return 'rejected'
 
             past = [rain.status_past60m, rain.status_past50m, rain.status_past40m,
@@ -224,6 +225,7 @@ class PreStartCheck(smach.State):
                 if s == 'RAIN':
                     self.pubs.log_info.publish(String("Start rejected: recent rain"))
                     self.pubs.smach_status.publish(String("Rejected: recent rain"))
+                    self.pubs.stop_reason.publish(String("rejected:recent_rain"))
                     return 'rejected'
 
             nowcast = [rain.status_nowcast10m, rain.status_nowcast20m,
@@ -231,6 +233,7 @@ class PreStartCheck(smach.State):
             if any(s in self.RAIN_STATUSES for s in nowcast):
                 self.pubs.log_info.publish(String("Start rejected: rain forecast"))
                 self.pubs.smach_status.publish(String("Rejected: forecast"))
+                self.pubs.stop_reason.publish(String("rejected:forecast"))
                 return 'rejected'
 
         except rospy.ROSException:
@@ -243,6 +246,7 @@ class PreStartCheck(smach.State):
                 self.pubs.log_info.publish(String(
                     "Start rejected: battery {}% < 40%".format(pm.battery_capacity)))
                 self.pubs.smach_status.publish(String("Rejected: low battery"))
+                self.pubs.stop_reason.publish(String("rejected:battery"))
                 return 'rejected'
         except rospy.ROSException:
             rospy.logwarn("[PRE_START_CHECK] Power status unavailable, proceeding")
@@ -599,8 +603,10 @@ class ExecutePathWithFeedback(smach.State):
                                        'replan_needed', 'blocked'],
                              input_keys=['path_chunk', 'paths', 'zone_name', 'index_path',
                                          'final_pose', 'path', 'path_window_start_index',
-                                         'restore_height_pending', 'zone_cut_height'],
-                             output_keys=['restore_height_pending'])
+                                         'restore_height_pending', 'zone_cut_height',
+                                         'consecutive_nav_failures'],
+                             output_keys=['restore_height_pending',
+                                          'consecutive_nav_failures'])
         self._client = actionlib.SimpleActionClient(
             '/move_base_flex/exe_path', ExePathAction)
         self.pubs = pubs
@@ -695,6 +701,10 @@ class ExecutePathWithFeedback(smach.State):
                               userdata.zone_cut_height)
                 self.pubs.mower_set_height.publish(Int16(userdata.zone_cut_height))
                 userdata.restore_height_pending = False
+            # Genuine forward progress on a full chunk → reset the navigation
+            # failure escalation counter (moved here from NAV_RECOVERY so a
+            # trivial recovery nudge no longer resets escalation).
+            userdata.consecutive_nav_failures = 0
             return 'succeeded'
         return 'aborted'
 

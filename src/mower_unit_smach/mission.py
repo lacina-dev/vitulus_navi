@@ -432,6 +432,7 @@ def build_mission_child_sm(pubs):
             pubs.show_map_layer.publish(String("SMACH|MAP|FULL"))
             rospy.sleep(1.5)
             ud.program.last_result = 'succeeded'
+            pubs.stop_reason.publish(String("succeeded"))
             return 'done'
 
         smach.StateMachine.add('POWER_OFF_MOWER', smach.CBState(power_off_cb),
@@ -934,17 +935,22 @@ def build_mission_concurrence(pubs, parent_sm):
     def outcome_cb(outcome_map):
         # Priority: STOP > TEMP > BATTERY > WEATHER > mission
         if outcome_map.get('STOP_MONITOR') == 'invalid':
+            pubs.stop_reason.publish(String("terminal:stop_signal"))
             return 'stop_preempt'
         if outcome_map.get('MOWER_TEMP_MONITOR') == 'invalid':
+            pubs.stop_reason.publish(String("interrupted:temp"))
             return 'temp_preempt'
         if outcome_map.get('BATTERY_MONITOR') == 'invalid':
+            pubs.stop_reason.publish(String("interrupted:battery"))
             return 'battery_preempt'
         if outcome_map.get('WEATHER_MONITOR') == 'invalid':
+            pubs.stop_reason.publish(String("interrupted:weather"))
             return 'weather_preempt'
         mission_out = outcome_map.get('MISSION_CHILD')
         if mission_out == 'succeeded':
             return 'mission_complete'
         if mission_out == 'aborted':
+            pubs.stop_reason.publish(String("critical:mission_aborted"))
             return 'critical_error'
         return 'preempted'
 

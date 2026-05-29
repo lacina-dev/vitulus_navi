@@ -17,6 +17,8 @@ class MowerPublishers:
         # --- SMACH status / UI ---
         self.smach_status = rospy.Publisher(
             '/mower_smach/status', String, latch=True, queue_size=1)
+        self.stop_reason = rospy.Publisher(
+            '/mower_smach/stop_reason', String, latch=True, queue_size=1)
         self.log_info = rospy.Publisher(
             '/nextion/log_info', String, queue_size=10, latch=True)
         self.active_program = rospy.Publisher(

@@ -40,6 +40,7 @@ class CriticalErrorState(smach.State):
         rospy.logerr("[CRITICAL_ERROR] Reason: %s", reason)
         self.pubs.log_info.publish(String("CRITICAL ERROR: {}".format(reason)))
         self.pubs.smach_status.publish(String("Critical error"))
+        self.pubs.stop_reason.publish(String("critical:{}".format(reason.lower())))
         self.pubs.pm_play_melody.publish(Int16(1))
 
         if reason in self.NO_DOCK_REASONS:
@@ -74,6 +75,7 @@ class TerminalErrorState(smach.State):
         self.pubs.log_info.publish(String(
             "TERMINAL: {}. Reset via /mower_smach/reset".format(reason)))
         self.pubs.smach_status.publish(String("TERMINAL ERROR"))
+        self.pubs.stop_reason.publish(String("terminal:{}".format(reason.lower())))
 
         # Ensure blade is safe
         safe_blade_shutdown(source='TERMINAL_ERROR', pubs=self.pubs)

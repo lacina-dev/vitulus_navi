@@ -12,7 +12,11 @@ clear_costmap:
   invert_area_to_clear: true
 #  both, local, global
   affected_maps: both
-  layer_names: [laser_layer, static_layer]
+  # static_layer removed: clearing the static map only blanks real mapped walls
+  # for a single update cycle (it reloads from /navi_manager/map immediately) and
+  # can briefly let the planner cut through a wall. Map "ghosts" must be fixed in
+  # the map itself, not worked around via costmap clearing.
+  layer_names: [laser_layer]
 
 clear_costmap_laser:
   reset_distance: 1

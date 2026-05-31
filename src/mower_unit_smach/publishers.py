@@ -28,6 +28,10 @@ class MowerPublishers:
         self.show_map_layer = rospy.Publisher(
             '/web_plan/show_map_layer', String, latch=True, queue_size=1)
 
+        # --- Navigation speed preset (same topic as webui speed buttons) ---
+        self.navi_speed = rospy.Publisher(
+            '/navi_manager/speed', String, latch=True, queue_size=1)
+
         # --- Docking ---
         self.dock_cancel = rospy.Publisher(
             '/dock_smach/stop', Bool, queue_size=1)

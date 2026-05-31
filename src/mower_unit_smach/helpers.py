@@ -16,12 +16,89 @@ from std_msgs.msg import Bool, String, Int16
 from geometry_msgs.msg import PoseStamped, Quaternion
 from vitulus_msgs.msg import Mower
 import mbf_msgs.msg as mbf_msgs
+from mbf_msgs.srv import CheckPathRequest, CheckPathResponse
 
 
 # ---------------------------------------------------------------------------
 # Mower FW status strings
 # ---------------------------------------------------------------------------
 MOWER_ERROR_STATES = ('ERR', 'BLOCKED', 'TEMP')
+
+
+# ---------------------------------------------------------------------------
+# MBF outcome code -> human-readable name (for debug logging)
+# Mirrors mbf_msgs ExePath/GetPath result outcome constants.
+# ---------------------------------------------------------------------------
+MBF_OUTCOME_NAMES = {
+    0: 'SUCCESS',
+    50: 'FAILURE', 51: 'CANCELED', 52: 'NO_VALID_CMD', 53: 'PAT_EXCEEDED',
+    54: 'COLLISION', 55: 'OSCILLATION', 56: 'ROBOT_STUCK', 57: 'MISSED_GOAL',
+    58: 'MISSED_PATH', 59: 'BLOCKED_PATH', 60: 'INVALID_PATH', 61: 'TF_ERROR',
+    62: 'NOT_INITIALIZED', 63: 'INVALID_PLUGIN', 64: 'INTERNAL_ERROR',
+    65: 'OUT_OF_MAP', 66: 'MAP_ERROR', 67: 'STOPPED',
+    # GetPath-specific
+    68: 'CANCELED', 69: 'EMPTY_PATH',
+}
+
+
+def mbf_outcome_str(code):
+    """Return 'NAME(code)' for an MBF outcome code, or 'None' if code is None."""
+    if code is None:
+        return 'None'
+    return '{}({})'.format(MBF_OUTCOME_NAMES.get(code, 'UNKNOWN'), code)
+
+
+# ---------------------------------------------------------------------------
+# Weather (rain) gating configuration
+#
+# Read from ROS params (set in navi_man.launch under the node's private
+# namespace) so the rain behaviour can be tuned without editing code:
+#   ~weather_rain_bypass          bool  - if true, skip ALL rain checks
+#   ~weather_reject_statuses      list  - forecast statuses that block mowing
+#                                         (default ['RAIN']; was RAIN/ALERT/WARN)
+#   ~weather_forecast_horizon_min int   - how far ahead to look: 10/20/30 min
+#                                         (the RainAlert msg only goes to 30)
+#   ~weather_monitor_min_steps    int   - during a mission, how many forecast
+#                                         steps must be "reject" to return to
+#                                         dock (pre-start rejects on any 1 step)
+# ---------------------------------------------------------------------------
+
+_NOWCAST_FIELDS = ('status_nowcast10m', 'status_nowcast20m', 'status_nowcast30m')
+
+
+def get_weather_config():
+    """Read rain-gating params with safe defaults. Called per check so a live
+    `rosparam set` takes effect without restarting the node."""
+    bypass = bool(rospy.get_param('~weather_rain_bypass', False))
+
+    statuses = rospy.get_param('~weather_reject_statuses', ['RAIN'])
+    if isinstance(statuses, str):
+        statuses = [s.strip() for s in statuses.split(',') if s.strip()]
+    reject_statuses = tuple(str(s).upper() for s in statuses) or ('RAIN',)
+
+    horizon = int(rospy.get_param('~weather_forecast_horizon_min', 30))
+    # The RainAlert message only carries 10/20/30-minute nowcast steps.
+    if horizon < 10:
+        horizon = 10
+    horizon = min(horizon, 30)
+    n_steps = max(1, horizon // 10)
+
+    min_steps = int(rospy.get_param('~weather_monitor_min_steps', 2))
+    if min_steps < 1:
+        min_steps = 1
+
+    return {
+        'bypass': bypass,
+        'reject_statuses': reject_statuses,
+        'horizon_min': horizon,
+        'n_steps': n_steps,
+        'monitor_min_steps': min_steps,
+    }
+
+
+def rain_forecast_steps(rain_msg, n_steps):
+    """Return the first `n_steps` nowcast status strings from a RainAlert msg."""
+    return [getattr(rain_msg, f, '') for f in _NOWCAST_FIELDS[:n_steps]]
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +172,43 @@ def direction_angle(line_coords):
     if x >= 0:
         return math.asin(y / diagonal)
     return math.acos(x / diagonal)
+
+
+# ---------------------------------------------------------------------------
+# Live costmap path collision probe
+# ---------------------------------------------------------------------------
+def first_lethal_index(check_path_proxy, path, safety_dist=0.10,
+                       use_padded_fp=False):
+    """Index of the first LETHAL pose on *path* per the live GLOBAL costmap, or
+    -1 if the path is clear / the service is unavailable.
+
+    Wraps move_base_flex's check_path_cost service (return_on=LETHAL). Gates on
+    state==LETHAL only: unknown space is ignored (unknown_cost_mult=0) and
+    inscribed/inflated cells (e.g. the static map walls an outline path runs
+    alongside) do NOT trip it — only real obstacle cells touched by the path do.
+    """
+    if path is None or not getattr(path, 'poses', None):
+        return -1
+    try:
+        req = CheckPathRequest()
+        req.path = path
+        req.costmap = CheckPathRequest.GLOBAL_COSTMAP
+        req.return_on = CheckPathResponse.LETHAL  # stop at first lethal pose
+        req.lethal_cost_mult = 1
+        req.inscrib_cost_mult = 1
+        req.unknown_cost_mult = 0   # ignore unknown space (common outdoors)
+        req.safety_dist = safety_dist
+        req.skip_poses = 0
+        req.use_padded_fp = use_padded_fp
+        req.path_cells_only = False
+        resp = check_path_proxy(req)
+    except (rospy.ServiceException, rospy.ROSException) as e:
+        rospy.logwarn_throttle(
+            10.0, '[first_lethal_index] check_path_cost unavailable: %s', e)
+        return -1
+    if resp.state == CheckPathResponse.LETHAL:
+        return int(resp.last_checked)
+    return -1
 
 
 # ---------------------------------------------------------------------------

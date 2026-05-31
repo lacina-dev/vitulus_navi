@@ -28,7 +28,7 @@ from .states import (
     GetZoneData, GetPathData, CheckDistance, WindowPlannerPath, TrimAndRetry,
     ExecutePathWithFeedback, WaitForRpmReached, WaitForMowerOff,
     CheckIfDockedState, WaitForPlannerLoaded, WaitForDockedState,
-    CheckForDockPoint)
+    CheckForDockPoint, DetourAroundObstacle)
 from .monitors import (
     weather_monitor_cb, battery_monitor_cb, mower_temp_monitor_cb, stop_monitor_cb)
 from .recovery import build_blocked_recovery_sm, build_nav_recovery_sm
@@ -336,10 +336,29 @@ def build_mission_child_sm(pubs):
 
         smach.StateMachine.add('WAIT_FOR_PLANNER', WaitForPlannerLoaded(pubs, timeout=120.0),
                                transitions={
-                                   'received': 'POWER_ON_MOWER',
+                                   'received': 'SET_PROGRAM_SPEED',
                                    'timeout': 'aborted',
                                    'preempted': 'preempted'
                                })
+
+        # ==================== PROGRAM SPEED ====================
+        # Apply the program-level driving speed the same way the webui speed
+        # buttons do (publish on /navi_manager/speed). 'mid' is the default.
+        @smach.cb_interface(input_keys=['program'], outcomes=['done', 'preempted'])
+        def set_program_speed_cb(ud):
+            speed_map = {'slow': 'SLOW', 'mid': 'MEDIUM', 'fast': 'FAST'}
+            raw = (getattr(ud.program, 'speed', '') or 'mid').lower()
+            speed = speed_map.get(raw, 'MEDIUM')
+            rospy.loginfo('[SET_PROGRAM_SPEED] program speed=%r -> %s', raw, speed)
+            pubs.navi_speed.publish(String(speed))
+            pubs.log_info.publish(String("Set speed: {}".format(speed)))
+            pubs.smach_status.publish(String("Set speed {}".format(speed)))
+            rospy.sleep(0.5)
+            return 'done'
+
+        smach.StateMachine.add('SET_PROGRAM_SPEED', smach.CBState(set_program_speed_cb),
+                               transitions={'done': 'POWER_ON_MOWER',
+                                            'preempted': 'preempted'})
 
         # ==================== MOWER POWER ====================
 
@@ -852,18 +871,26 @@ def _build_process_path_sm(pubs, path_it):
                                })
 
         # --- WINDOW_PLANNER_PATH ---
+        # 'detour_needed' fires when the costmap goal guard sees an obstacle on
+        # the mowing line right ahead: route around it globally rather than
+        # handing TEB a blocked chunk goal (avoids the dancing at chunk ends).
         smach.StateMachine.add('WINDOW_PLANNER_PATH', WindowPlannerPath(pubs),
                                transitions={
                                    'available': 'EXE_PLANNER_PATH',
                                    'finished': 'continue_path',
+                                   'detour_needed': 'DETOUR',
                                    'preempted': 'preempted'
                                })
 
         # --- EXE_PLANNER_PATH (with BLOCKED detection) ---
+        # 'detour' = a stall/abort where the live costmap confirms an obstacle on
+        # the line ahead -> go straight around it (skip the slow NAV_RECOVERY
+        # wait/retry that is meant for dynamic obstacles, not a standing person).
         smach.StateMachine.add('EXE_PLANNER_PATH', ExecutePathWithFeedback(pubs),
                                transitions={
                                    'succeeded': 'WINDOW_PLANNER_PATH',
                                    'replan_needed': 'WINDOW_PLANNER_PATH',
+                                   'detour': 'DETOUR',
                                    'aborted': 'NAV_RECOVERY',
                                    'blocked': 'BLOCKED_RECOVERY',
                                    'preempted': 'preempted'
@@ -887,14 +914,60 @@ def _build_process_path_sm(pubs, path_it):
         smach.StateMachine.add('SET_BLOCKED_ERROR', smach.CBState(set_blocked_error_cb),
                                transitions={'done': 'critical_failure'})
 
-        # --- NAV RECOVERY (wait → skip → critical) ---
+        # --- NAV RECOVERY (wait + retry same chunk for dynamic obstacles) ---
+        # On persistent obstacle it returns 'detour_needed' instead of skipping
+        # the whole line.
         nav_sm = build_nav_recovery_sm(pubs)
         smach.StateMachine.add('NAV_RECOVERY', nav_sm,
                                transitions={
                                    'recovered': 'WINDOW_PLANNER_PATH',
-                                   'skip_path': 'continue_path',
+                                   'detour_needed': 'DETOUR',
                                    'critical_error': 'SET_NAV_ERROR',
                                    'preempted': 'preempted'
+                               })
+
+        # --- DETOUR (route around the obstacle, rejoin the line downstream) ---
+        smach.StateMachine.add('DETOUR', DetourAroundObstacle(pubs),
+                               transitions={
+                                   'resumed': 'WINDOW_PLANNER_PATH',
+                                   'no_detour': 'DETOUR_ESCALATE',
+                                   'preempted': 'preempted'
+                               })
+
+        # --- DETOUR_ESCALATE ---
+        # Reached only when no detour around the obstacle is feasible. As a last
+        # resort skip THIS line (not the whole zone) and move on. Only after many
+        # consecutive un-mowable lines with no successful mowing in between (the
+        # counter is reset on every genuine full-chunk completion) do we give up
+        # and raise a navigation error — which now tries a return to dock first.
+        MAX_CONSECUTIVE_UNMOWABLE = 5
+
+        @smach.cb_interface(input_keys=['consecutive_nav_failures', 'zone_name',
+                                        'index_path', 'paths'],
+                            output_keys=['consecutive_nav_failures'],
+                            outcomes=['skip', 'critical'])
+        def detour_escalate_cb(ud):
+            count = int(ud.consecutive_nav_failures or 0) + 1
+            ud.consecutive_nav_failures = count
+            if count >= MAX_CONSECUTIVE_UNMOWABLE:
+                rospy.logerr("[DETOUR_ESCALATE] %d consecutive un-mowable lines - "
+                             "navigation error", count)
+                pubs.log_info.publish(String(
+                    "Navigation: {} lines blocked, giving up".format(count)))
+                return 'critical'
+            rospy.logwarn("[DETOUR_ESCALATE] line %s blocked, no detour - skipping "
+                          "(%d consecutive)", ud.index_path, count)
+            pubs.log_info.publish(String(
+                "Path skipped: obstacle, no detour possible"))
+            # Blade back on for the next line.
+            pubs.mower_set_motor_on.publish(Bool(True))
+            rospy.sleep(1.0)
+            return 'skip'
+
+        smach.StateMachine.add('DETOUR_ESCALATE', smach.CBState(detour_escalate_cb),
+                               transitions={
+                                   'skip': 'continue_path',
+                                   'critical': 'SET_NAV_ERROR'
                                })
 
         @smach.cb_interface(input_keys=['error_reason'], output_keys=['error_reason'],

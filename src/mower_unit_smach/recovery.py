@@ -14,7 +14,8 @@ from nav_msgs.msg import Path
 from vitulus_msgs.msg import Mower
 from mbf_msgs.msg import ExePathAction, ExePathGoal, RecoveryAction, RecoveryGoal
 
-from .helpers import MOWER_ERROR_STATES, get_robot_xy_in_map, nearest_pose_index
+from .helpers import (MOWER_ERROR_STATES, get_robot_xy_in_map,
+                      nearest_pose_index, mbf_outcome_str)
 from .states import WaitForMowerStatus, RetryLimitedAction
 
 
@@ -279,17 +280,20 @@ def build_blocked_recovery_sm(pubs):
 def build_nav_recovery_sm(pubs):
     """Build a sub-SM for recovering from navigation failures.
 
-    Phases:
-      1. Wait 10s + retry same path chunk (2 attempts) - handles dynamic obstacles
-      2. Skip waypoint, increment consecutive failure counter
-      3. If 3 consecutive skips → critical_error
+    This handles the *dynamic* obstacle case (something that may clear by
+    itself): blade off, wait for the self-decaying obstacle maps to clear,
+    clear the costmap, optionally back up, and retry the SAME chunk.
 
-    Outcomes: 'recovered', 'skip_path', 'critical_error', 'preempted'
+    If the obstacle persists, it does NOT skip the whole line — it returns
+    'detour_needed' so the caller can route AROUND the obstacle and rejoin the
+    line downstream (DetourAroundObstacle).
+
+    Outcomes: 'recovered', 'detour_needed', 'critical_error', 'preempted'
     Input keys: path_chunk, consecutive_nav_failures, zone_rpm
     Output keys: consecutive_nav_failures
     """
     sm = smach.StateMachine(
-        outcomes=['recovered', 'skip_path', 'critical_error', 'preempted'],
+        outcomes=['recovered', 'detour_needed', 'critical_error', 'preempted'],
         input_keys=['path_chunk', 'consecutive_nav_failures', 'zone_rpm'],
         output_keys=['consecutive_nav_failures']
     )
@@ -297,12 +301,17 @@ def build_nav_recovery_sm(pubs):
 
     with sm:
 
-        # --- Phase 1: Blade off + wait 10s for dynamic obstacle to clear ---
+        # --- Phase 1: Blade off + wait for dynamic obstacle to clear ---
 
         class NavBladeOffWait(smach.State):
-            """Stop blade and wait 10s (preemptable) for dynamic obstacle to clear."""
+            """Stop blade and wait (preemptable) for a dynamic obstacle to clear.
 
-            WAIT_SECONDS = 5
+            The obstacle source maps (lidar/cloud) self-decay within a few
+            seconds, so a short wait lets a passing person/animal disappear from
+            the costmap before we retry the same chunk.
+            """
+
+            WAIT_SECONDS = 6
 
             def __init__(self):
                 smach.State.__init__(self, outcomes=['done', 'preempted'])
@@ -361,6 +370,8 @@ def build_nav_recovery_sm(pubs):
                     return 'preempted'
                 goal = ExePathGoal()
                 goal.path = userdata.path_chunk
+                rospy.loginfo("[NAV_REC] retrying same chunk (%d poses)",
+                              len(goal.path.poses) if goal.path.poses else 0)
                 self._client.send_goal(goal)
                 while self._client.get_state() in [
                         actionlib.GoalStatus.PENDING, actionlib.GoalStatus.ACTIVE]:
@@ -370,7 +381,9 @@ def build_nav_recovery_sm(pubs):
                         return 'preempted'
                     rospy.sleep(0.2)
                 result = self._client.get_result()
-                if result and result.outcome == 0:
+                outcome = getattr(result, 'outcome', None) if result else None
+                rospy.loginfo("[NAV_REC] chunk retry outcome=%s", mbf_outcome_str(outcome))
+                if outcome == 0:
                     return 'succeeded'
                 return 'aborted'
 
@@ -438,46 +451,14 @@ def build_nav_recovery_sm(pubs):
                                transitions={'done': 'NAV_CLEAR_COSTMAP',
                                             'preempted': 'preempted'})
 
+        # When the quick retries are exhausted the obstacle is not clearing by
+        # itself -> hand off to DETOUR (route around it and rejoin the line)
+        # instead of abandoning the whole line here.
         smach.StateMachine.add('NAV_RETRY_GATE',
                                RetryLimitedAction('nav_retry_count', max_retries=2),
                                transitions={
                                    'retry': 'NAV_BACKUP',
-                                   'give_up': 'NAV_SKIP_CHECK',
-                                   'preempted': 'preempted'
-                               })
-
-        # --- Phase 2/3: Skip waypoint or escalate ---
-
-        class NavSkipCheck(smach.State):
-            """Decide skip_path or critical_error based on consecutive failures."""
-
-            def __init__(self):
-                smach.State.__init__(self,
-                                     outcomes=['skip', 'critical_error', 'preempted'],
-                                     input_keys=['consecutive_nav_failures'],
-                                     output_keys=['consecutive_nav_failures'])
-
-            def execute(self, userdata):
-                if self.preempt_requested():
-                    self.service_preempt()
-                    return 'preempted'
-                count = int(userdata.consecutive_nav_failures or 0) + 1
-                userdata.consecutive_nav_failures = count
-                if count >= 3:
-                    rospy.logerr("[NAV_RECOVERY] %d consecutive failures - critical", count)
-                    pubs.log_info.publish(String("Navigation: 3 consecutive failures"))
-                    return 'critical_error'
-                rospy.logwarn("[NAV_RECOVERY] Skipping waypoint (%d consecutive)", count)
-                pubs.log_info.publish(String("Waypoint skipped (obstacle)"))
-                # Turn blade back on for next path
-                pubs.mower_set_motor_on.publish(Bool(True))
-                rospy.sleep(1.0)
-                return 'skip'
-
-        smach.StateMachine.add('NAV_SKIP_CHECK', NavSkipCheck(),
-                               transitions={
-                                   'skip': 'skip_path',
-                                   'critical_error': 'critical_error',
+                                   'give_up': 'detour_needed',
                                    'preempted': 'preempted'
                                })
 

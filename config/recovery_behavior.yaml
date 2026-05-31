@@ -12,11 +12,16 @@ clear_costmap:
   invert_area_to_clear: true
 #  both, local, global
   affected_maps: both
-  # static_layer removed: clearing the static map only blanks real mapped walls
-  # for a single update cycle (it reloads from /navi_manager/map immediately) and
-  # can briefly let the planner cut through a wall. Map "ghosts" must be fixed in
-  # the map itself, not worked around via costmap clearing.
-  layer_names: [laser_layer]
+  # static_layer is intentionally NOT cleared: blanking the mapped walls for a
+  # single cycle (they reload from /navi_manager/map immediately) can briefly let
+  # the planner cut through a wall. Map "ghosts" must be fixed in the map itself.
+  # We clear the LIVE obstacle layers instead. These are the actual plugin names
+  # in both the local and (newly) global costmaps. The previous value
+  # [laser_layer] matched no plugin in any costmap, so this recovery was a no-op.
+  # Note: obstacles come from self-decaying source maps, so a clear only blanks
+  # them for one cycle; it mainly helps reset a momentarily stuck cell before a
+  # retry. Persistent obstacles are handled by the DETOUR logic in mower_smach.
+  layer_names: [lidar_costmap_layer, cloud_costmap_layer, obstacle_layer]
 
 clear_costmap_laser:
   reset_distance: 1
@@ -24,7 +29,7 @@ clear_costmap_laser:
   invert_area_to_clear: false
 #  both, local, global
   affected_maps: both
-  layer_names: [laser_layer]
+  layer_names: [lidar_costmap_layer, cloud_costmap_layer, obstacle_layer]
 
 clear_costmap_static:
   reset_distance: 2

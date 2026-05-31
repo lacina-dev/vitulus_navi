@@ -13,7 +13,10 @@
         </node>
     </group>
 
-    <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="log" />
+    <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="log">
+        <!-- Rain gating + other config: see config/mower_smach.yaml and helpers.get_weather_config -->
+        <rosparam command="load" file="$(find vitulus_navi)/config/mower_smach.yaml"/>
+    </node>
     <node name="node_smach_exe_path" pkg="vitulus_navi" type="smach_exe_path" respawn="true" respawn_delay="1" output="log" />
     <node name="node_exe_goal" pkg="vitulus_navi" type="smach_exe_goal" respawn="true" respawn_delay="1" output="log" />
 

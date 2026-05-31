@@ -19,11 +19,14 @@ from .states import WaitForTopic, WaitForDockedState, CheckForDockPoint
 class CriticalErrorState(smach.State):
     """Route critical errors: either try docking or go directly to TERMINAL.
 
-    If the error reason is NAVIGATION_ABORTED or DOCKING_* (meaning the robot
-    can't navigate/dock reliably), skip docking and go terminal.
-    For other reasons (e.g. BLOCKED_FAILED), attempt one more dock.
+    If the error reason is a DOCKING_* failure (meaning the robot already tried
+    and failed to dock), skip docking and go terminal to avoid an endless loop.
+    For all other reasons (BLOCKED_FAILED, NAVIGATION_ABORTED, ...), attempt a
+    return to dock first — a single un-mowable line must NOT strand the robot in
+    the field. If that docking attempt also fails, WAIT_FOR_DOCKED sets a
+    DOCKING_* reason and we come back here, which then routes to terminal.
     """
-    NO_DOCK_REASONS = ('NAVIGATION_ABORTED', 'DOCKING_TIMEOUT', 'DOCKING_FAILED')
+    NO_DOCK_REASONS = ('DOCKING_TIMEOUT', 'DOCKING_FAILED')
 
     def __init__(self, pubs):
         smach.State.__init__(self,
@@ -107,6 +110,70 @@ class TerminalErrorState(smach.State):
                 last_buzzer = rospy.Time.now()
 
         # rospy shutdown
+        return 'preempted'
+
+
+# ===========================================================================
+# STOPPED state (recoverable pause after an external STOP signal)
+# ===========================================================================
+
+class StoppedState(smach.State):
+    """Recoverable pause after an external STOP signal.
+
+    Unlike TERMINAL_ERROR this is NOT a quarantine/error. The robot simply
+    holds position: motion was already cancelled by the preempt and the blade
+    by the GLOBAL_STOP handler. It then waits to be re-armed so there is always
+    a way out (no dead-end loop).
+
+    On /mower_smach/reset True it clears the STOP latch and returns to
+    WAIT_FOR_PROGRAM, from where a new or unfinished program resumes the
+    mission where it left off.
+    """
+    STATUS_INTERVAL = 15.0
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['resume', 'preempted'],
+                             input_keys=['error_reason'],
+                             output_keys=['error_reason'])
+        self.pubs = pubs
+        # Own publisher so we can clear a possibly-stuck STOP on resume.
+        self._stop_pub = rospy.Publisher('/mower_smach/stop', Bool,
+                                         queue_size=1, latch=True)
+
+    def execute(self, userdata):
+        rospy.logwarn("[STOPPED] Paused by STOP signal. Holding position.")
+        self.pubs.log_info.publish(String(
+            "Stopped. Resume via /mower_smach/reset."))
+        self.pubs.smach_status.publish(String("Stopped"))
+        self.pubs.stop_reason.publish(String("stopped:user_stop"))
+
+        # Make sure we are mechanically safe (idempotent — usually already done).
+        safe_blade_shutdown(source='STOPPED', pubs=self.pubs)
+        self.pubs.mower_set_power.publish(Bool(False))
+
+        last_status = rospy.Time.now()
+        while not rospy.is_shutdown():
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            try:
+                msg = rospy.wait_for_message('/mower_smach/reset', Bool, timeout=1.0)
+                if msg.data:
+                    rospy.loginfo("[STOPPED] Reset received -> re-arming")
+                    # Clear any stuck STOP so the restarted mission is not
+                    # immediately preempted again.
+                    self._stop_pub.publish(Bool(False))
+                    self.pubs.log_info.publish(String("Resumed from stop."))
+                    self.pubs.smach_status.publish(String("Ready"))
+                    return 'resume'
+            except rospy.ROSException:
+                pass
+
+            if (rospy.Time.now() - last_status).to_sec() >= self.STATUS_INTERVAL:
+                self.pubs.smach_status.publish(String("Stopped"))
+                last_status = rospy.Time.now()
+
         return 'preempted'
 
 

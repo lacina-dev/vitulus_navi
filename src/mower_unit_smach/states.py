@@ -249,11 +249,13 @@ class PreStartCheck(smach.State):
                 rospy.logwarn("[PRE_START_CHECK] Weather data unavailable, proceeding")
 
         # --- Battery check ---
+        min_start_pct = int(rospy.get_param('~battery_min_start_pct', 40))
         try:
             pm = rospy.wait_for_message('/pm/power_status', Power_status, timeout=5.0)
-            if pm.battery_capacity < 40:
+            if pm.battery_capacity < min_start_pct:
                 self.pubs.log_info.publish(String(
-                    "Start rejected: battery {}% < 40%".format(pm.battery_capacity)))
+                    "Start rejected: battery {}% < {}%".format(
+                        pm.battery_capacity, min_start_pct)))
                 self.pubs.smach_status.publish(String("Rejected: low battery"))
                 self.pubs.stop_reason.publish(String("rejected:battery"))
                 return 'rejected'
@@ -528,18 +530,21 @@ class WindowPlannerPath(smach.State):
                                          'index_path', 'program'],
                              output_keys=['path_chunk', 'path_window_start_index', 'program',
                                           'path_chunk_trim_count'])
-        self.window_size = 200
-        self.fallback_step = 100
-        self.end_tolerance = 0.4
-        self.tail_indices = 5
+        self.window_size = int(rospy.get_param('~window_size', 200))
+        self.fallback_step = int(rospy.get_param('~window_fallback_step', 100))
+        self.end_tolerance = float(rospy.get_param('~window_end_tolerance', 0.4))
+        self.tail_indices = int(rospy.get_param('~window_tail_indices', 5))
         self.pubs = pubs
         # --- Costmap goal guard ---
         # Segmentisation is ~0.03 m/pose (see GetPathData / segmentize_raw_path).
         self._check_path = rospy.ServiceProxy(
             '/move_base_flex/check_path_cost', CheckPath)
-        self.guard_safety_poses = 13   # ~0.40 m: end a chunk this far before an obstacle
-        self.guard_detour_poses = 16   # ~0.50 m: closer than this -> global detour now
-        self.guard_tail_poses = 23     # ~0.70 m: free run past obstacle below this -> trim
+        # ~0.40 m: end a chunk this far before an obstacle
+        self.guard_safety_poses = int(rospy.get_param('~guard_safety_poses', 13))
+        # ~0.50 m: closer than this -> global detour now
+        self.guard_detour_poses = int(rospy.get_param('~guard_detour_poses', 16))
+        # ~0.70 m: free run past obstacle below this -> trim
+        self.guard_tail_poses = int(rospy.get_param('~guard_tail_poses', 23))
 
     def _first_lethal_index(self, chunk):
         """Local index of the first LETHAL pose on *chunk* per the global
@@ -709,7 +714,17 @@ class ExecutePathWithFeedback(smach.State):
         self.pubs = pubs
         self._feedback_sub = None
         self.last_feedback = None
-        self.step_size = 100
+        self.step_size = int(rospy.get_param('~exe_step_size', 100))
+        # Tunables (defaults = the class constants above); read once at construction.
+        self.STALL_TIME = float(rospy.get_param('~exe_stall_time', self.STALL_TIME))
+        self.STALL_MOVE_EPS = float(rospy.get_param('~exe_stall_move_eps', self.STALL_MOVE_EPS))
+        self.STALL_SAMPLE_DT = float(rospy.get_param('~exe_stall_sample_dt', self.STALL_SAMPLE_DT))
+        self.PROGRESS_EPS = float(rospy.get_param('~exe_progress_eps', self.PROGRESS_EPS))
+        # Re-window when this close to a (non-last) chunk goal.
+        self.near_chunk_end_dist = float(rospy.get_param('~exe_near_chunk_end_dist', 0.6))
+        # No-goal-progress: probe costmap after this long, give up after the longer one.
+        self.goal_stall_obstacle_s = float(rospy.get_param('~exe_goal_stall_obstacle_s', 3.0))
+        self.goal_stall_time = float(rospy.get_param('~exe_goal_stall_time', 6.0))
         # Live costmap probe: on a stall/abort, tells us whether an obstacle is
         # actually sitting on the line ahead so we can route straight to a global
         # detour instead of the slow dynamic-obstacle recovery / re-window loop.
@@ -826,7 +841,7 @@ class ExecutePathWithFeedback(smach.State):
                 # up. Re-windowing a little earlier hands the last 0.6m to the
                 # next (robot-anchored) chunk, so nothing is left un-mown.
                 if (not is_last_chunk and self.last_feedback
-                        and self.last_feedback.dist_to_goal < 0.6):
+                        and self.last_feedback.dist_to_goal < self.near_chunk_end_dist):
                     rospy.loginfo("[EXE] near chunk end (dist_to_goal=%.2f) -> replan window",
                                   self.last_feedback.dist_to_goal)
                     self._client.cancel_goal()
@@ -849,7 +864,7 @@ class ExecutePathWithFeedback(smach.State):
                         # live costmap confirms a real obstacle on the line ahead,
                         # go around it -- no need to "dance" the full 6 s first.
                         # (Probe throttled to 1 Hz.)
-                        if stuck > 3.0 and (now - last_obs_check_time).to_sec() > 1.0:
+                        if stuck > self.goal_stall_obstacle_s and (now - last_obs_check_time).to_sec() > 1.0:
                             last_obs_check_time = now
                             if self._obstacle_ahead(chunk, last_xy):
                                 self._client.cancel_goal()
@@ -857,7 +872,7 @@ class ExecutePathWithFeedback(smach.State):
                                 rospy.logwarn("[EXE] no goal progress %.1fs + obstacle on "
                                               "line -> detour", stuck)
                                 return 'detour'
-                        if stuck > 6.0:
+                        if stuck > self.goal_stall_time:
                             elapsed_d = (now - t_start).to_sec()
                             self._client.cancel_goal()
                             self._client.wait_for_result(rospy.Duration(0.5))
@@ -1023,6 +1038,11 @@ class DetourAroundObstacle(smach.State):
                                          'zone_name', 'index_path', 'program'],
                              output_keys=['path_window_start_index', 'program'])
         self.pubs = pubs
+        # Tunables (defaults = the class constants above).
+        self.REJOIN_DISTANCES_M = tuple(
+            rospy.get_param('~detour_rejoin_distances_m', list(self.REJOIN_DISTANCES_M)))
+        self.GET_PATH_TOLERANCE = float(
+            rospy.get_param('~detour_get_path_tolerance', self.GET_PATH_TOLERANCE))
         self._get_path = actionlib.SimpleActionClient(
             '/move_base_flex/get_path', GetPathAction)
         self._exe_path = actionlib.SimpleActionClient(

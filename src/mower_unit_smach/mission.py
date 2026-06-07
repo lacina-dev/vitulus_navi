@@ -529,7 +529,9 @@ def _build_process_zone_sm(pubs, zone_it):
                                })
 
         smach.StateMachine.add('RG_GET_PATH_TO_START',
-                               RetryLimitedAction('retry_get_path_to_start', max_retries=3),
+                               RetryLimitedAction('retry_get_path_to_start',
+                                                  max_retries=int(rospy.get_param(
+                                                      '~retry_get_path_to_start_max', 3))),
                                transitions={'retry': 'GET_PATH_TO_START',
                                             'give_up': 'aborted',
                                             'preempted': 'preempted'})
@@ -768,7 +770,9 @@ def _build_process_path_sm(pubs, path_it):
                                })
 
         smach.StateMachine.add('RG_GET_PATH_TO_BEGIN',
-                               RetryLimitedAction('retry_get_path_to_begin', max_retries=3),
+                               RetryLimitedAction('retry_get_path_to_begin',
+                                                  max_retries=int(rospy.get_param(
+                                                      '~retry_get_path_to_begin_max', 3))),
                                transitions={'retry': 'GET_PATH_TO_BEGIN',
                                             'give_up': 'continue_path',
                                             'preempted': 'preempted'})
@@ -827,7 +831,9 @@ def _build_process_path_sm(pubs, path_it):
                                             'preempted': 'preempted'})
 
         smach.StateMachine.add('RG_EXE_TO_BEGIN',
-                               RetryLimitedAction('retry_exe_to_begin', max_retries=3),
+                               RetryLimitedAction('retry_exe_to_begin',
+                                                  max_retries=int(rospy.get_param(
+                                                      '~retry_exe_to_begin_max', 3))),
                                transitions={'retry': 'EXE_PATH_TO_BEGIN',
                                             'give_up': 'continue_path',
                                             'preempted': 'preempted'})
@@ -940,7 +946,7 @@ def _build_process_path_sm(pubs, path_it):
         # consecutive un-mowable lines with no successful mowing in between (the
         # counter is reset on every genuine full-chunk completion) do we give up
         # and raise a navigation error — which now tries a return to dock first.
-        MAX_CONSECUTIVE_UNMOWABLE = 5
+        MAX_CONSECUTIVE_UNMOWABLE = int(rospy.get_param('~max_consecutive_unmowable', 5))
 
         @smach.cb_interface(input_keys=['consecutive_nav_failures', 'zone_name',
                                         'index_path', 'paths'],

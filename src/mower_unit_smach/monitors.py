@@ -32,11 +32,14 @@ def weather_monitor_cb(userdata, msg):
 def battery_monitor_cb(userdata, msg):
     """Monitor /pm/power_status (vitulus_msgs/Power_status).
 
-    Pravidlo 3: Trigger return-to-dock if battery_capacity <= 25%.
+    Pravidlo 3: Trigger return-to-dock if battery_capacity <= return threshold.
+    Threshold is configurable (~battery_return_pct); read per message so a live
+    `rosparam set` takes effect without restarting the node.
     """
-    if msg.battery_capacity <= 25:
-        rospy.logwarn("[BATTERY_MONITOR] Battery capacity=%d%% <= 25%%",
-                      msg.battery_capacity)
+    return_pct = int(rospy.get_param('~battery_return_pct', 25))
+    if msg.battery_capacity <= return_pct:
+        rospy.logwarn("[BATTERY_MONITOR] Battery capacity=%d%% <= %d%%",
+                      msg.battery_capacity, return_pct)
         return False
     return True
 

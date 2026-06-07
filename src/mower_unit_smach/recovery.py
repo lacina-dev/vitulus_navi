@@ -72,7 +72,8 @@ def build_blocked_recovery_sm(pubs):
                                             'preempted': 'preempted'})
 
         smach.StateMachine.add('PHASE1_WAIT_RUN',
-                               WaitForMowerStatus('RUN', timeout=5.0),
+                               WaitForMowerStatus('RUN', timeout=float(rospy.get_param(
+                                   '~blocked_wait_run_timeout', 5.0))),
                                transitions={
                                    'reached': 'recovered',
                                    'error': 'PHASE1_RETRY',
@@ -81,7 +82,9 @@ def build_blocked_recovery_sm(pubs):
                                })
 
         smach.StateMachine.add('PHASE1_RETRY',
-                               RetryLimitedAction('blocked_phase1_count', max_retries=2),
+                               RetryLimitedAction('blocked_phase1_count',
+                                                  max_retries=int(rospy.get_param(
+                                                      '~blocked_phase1_retries', 2))),
                                transitions={
                                    'retry': 'PHASE1_STOP',
                                    'give_up': 'PHASE2_RAISE',
@@ -112,7 +115,8 @@ def build_blocked_recovery_sm(pubs):
                                             'preempted': 'preempted'})
 
         smach.StateMachine.add('PHASE2_WAIT_HEIGHT',
-                               WaitForMowerStatus('READY', timeout=60.0),
+                               WaitForMowerStatus('READY', timeout=float(rospy.get_param(
+                                   '~blocked_wait_height_timeout', 60.0))),
                                transitions={
                                    'reached': 'PHASE2_START_MOTOR',
                                    'error': 'PHASE2_RETRY',
@@ -132,7 +136,8 @@ def build_blocked_recovery_sm(pubs):
                                             'preempted': 'preempted'})
 
         smach.StateMachine.add('PHASE2_WAIT_RUN',
-                               WaitForMowerStatus('RUN', timeout=5.0),
+                               WaitForMowerStatus('RUN', timeout=float(rospy.get_param(
+                                   '~blocked_wait_run_timeout', 5.0))),
                                transitions={
                                    'reached': 'PHASE2_RECOVERED',
                                    'error': 'PHASE2_RETRY',
@@ -154,7 +159,9 @@ def build_blocked_recovery_sm(pubs):
                                transitions={'done': 'recovered'})
 
         smach.StateMachine.add('PHASE2_RETRY',
-                               RetryLimitedAction('blocked_phase2_count', max_retries=2),
+                               RetryLimitedAction('blocked_phase2_count',
+                                                  max_retries=int(rospy.get_param(
+                                                      '~blocked_phase2_retries', 2))),
                                transitions={
                                    'retry': 'PHASE2_RAISE',
                                    'give_up': 'PHASE3_ESCAPE',
@@ -173,6 +180,11 @@ def build_blocked_recovery_sm(pubs):
                 smach.State.__init__(self,
                                      outcomes=['motor_ok', 'motor_failed', 'nav_failed', 'preempted'],
                                      input_keys=['path', 'path_window_start_index'])
+                # Tunables (defaults = the class constants above).
+                self.ESCAPE_POSES = int(rospy.get_param(
+                    '~blocked_escape_poses', self.ESCAPE_POSES))
+                self.MOTOR_WAIT_TIMEOUT = float(rospy.get_param(
+                    '~blocked_escape_motor_wait_timeout', self.MOTOR_WAIT_TIMEOUT))
                 self._client = actionlib.SimpleActionClient(
                     '/move_base_flex/exe_path', ExePathAction)
                 self._client.wait_for_server(rospy.Duration(5.0))
@@ -315,6 +327,8 @@ def build_nav_recovery_sm(pubs):
 
             def __init__(self):
                 smach.State.__init__(self, outcomes=['done', 'preempted'])
+                self.WAIT_SECONDS = int(rospy.get_param(
+                    '~nav_blade_off_wait_s', self.WAIT_SECONDS))
 
             def execute(self, userdata):
                 rospy.loginfo("[NAV_RECOVERY] Stopping blade, waiting %ds", self.WAIT_SECONDS)
@@ -422,6 +436,11 @@ def build_nav_recovery_sm(pubs):
 
             def __init__(self):
                 smach.State.__init__(self, outcomes=['done', 'preempted'])
+                # Tunables (defaults = the class constants above).
+                self.BACKUP_SPEED = float(rospy.get_param(
+                    '~nav_backup_speed', self.BACKUP_SPEED))
+                self.BACKUP_DISTANCE = float(rospy.get_param(
+                    '~nav_backup_distance', self.BACKUP_DISTANCE))
                 self._cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
 
             def execute(self, userdata):
@@ -455,7 +474,9 @@ def build_nav_recovery_sm(pubs):
         # itself -> hand off to DETOUR (route around it and rejoin the line)
         # instead of abandoning the whole line here.
         smach.StateMachine.add('NAV_RETRY_GATE',
-                               RetryLimitedAction('nav_retry_count', max_retries=2),
+                               RetryLimitedAction('nav_retry_count',
+                                                  max_retries=int(rospy.get_param(
+                                                      '~nav_retry_max', 2))),
                                transitions={
                                    'retry': 'NAV_BACKUP',
                                    'give_up': 'detour_needed',

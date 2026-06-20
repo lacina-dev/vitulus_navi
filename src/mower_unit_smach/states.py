@@ -714,7 +714,6 @@ class ExecutePathWithFeedback(smach.State):
         self.pubs = pubs
         self._feedback_sub = None
         self.last_feedback = None
-        self.step_size = int(rospy.get_param('~exe_step_size', 100))
         # Tunables (defaults = the class constants above); read once at construction.
         self.STALL_TIME = float(rospy.get_param('~exe_stall_time', self.STALL_TIME))
         self.STALL_MOVE_EPS = float(rospy.get_param('~exe_stall_move_eps', self.STALL_MOVE_EPS))
@@ -772,7 +771,12 @@ class ExecutePathWithFeedback(smach.State):
         n_full = len(userdata.path.poses) if userdata.path else 0
         start_idx = int(userdata.path_window_start_index or 0)
         n_chunk = len(chunk.poses) if chunk and chunk.poses else 0
-        is_last_chunk = (start_idx + self.step_size) >= n_full
+        # "Last" iff the chunk actually reaches the end of the line. (Was
+        # start_idx + exe_step_size with step 100 vs window_size 200, which
+        # mis-classified final chunks of 100-200 poses as non-last and cost an
+        # extra cancel + mini-chunk at those line ends.) A chunk trimmed by the
+        # costmap goal guard correctly stays non-last.
+        is_last_chunk = n_chunk > 0 and (start_idx + n_chunk) >= n_full
 
         goal_xy = (None, None)
         if n_chunk:
@@ -1013,7 +1017,8 @@ class DetourAroundObstacle(smach.State):
          WINDOW_PLANNER_PATH resumes mowing from the rejoin pose.
 
     Only the short span right next to the obstacle stays un-mown; the rest of the
-    line is preserved.
+    line is preserved. The bypassed span is recorded in userdata.skipped_spans
+    so RemowSkippedSpans can re-attempt it once at the end of the zone.
 
     Outcomes:
       - 'resumed':    detour driven, rejoined the line (blade back on)
@@ -1035,8 +1040,10 @@ class DetourAroundObstacle(smach.State):
         smach.State.__init__(self,
                              outcomes=['resumed', 'no_detour', 'preempted'],
                              input_keys=['path', 'path_window_start_index',
-                                         'zone_name', 'index_path', 'program'],
-                             output_keys=['path_window_start_index', 'program'])
+                                         'zone_name', 'index_path', 'program',
+                                         'skipped_spans'],
+                             output_keys=['path_window_start_index', 'program',
+                                          'skipped_spans'])
         self.pubs = pubs
         # Tunables (defaults = the class constants above).
         self.REJOIN_DISTANCES_M = tuple(
@@ -1152,6 +1159,14 @@ class DetourAroundObstacle(smach.State):
             userdata.program.last_result = (
                 'failed: on_path-{}-{}-{}'.format(
                     userdata.zone_name, userdata.index_path, target_idx))
+            # Remember the bypassed span (copies of the pose slice — the path
+            # object is rebuilt per line) for the end-of-zone re-mow pass.
+            spans = list(userdata.skipped_spans or [])
+            spans.append({'zone': userdata.zone_name,
+                          'path_idx': int(userdata.index_path),
+                          'poses': list(poses[start_idx:target_idx + 1]),
+                          'reason': 'detour'})
+            userdata.skipped_spans = spans
             self.pubs.mower_set_motor_on.publish(Bool(True))
             rospy.sleep(1.0)
             self.pubs.log_info.publish(String("Rejoined mowing line after obstacle"))
@@ -1164,6 +1179,170 @@ class DetourAroundObstacle(smach.State):
                       start_idx)
         self.pubs.log_info.publish(String("No detour possible around obstacle"))
         return 'no_detour'
+
+
+# ===========================================================================
+# End-of-zone re-mow of skipped spans
+# ===========================================================================
+
+class RemowSkippedSpans(smach.State):
+    """Second pass over spans skipped during mowing, run at the end of a zone.
+
+    Spans are recorded by DetourAroundObstacle (the bypassed section of the
+    line) and by the NAV_RECOVERY blade-off traverse. One best-effort attempt
+    per span: if the live costmap still shows an obstacle on it, or the travel
+    or the mowing run fails, the span is dropped for good — no recovery/detour
+    recursion and no re-recording, so this state always terminates.
+
+    Runs with the blade already on (same as inter-line travel within a zone);
+    spans still showing an obstacle are filtered out by the costmap check, so
+    the blade-off-near-obstacle principle is preserved. A BLOCKED motor aborts
+    the whole pass (SET_MOTOR_OFF_AND_HOME right after does the safe shutdown).
+
+    Enable/disable via ~remow_enabled (read per zone, live rosparam works).
+
+    Outcomes: 'done', 'preempted'
+    """
+
+    GET_PATH_TOLERANCE = 0.25
+    MIN_ACTION_TIMEOUT = 30.0   # s; lower bound for travel/mow action timeouts
+    ASSUMED_SPEED = 0.08        # m/s; pessimistic speed for timeout sizing
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['done', 'preempted'],
+                             input_keys=['skipped_spans', 'zone_name'],
+                             output_keys=['skipped_spans'])
+        self.pubs = pubs
+        self._get_path = actionlib.SimpleActionClient(
+            '/move_base_flex/get_path', GetPathAction)
+        self._exe_path = actionlib.SimpleActionClient(
+            '/move_base_flex/exe_path', ExePathAction)
+        self._get_path.wait_for_server(rospy.Duration(5.0))
+        self._exe_path.wait_for_server(rospy.Duration(5.0))
+        self._check_path = rospy.ServiceProxy(
+            '/move_base_flex/check_path_cost', CheckPath)
+        self._mower_status = None
+        rospy.Subscriber('/mower/status', Mower, self._mower_status_cb)
+
+    def _mower_status_cb(self, msg):
+        self._mower_status = msg
+
+    def _run_action(self, client, goal, timeout_s):
+        """Send goal and wait. Returns 'ok' | 'fail' | 'blocked' | 'preempted'."""
+        client.send_goal(goal)
+        deadline = rospy.Time.now() + rospy.Duration(timeout_s)
+        while client.get_state() in [actionlib.GoalStatus.PENDING,
+                                     actionlib.GoalStatus.ACTIVE]:
+            if self.preempt_requested():
+                client.cancel_goal()
+                return 'preempted'
+            if self._mower_status and self._mower_status.status == 'BLOCKED':
+                client.cancel_goal()
+                client.wait_for_result(rospy.Duration(1.0))
+                return 'blocked'
+            if rospy.is_shutdown() or rospy.Time.now() > deadline:
+                client.cancel_goal()
+                client.wait_for_result(rospy.Duration(1.0))
+                return 'fail'
+            rospy.sleep(0.2)
+        result = client.get_result()
+        outcome = getattr(result, 'outcome', None) if result is not None else None
+        return 'ok' if outcome == 0 else 'fail'
+
+    def _attempt_span(self, span):
+        """One attempt at a single span. Returns 'ok'|'fail'|'blocked'|'preempted'."""
+        poses = span.get('poses') or []
+        if len(poses) < 2:
+            return 'fail'
+        span_path = Path()
+        span_path.header.frame_id = 'map'
+        span_path.header.stamp = rospy.Time.now()
+        span_path.poses = poses
+        span_len_m = (len(poses) - 1) * 0.03
+
+        # Still blocked? Then keep clear of it — blade is running.
+        if first_lethal_index(self._check_path, span_path) >= 0:
+            rospy.loginfo('[REMOW] span path=%s len=%.1fm still blocked -> dropped',
+                          span.get('path_idx'), span_len_m)
+            return 'fail'
+
+        # Travel to the span start.
+        gp_goal = GetPathGoal()
+        gp_goal.use_start_pose = False
+        gp_goal.tolerance = self.GET_PATH_TOLERANCE
+        gp_goal.target_pose = PoseStamped()
+        gp_goal.target_pose.header.frame_id = 'map'
+        gp_goal.target_pose.header.stamp = rospy.Time.now()
+        gp_goal.target_pose.pose = poses[0].pose
+        status = self._run_action(self._get_path, gp_goal, self.MIN_ACTION_TIMEOUT)
+        if status != 'ok':
+            return status
+        gp_res = self._get_path.get_result()
+        if not gp_res.path.poses:
+            return 'fail'
+        travel_len_m = (len(gp_res.path.poses) - 1) * 0.03
+        ep_goal = ExePathGoal()
+        ep_goal.path = gp_res.path
+        status = self._run_action(
+            self._exe_path, ep_goal,
+            max(self.MIN_ACTION_TIMEOUT, travel_len_m / self.ASSUMED_SPEED))
+        if status != 'ok':
+            return status
+
+        # Mow the span itself.
+        ep_goal = ExePathGoal()
+        ep_goal.path = span_path
+        return self._run_action(
+            self._exe_path, ep_goal,
+            max(self.MIN_ACTION_TIMEOUT, span_len_m / self.ASSUMED_SPEED))
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+
+        zone = userdata.zone_name
+        spans = list(userdata.skipped_spans or [])
+        mine = [s for s in spans if s.get('zone') == zone]
+        # This zone's spans are consumed now, whatever the attempts yield
+        # (one attempt each); spans of other zones are kept untouched.
+        userdata.skipped_spans = [s for s in spans if s.get('zone') != zone]
+
+        if not mine:
+            return 'done'
+        if not bool(rospy.get_param('~remow_enabled', True)):
+            rospy.loginfo('[REMOW] disabled (~remow_enabled=false); '
+                          'dropping %d span(s)', len(mine))
+            return 'done'
+
+        rospy.loginfo('[REMOW] zone=%s: %d skipped span(s) to re-mow', zone, len(mine))
+        self.pubs.log_info.publish(String(
+            "Re-mowing {} skipped span(s)".format(len(mine))))
+        self.pubs.smach_status.publish(String("Re-mowing skipped spans"))
+
+        ok = 0
+        for span in mine:
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            status = self._attempt_span(span)
+            rospy.loginfo('[REMOW] span path=%s reason=%s poses=%d -> %s',
+                          span.get('path_idx'), span.get('reason'),
+                          len(span.get('poses') or []), status)
+            if status == 'preempted':
+                self.service_preempt()
+                return 'preempted'
+            if status == 'blocked':
+                rospy.logwarn('[REMOW] mower BLOCKED -> aborting re-mow pass')
+                self.pubs.log_info.publish(String("Re-mow aborted: mower blocked"))
+                return 'done'
+            if status == 'ok':
+                ok += 1
+
+        self.pubs.log_info.publish(String(
+            "Re-mow done: {}/{} spans".format(ok, len(mine))))
+        return 'done'
 
 
 # ===========================================================================

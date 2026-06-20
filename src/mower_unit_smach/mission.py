@@ -28,7 +28,7 @@ from .states import (
     GetZoneData, GetPathData, CheckDistance, WindowPlannerPath, TrimAndRetry,
     ExecutePathWithFeedback, WaitForRpmReached, WaitForMowerOff,
     CheckIfDockedState, WaitForPlannerLoaded, WaitForDockedState,
-    CheckForDockPoint, DetourAroundObstacle)
+    CheckForDockPoint, DetourAroundObstacle, RemowSkippedSpans)
 from .monitors import (
     weather_monitor_cb, battery_monitor_cb, mower_temp_monitor_cb, stop_monitor_cb)
 from .recovery import build_blocked_recovery_sm, build_nav_recovery_sm
@@ -53,6 +53,7 @@ def build_wait_for_program(pubs):
         userdata.unfinished_active = False
         userdata.restore_height_pending = False
         userdata.consecutive_nav_failures = 0
+        userdata.skipped_spans = []
 
     def callback_program(userdata, msg):
         reinit_userdata(userdata)
@@ -114,7 +115,7 @@ def build_wait_for_program(pubs):
     all_keys = ['program', 'prg_start_time', 'unfinished_active',
                 'unfinished_zone', 'unfinished_path', 'path_window_start_index',
                 'path_chunk', 'unfinished_window', 'restore_height_pending',
-                'consecutive_nav_failures']
+                'consecutive_nav_failures', 'skipped_spans']
 
     cc = smach.Concurrence(
         outcomes=['program_received', 'preempted'],
@@ -160,7 +161,8 @@ def build_mission_child_sm(pubs):
         input_keys=['program', 'prg_start_time', 'unfinished_active',
                     'unfinished_zone', 'unfinished_path', 'unfinished_window',
                     'path_window_start_index', 'path_chunk', 'error_reason',
-                    'restore_height_pending', 'consecutive_nav_failures'],
+                    'restore_height_pending', 'consecutive_nav_failures',
+                    'skipped_spans'],
         output_keys=['program', 'prg_start_time', 'error_reason']
     )
 
@@ -184,6 +186,7 @@ def build_mission_child_sm(pubs):
     sm.userdata.consecutive_nav_failures = 0
     sm.userdata.restore_height_pending = False
     sm.userdata.error_reason = ''
+    sm.userdata.skipped_spans = []
 
     with sm:
 
@@ -405,11 +408,11 @@ def build_mission_child_sm(pubs):
                         'retry_get_path_to_start', 'retry_get_path_to_begin',
                         'retry_exe_to_begin', 'retry_planner',
                         'consecutive_nav_failures', 'restore_height_pending',
-                        'error_reason'],
+                        'error_reason', 'skipped_spans'],
             output_keys=['zone_cut_height', 'zone_rpm', 'zone_name',
                          'zone_start_pose', 'path_plan', 'paths',
                          'path_window_start_index', 'error_reason',
-                         'consecutive_nav_failures'],
+                         'consecutive_nav_failures', 'skipped_spans'],
             it=lambda: range(0, len(sm.userdata.program.zone_list)),
             it_label='index',
             exhausted_outcome='succeeded')
@@ -424,10 +427,28 @@ def build_mission_child_sm(pubs):
         smach.StateMachine.add('ZONE_IT', zone_it,
                                transitions={
                                    'succeeded': 'POWER_OFF_MOWER',
-                                   'aborted': 'POWER_OFF_MOWER',
+                                   'aborted': 'SET_ZONE_ABORT_REASON',
                                    'critical_failure': 'SET_ERROR_AND_ABORT',
                                    'preempted': 'preempted'
                                })
+
+        # Zone hard-failure (cut-height/RPM timeout, unreachable zone start...):
+        # must NOT go through POWER_OFF_MOWER — that would mark the program
+        # 'succeeded' and wipe the on_path resume checkpoint. Shut the blade
+        # down here and abort via the critical path instead: the robot still
+        # docks (CRITICAL_ERROR -> RETURN_TO_DOCK), the master sees critical:*
+        # and the saved checkpoint allows a later resume.
+        @smach.cb_interface(input_keys=['error_reason'], output_keys=['error_reason'],
+                            outcomes=['done'])
+        def set_zone_abort_cb(ud):
+            rospy.logerr('[ZONE_ABORTED] Zone processing failed; aborting mission')
+            safe_blade_shutdown(source='ZONE_ABORTED', pubs=pubs)
+            if not ud.error_reason:
+                ud.error_reason = 'ZONE_ABORTED'
+            return 'done'
+
+        smach.StateMachine.add('SET_ZONE_ABORT_REASON', smach.CBState(set_zone_abort_cb),
+                               transitions={'done': 'aborted'})
 
         # Set error_reason before aborting from critical failure
         @smach.cb_interface(input_keys=['error_reason'], output_keys=['error_reason'],
@@ -484,11 +505,11 @@ def _build_process_zone_sm(pubs, zone_it):
                     'retry_get_path_to_start', 'retry_get_path_to_begin',
                     'retry_exe_to_begin', 'retry_planner',
                     'consecutive_nav_failures', 'restore_height_pending',
-                    'error_reason'],
+                    'error_reason', 'skipped_spans'],
         output_keys=['zone_cut_height', 'zone_rpm', 'zone_name',
                      'zone_start_pose', 'path_plan', 'paths',
                      'path_window_start_index', 'error_reason',
-                     'consecutive_nav_failures'])
+                     'consecutive_nav_failures', 'skipped_spans'])
     process_zone_sm.userdata = zone_it.userdata
 
     with process_zone_sm:
@@ -643,10 +664,10 @@ def _build_process_zone_sm(pubs, zone_it):
                         'unfinished_zone', 'unfinished_path', 'unfinished_window',
                         'retry_get_path_to_begin', 'retry_exe_to_begin',
                         'retry_planner', 'consecutive_nav_failures',
-                        'restore_height_pending', 'error_reason'],
+                        'restore_height_pending', 'error_reason', 'skipped_spans'],
             output_keys=['path_plan', 'zone_cut_height', 'zone_rpm', 'zone_name',
                          'zone_start_pose', 'index_path', 'path_window_start_index',
-                         'consecutive_nav_failures', 'error_reason'],
+                         'consecutive_nav_failures', 'error_reason', 'skipped_spans'],
             it=lambda: range(0, len(process_zone_sm.userdata.paths)),
             it_label='index_path',
             exhausted_outcome='succeeded')
@@ -660,9 +681,18 @@ def _build_process_zone_sm(pubs, zone_it):
 
         smach.StateMachine.add('PATH_IT', path_it,
                                transitions={
-                                   'succeeded': 'SET_MOTOR_OFF_AND_HOME',
+                                   'succeeded': 'REMOW_SKIPPED',
                                    'aborted': 'SET_MOTOR_OFF_AND_HOME',
                                    'critical_failure': 'EMERGENCY_BLADE_OFF',
+                                   'preempted': 'preempted'
+                               })
+
+        # --- REMOW_SKIPPED (second pass over detour/recovery gaps) ---
+        # One best-effort attempt per recorded span, then the zone wraps up
+        # normally. Blade is still on/at zone height here.
+        smach.StateMachine.add('REMOW_SKIPPED', RemowSkippedSpans(pubs),
+                               transitions={
+                                   'done': 'SET_MOTOR_OFF_AND_HOME',
                                    'preempted': 'preempted'
                                })
 
@@ -721,10 +751,10 @@ def _build_process_path_sm(pubs, path_it):
                     'unfinished_window',
                     'retry_get_path_to_begin', 'retry_exe_to_begin',
                     'retry_planner', 'consecutive_nav_failures',
-                    'restore_height_pending', 'error_reason'],
+                    'restore_height_pending', 'error_reason', 'skipped_spans'],
         output_keys=['zone_cut_height', 'zone_rpm', 'zone_name', 'program',
                      'zone_start_pose', 'path_plan', 'path_window_start_index',
-                     'consecutive_nav_failures', 'error_reason'])
+                     'consecutive_nav_failures', 'error_reason', 'skipped_spans'])
     process_path_sm.userdata = path_it.userdata
 
     with process_path_sm:
@@ -1036,7 +1066,8 @@ def build_mission_concurrence(pubs, parent_sm):
     all_keys = ['program', 'prg_start_time', 'unfinished_active',
                 'unfinished_zone', 'unfinished_path', 'unfinished_window',
                 'path_window_start_index', 'path_chunk', 'error_reason',
-                'restore_height_pending', 'consecutive_nav_failures']
+                'restore_height_pending', 'consecutive_nav_failures',
+                'skipped_spans']
 
     cc = smach.Concurrence(
         outcomes=['mission_complete', 'weather_preempt', 'battery_preempt',

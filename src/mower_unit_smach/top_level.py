@@ -19,14 +19,15 @@ from .states import WaitForTopic, WaitForDockedState, CheckForDockPoint
 class CriticalErrorState(smach.State):
     """Route critical errors: either try docking or go directly to TERMINAL.
 
-    If the error reason is a DOCKING_* failure (meaning the robot already tried
-    and failed to dock), skip docking and go terminal to avoid an endless loop.
+    If the error reason is a DOCKING_* failure (meaning a docking attempt
+    already failed — couldn't dock, no DOCK point, no dock program), skip
+    docking and go terminal to avoid an endless loop.
     For all other reasons (BLOCKED_FAILED, NAVIGATION_ABORTED, ...), attempt a
     return to dock first — a single un-mowable line must NOT strand the robot in
-    the field. If that docking attempt also fails, WAIT_FOR_DOCKED sets a
-    DOCKING_* reason and we come back here, which then routes to terminal.
+    the field. If that docking attempt also fails, the RETURN_TO_DOCK sub-SM
+    sets a DOCKING_* reason and we come back here, which then routes to terminal.
     """
-    NO_DOCK_REASONS = ('DOCKING_TIMEOUT', 'DOCKING_FAILED')
+    NO_DOCK_PREFIX = 'DOCKING_'
 
     def __init__(self, pubs):
         smach.State.__init__(self,
@@ -46,7 +47,7 @@ class CriticalErrorState(smach.State):
         self.pubs.stop_reason.publish(String("critical:{}".format(reason.lower())))
         self.pubs.pm_play_melody.publish(Int16(1))
 
-        if reason in self.NO_DOCK_REASONS:
+        if reason.startswith(self.NO_DOCK_PREFIX):
             rospy.logerr("[CRITICAL_ERROR] Cannot dock safely (reason=%s) -> TERMINAL", reason)
             return 'terminal'
         rospy.logwarn("[CRITICAL_ERROR] Attempting return to dock...")
@@ -192,6 +193,11 @@ def build_return_to_dock_sm(pubs):
       5. Wait for docked
 
     Outcomes: 'succeeded', 'failed', 'preempted'
+
+    INVARIANT: every 'failed' outcome must leave a DOCKING_* error_reason in
+    userdata. CRITICAL_ERROR retries docking for any other reason, so a
+    'failed' without a DOCKING_* reason loops CRITICAL_ERROR <-> RETURN_TO_DOCK
+    forever.
     """
     sm = smach.StateMachine(
         outcomes=['succeeded', 'failed', 'preempted'],
@@ -222,9 +228,18 @@ def build_return_to_dock_sm(pubs):
         smach.StateMachine.add('CHECK_DOCK_POINT', CheckForDockPoint(pubs),
                                transitions={
                                    'dock_point_found': 'GET_DOCK_PROGRAM',
-                                   'no_dock_point': 'failed',
+                                   'no_dock_point': 'SET_NO_DOCK_POINT',
                                    'preempted': 'preempted'
                                })
+
+        @smach.cb_interface(input_keys=['error_reason'], output_keys=['error_reason'],
+                            outcomes=['done'])
+        def no_dock_point_cb(ud):
+            ud.error_reason = 'DOCKING_NO_DOCK_POINT'
+            return 'done'
+
+        smach.StateMachine.add('SET_NO_DOCK_POINT', smach.CBState(no_dock_point_cb),
+                               transitions={'done': 'failed'})
 
         # --- Get dock program ---
         def _on_dock_program(userdata, msg):
@@ -240,9 +255,18 @@ def build_return_to_dock_sm(pubs):
                                             on_match=_on_dock_program),
                                transitions={
                                    'received': 'SEND_DOCK_PROGRAM',
-                                   'timeout': 'failed',
+                                   'timeout': 'SET_NO_DOCK_PROGRAM',
                                    'preempted': 'preempted'
                                })
+
+        @smach.cb_interface(input_keys=['error_reason'], output_keys=['error_reason'],
+                            outcomes=['done'])
+        def no_dock_program_cb(ud):
+            ud.error_reason = 'DOCKING_NO_PROGRAM'
+            return 'done'
+
+        smach.StateMachine.add('SET_NO_DOCK_PROGRAM', smach.CBState(no_dock_program_cb),
+                               transitions={'done': 'failed'})
 
         # --- Send dock program ---
         @smach.cb_interface(input_keys=['dock_program'], outcomes=['done', 'preempted'])

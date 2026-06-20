@@ -300,16 +300,24 @@ def build_nav_recovery_sm(pubs):
     'detour_needed' so the caller can route AROUND the obstacle and rejoin the
     line downstream (DetourAroundObstacle).
 
+    A successful retry traverses the rest of the chunk with the blade OFF
+    (deliberate: obstacle may still be near). That blade-off span is recorded
+    in userdata.skipped_spans so RemowSkippedSpans re-attempts it once at the
+    end of the zone.
+
     Outcomes: 'recovered', 'detour_needed', 'critical_error', 'preempted'
-    Input keys: path_chunk, consecutive_nav_failures, zone_rpm
-    Output keys: consecutive_nav_failures
+    Input keys: path_chunk, consecutive_nav_failures, zone_rpm, zone_name,
+                index_path, skipped_spans
+    Output keys: consecutive_nav_failures, skipped_spans
     """
     sm = smach.StateMachine(
         outcomes=['recovered', 'detour_needed', 'critical_error', 'preempted'],
-        input_keys=['path_chunk', 'consecutive_nav_failures', 'zone_rpm'],
-        output_keys=['consecutive_nav_failures']
+        input_keys=['path_chunk', 'consecutive_nav_failures', 'zone_rpm',
+                    'zone_name', 'index_path', 'skipped_spans'],
+        output_keys=['consecutive_nav_failures', 'skipped_spans']
     )
     sm.userdata.nav_retry_count = 0
+    sm.userdata.recovery_entry_idx = 0
 
     with sm:
 
@@ -326,11 +334,22 @@ def build_nav_recovery_sm(pubs):
             WAIT_SECONDS = 6
 
             def __init__(self):
-                smach.State.__init__(self, outcomes=['done', 'preempted'])
+                smach.State.__init__(self, outcomes=['done', 'preempted'],
+                                     input_keys=['path_chunk'],
+                                     output_keys=['recovery_entry_idx'])
                 self.WAIT_SECONDS = int(rospy.get_param(
                     '~nav_blade_off_wait_s', self.WAIT_SECONDS))
 
             def execute(self, userdata):
+                # Remember where on the chunk the blade goes off: a successful
+                # retry drives from here to the chunk end blade-off, and that
+                # span is recorded for the end-of-zone re-mow.
+                entry_idx = 0
+                chunk = userdata.path_chunk
+                xy = get_robot_xy_in_map(timeout=0.5)
+                if xy is not None and chunk and chunk.poses:
+                    entry_idx = nearest_pose_index(chunk, xy[0], xy[1], hint_index=0)
+                userdata.recovery_entry_idx = entry_idx
                 rospy.loginfo("[NAV_RECOVERY] Stopping blade, waiting %ds", self.WAIT_SECONDS)
                 pubs.mower_set_motor_on.publish(Bool(False))
                 for _ in range(self.WAIT_SECONDS):
@@ -408,12 +427,33 @@ def build_nav_recovery_sm(pubs):
                                    'preempted': 'preempted'
                                })
 
-        @smach.cb_interface(input_keys=['consecutive_nav_failures'],
-                            output_keys=['consecutive_nav_failures'],
+        @smach.cb_interface(input_keys=['consecutive_nav_failures', 'path_chunk',
+                                        'recovery_entry_idx', 'zone_name',
+                                        'index_path', 'skipped_spans'],
+                            output_keys=['consecutive_nav_failures', 'skipped_spans'],
                             outcomes=['done'])
         def blade_on_cb(ud):
             pubs.mower_set_motor_on.publish(Bool(True))
             rospy.sleep(1.0)
+            # Record the blade-off traverse (entry point -> current position)
+            # for the end-of-zone re-mow pass.
+            chunk = ud.path_chunk
+            if chunk and chunk.poses:
+                start = int(ud.recovery_entry_idx or 0)
+                end = len(chunk.poses) - 1
+                xy = get_robot_xy_in_map(timeout=0.5)
+                if xy is not None:
+                    end = nearest_pose_index(chunk, xy[0], xy[1], hint_index=start)
+                if end > start:
+                    spans = list(ud.skipped_spans or [])
+                    spans.append({'zone': ud.zone_name,
+                                  'path_idx': int(ud.index_path),
+                                  'poses': list(chunk.poses[start:end + 1]),
+                                  'reason': 'nav_recovery'})
+                    ud.skipped_spans = spans
+                    rospy.loginfo("[NAV_RECOVERY] recorded blade-off span "
+                                  "[%d:%d] (%.1fm) for re-mow",
+                                  start, end, (end - start) * 0.03)
             # NOTE: consecutive_nav_failures is intentionally NOT reset here.
             # It is reset only after a *genuine* full-chunk completion in
             # ExecutePathWithFeedback. Resetting on every recovery retry let the

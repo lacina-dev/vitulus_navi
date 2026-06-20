@@ -60,7 +60,8 @@ guard_detour_poses: 16          # ~0.50 m: closer than this -> global detour now
 guard_tail_poses: 23            # ~0.70 m: free run past obstacle below this -> trim
 
 # --- Path execution (ExecutePathWithFeedback) -------------------------------
-exe_step_size: 100              # poses; used for last-chunk detection
+# (exe_step_size removed 2026-06-11: last-chunk detection now uses the actual
+#  chunk length instead of a fixed step.)
 exe_stall_time: 5.0             # s without motion -> stall
 exe_stall_move_eps: 0.08        # m; movement below this between samples = "stuck"
 exe_stall_sample_dt: 0.5        # s; TF sampling period for stall detection
@@ -75,6 +76,13 @@ detour_get_path_tolerance: 0.25  # m goal tolerance for the global detour plan
 
 # --- Escalation -------------------------------------------------------------
 max_consecutive_unmowable: 5    # consecutive un-mowable lines -> navigation error
+
+# --- End-of-zone re-mow (RemowSkippedSpans) ----------------------------------
+# Spans skipped during mowing (detour around an obstacle, blade-off recovery
+# traverse) get ONE re-mow attempt at the end of their zone. Spans whose
+# costmap still shows an obstacle are dropped without approaching them.
+# Read per zone, so a live `rosparam set` takes effect without restart.
+remow_enabled: true
 
 # --- "Go to start/begin" retries (mission flow) -----------------------------
 retry_get_path_to_start_max: 3  # GET_PATH_TO_START plan retries

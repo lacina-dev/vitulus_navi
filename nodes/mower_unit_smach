@@ -65,6 +65,7 @@ def main():
     sm.userdata.error_reason = ''
     sm.userdata.restore_height_pending = False
     sm.userdata.consecutive_nav_failures = 0
+    sm.userdata.skipped_spans = []
     # Retry counters
     sm.userdata.retry_get_path_to_start = 0
     sm.userdata.retry_get_path_to_begin = 0

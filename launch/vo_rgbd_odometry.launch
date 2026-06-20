@@ -29,10 +29,13 @@
     <param name="approx_sync"       type="bool"   value="$(arg approx_sync)"/>
     <param name="wait_for_transform_duration" type="double" value="0.2"/>
 
-    <!-- Keep VO purely relative; do not let it reset/teleport on tracking loss.
-         When it loses tracking (night / low texture) it reports lost in
-         odom_info, which the consumer uses to drop this source. -->
-    <param name="Odom/ResetCountdown" type="string" value="0"/>
+    <!-- Auto-reset after losing tracking so the node ALWAYS recovers when good
+         conditions return. With 0 (no reset) it stayed lost forever after a
+         single bad patch (e.g. sun / open area), so it never came back in the
+         shade. The consumer (navi_transform bridge) absorbs the reset jump: it
+         only uses this source while gated (low covariance) and refreshes its
+         reference every cycle. -->
+    <param name="Odom/ResetCountdown" type="string" value="1"/>
     <param name="Odom/Holonomic"      type="string" value="false"/>
     <param name="Reg/Force3DoF"       type="string" value="true"/>
     <param name="Vis/EstimationType"  type="string" value="1"/>   <!-- PnP (3D->2D) -->

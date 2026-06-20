@@ -27,7 +27,11 @@
     <param name="publish_tf"        type="bool"   value="false"/>
     <param name="wait_for_transform_duration" type="double" value="0.2"/>
 
-    <param name="Odom/ResetCountdown"     type="string" value="0"/>
+    <!-- Auto-reset after losing tracking so icp_odometry ALWAYS recovers when
+         structure/returns come back. With 0 it got permanently stuck lost
+         (corr=0) after an open/sun patch and never re-registered even with a
+         good 600-point scan. The bridge consumer absorbs the reset jump. -->
+    <param name="Odom/ResetCountdown"     type="string" value="1"/>
     <param name="Odom/Holonomic"          type="string" value="false"/>
     <param name="Reg/Strategy"            type="string" value="1"/>   <!-- ICP -->
     <param name="Reg/Force3DoF"           type="string" value="true"/>

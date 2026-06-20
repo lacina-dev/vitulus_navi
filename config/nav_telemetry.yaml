@@ -48,3 +48,13 @@ signals:
   # ---- navi_transform status -------------------------------------------
   - {name: navtf_status,  topic: /nav_tf/odom_status, type: vitulus_msgs/Navi_transform, field: "status"}
   - {name: navtf_info,    topic: /nav_tf/odom_status, type: vitulus_msgs/Navi_transform, field: "info"}
+  - {name: navtf_pos_flag, topic: /nav_tf/odom_status, type: vitulus_msgs/Navi_transform, field: "position"}
+  - {name: navtf_hdg_flag, topic: /nav_tf/odom_status, type: vitulus_msgs/Navi_transform, field: "heading"}
+
+  # ---- RTK heading quality (gates the GPS heading) ---------------------
+  - {name: gps_heading_cov, topic: /gnss_heading/navheading, type: sensor_msgs/Imu, field: "orientation_covariance[8]"}
+
+  # ---- commanded vs actual (null when no command is being sent) ---------
+  - {name: cmd_lin,     topic: /cmd_vel, type: geometry_msgs/Twist, field: "linear.x"}
+  - {name: cmd_ang,     topic: /cmd_vel, type: geometry_msgs/Twist, field: "angular.z"}
+  - {name: wheel_speed, topic: /mobile_base_controller/odom, type: nav_msgs/Odometry, field: "twist.twist.linear.x"}

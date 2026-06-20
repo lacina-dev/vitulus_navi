@@ -1,0 +1,9 @@
+<launch>
+  <!-- Navigation telemetry logger. Additive / passive: only subscribes and
+       writes a rotated JSONL log; it publishes nothing and changes no state.
+       Analyse the log live with scripts/nav_telemetry_analyze.py. -->
+  <arg name="config" default="$(find vitulus_navi)/config/nav_telemetry.yaml"/>
+  <node pkg="vitulus_navi" type="nav_telemetry" name="nav_telemetry" output="screen">
+    <param name="config" value="$(arg config)"/>
+  </node>
+</launch>

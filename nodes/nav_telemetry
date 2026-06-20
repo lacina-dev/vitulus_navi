@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""nav_telemetry - config-driven navigation telemetry logger.
+
+Subscribes to an arbitrary set of topics defined in a YAML config (see
+config/nav_telemetry.yaml), extracts named fields, and writes one JSON object
+per sample (JSONL) to a size-rotated log file. Built to be:
+
+  * watched / analysed live while the robot drives (see
+    scripts/nav_telemetry_analyze.py),
+  * extended by editing the YAML, not the code (add a signal -> add a key),
+  * safe on disk (rotating files with a hard cap),
+  * decoupled (uses runtime message-class lookup, so it needs no imports for
+    the message types it logs).
+
+Run:  rosrun vitulus_navi nav_telemetry _config:=<path>
+  or:  roslaunch vitulus_navi nav_telemetry.launch
+"""
+import os
+import re
+import json
+import time
+import logging
+from logging.handlers import RotatingFileHandler
+
+import rospy
+import yaml
+import roslib.message
+
+# one path token: name, optionally followed by [index]
+_TOKEN = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?$')
+
+
+def get_field(msg, path):
+    """Resolve a dotted/indexed field path against a ROS message. Returns None
+    if any step is missing (so a bad config entry logs null, not a crash)."""
+    cur = msg
+    for part in path.split('.'):
+        m = _TOKEN.match(part)
+        if not m:
+            return None
+        cur = getattr(cur, m.group(1), None)
+        if cur is None:
+            return None
+        if m.group(2) is not None:
+            try:
+                cur = cur[int(m.group(2))]
+            except (IndexError, TypeError, KeyError):
+                return None
+    return cur
+
+
+def jsonable(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+class NavTelemetry(object):
+    def __init__(self):
+        cfg_path = rospy.get_param('~config', '')
+        if not cfg_path or not os.path.isfile(cfg_path):
+            raise RuntimeError("nav_telemetry: ~config not set or not found: %r" % cfg_path)
+        with open(cfg_path, 'r') as fh:
+            cfg = yaml.safe_load(fh) or {}
+
+        self.signals = cfg.get('signals', []) or []
+        self.stale_after = float(cfg.get('stale_after_s', 1.0))
+        self.latest = {}        # name -> (value, rx_time)
+        self._warned = set()    # field paths already warned about
+
+        # group signals by (topic, type) so each topic is subscribed once
+        by_topic = {}
+        for s in self.signals:
+            by_topic.setdefault((s['topic'], s['type']), []).append(s)
+        for (topic, typ), sigs in by_topic.items():
+            cls = roslib.message.get_message_class(typ)
+            if cls is None:
+                rospy.logwarn("nav_telemetry: unknown msg type '%s' for %s (skipped)", typ, topic)
+                continue
+            rospy.Subscriber(topic, cls, self._make_cb(sigs), queue_size=20)
+
+        outdir = os.path.expanduser(cfg.get('output_dir', '/home/vitulus/nav_logs'))
+        os.makedirs(outdir, exist_ok=True)
+        self.path = os.path.join(outdir, cfg.get('file_prefix', 'nav_telemetry') + '.jsonl')
+        self._log = logging.getLogger('nav_telemetry_file')
+        self._log.setLevel(logging.INFO)
+        self._log.propagate = False
+        h = RotatingFileHandler(self.path,
+                                maxBytes=int(cfg.get('max_file_mb', 50)) * 1024 * 1024,
+                                backupCount=int(cfg.get('backup_count', 5)))
+        h.setFormatter(logging.Formatter('%(message)s'))
+        self._log.addHandler(h)
+
+        # a small header record so consumers know the schema / run boundary
+        self._log.info(json.dumps({
+            't': round(time.time(), 3), 'event': 'start',
+            'signals': [s['name'] for s in self.signals],
+        }))
+
+        rate = float(cfg.get('sample_rate_hz', 5.0))
+        rospy.loginfo("nav_telemetry: %d signals @ %.1f Hz -> %s", len(self.signals), rate, self.path)
+        rospy.Timer(rospy.Duration(1.0 / rate), self._sample)
+
+    def _make_cb(self, sigs):
+        def cb(msg):
+            now = time.time()
+            for s in sigs:
+                val = get_field(msg, s['field'])
+                if val is None and s['field'] not in self._warned:
+                    self._warned.add(s['field'])
+                    rospy.logwarn_throttle(30.0, "nav_telemetry: field '%s' on %s resolved to None",
+                                           s['field'], s['topic'])
+                self.latest[s['name']] = (val, now)
+        return cb
+
+    def _sample(self, event=None):
+        now = time.time()
+        rec = {'t': round(now, 3)}
+        for s in self.signals:
+            v, rx = self.latest.get(s['name'], (None, 0.0))
+            rec[s['name']] = jsonable(v) if (rx and (now - rx) <= self.stale_after) else None
+        self._log.info(json.dumps(rec))
+
+
+if __name__ == '__main__':
+    rospy.init_node('nav_telemetry')
+    try:
+        NavTelemetry()
+        rospy.spin()
+    except Exception as e:
+        rospy.logfatal("nav_telemetry failed: %s", e)
+        raise

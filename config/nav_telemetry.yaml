@@ -1,0 +1,50 @@
+# nav_telemetry — navigation telemetry logger configuration.
+#
+# The logger subscribes to every topic listed under `signals`, extracts the
+# named field, and writes one JSON object per sample to a size-rotated JSONL
+# file. To track a new attribute just add an entry here — no code changes.
+#
+# field path syntax: dotted access with optional [index], e.g.
+#   twist.twist.linear.x
+#   "position_covariance[0]"   (quote any value containing [ ] )
+# Unknown fields / stale topics are logged as null (so the schema stays stable).
+
+output_dir: /home/vitulus/nav_logs   # logs go here (created if missing)
+file_prefix: nav_telemetry           # -> nav_telemetry.jsonl (+ .1 .2 ... rotated)
+sample_rate_hz: 5.0                   # one JSONL record this often
+max_file_mb: 50                      # rotate at this size
+backup_count: 5                      # keep this many rotated files (cap ~ 50*5 MB)
+stale_after_s: 1.0                   # a signal with no fresh msg within this -> null
+
+signals:
+  # ---- motion -----------------------------------------------------------
+  - {name: speed,        topic: /odometry/odom, type: nav_msgs/Odometry, field: "twist.twist.linear.x"}
+  - {name: yaw_rate,     topic: /odometry/odom, type: nav_msgs/Odometry, field: "twist.twist.angular.z"}
+  - {name: pose_x,       topic: /odometry/odom, type: nav_msgs/Odometry, field: "pose.pose.position.x"}
+  - {name: pose_y,       topic: /odometry/odom, type: nav_msgs/Odometry, field: "pose.pose.position.y"}
+
+  # ---- GPS / RTK --------------------------------------------------------
+  - {name: gps_status,   topic: /gnss/fix, type: sensor_msgs/NavSatFix, field: "status.status"}
+  - {name: gps_cov_x,    topic: /gnss/fix, type: sensor_msgs/NavSatFix, field: "position_covariance[0]"}
+  - {name: gps_cov_y,    topic: /gnss/fix, type: sensor_msgs/NavSatFix, field: "position_covariance[4]"}
+  - {name: gps_cov_z,    topic: /gnss/fix, type: sensor_msgs/NavSatFix, field: "position_covariance[8]"}
+
+  # ---- visual odometry (d435) ------------------------------------------
+  - {name: vo_lost,      topic: /vo/odom_info, type: rtabmap_msgs/OdomInfo, field: "lost"}
+  - {name: vo_inliers,   topic: /vo/odom_info, type: rtabmap_msgs/OdomInfo, field: "inliers"}
+  - {name: vo_matches,   topic: /vo/odom_info, type: rtabmap_msgs/OdomInfo, field: "matches"}
+
+  # ---- lidar ICP odometry ----------------------------------------------
+  - {name: licp_lost,    topic: /licp/odom_info, type: rtabmap_msgs/OdomInfo, field: "lost"}
+  - {name: licp_ratio,   topic: /licp/odom_info, type: rtabmap_msgs/OdomInfo, field: "icpInliersRatio"}
+  - {name: licp_corr,    topic: /licp/odom_info, type: rtabmap_msgs/OdomInfo, field: "icpCorrespondences"}
+
+  # ---- bridge (Phase 1 shadow) -----------------------------------------
+  # bridge_status string already encodes gps_good / active source / div / per-source use
+  - {name: bridge_status, topic: /nav_tf/bridge_status, type: std_msgs/String, field: "data"}
+  - {name: bridge_x,      topic: /nav_tf/odom_bridge_preview, type: nav_msgs/Odometry, field: "pose.pose.position.x"}
+  - {name: bridge_y,      topic: /nav_tf/odom_bridge_preview, type: nav_msgs/Odometry, field: "pose.pose.position.y"}
+
+  # ---- navi_transform status -------------------------------------------
+  - {name: navtf_status,  topic: /nav_tf/odom_status, type: vitulus_msgs/Navi_transform, field: "status"}
+  - {name: navtf_info,    topic: /nav_tf/odom_status, type: vitulus_msgs/Navi_transform, field: "info"}

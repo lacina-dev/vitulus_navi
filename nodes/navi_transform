@@ -309,6 +309,12 @@ class NavTfNode:
         self._bridge_hyst = 3              # consecutive good samples before a source is trusted
         self._bridge_max_step = 0.3        # m; reject larger single-cycle deltas (reset/glitch jumps)
         self._bridge_max_yaw = 0.3         # rad; same, for rotation
+        # Wheel cross-check (Step B layer 1): a VO/lidar source is only trusted
+        # if its per-cycle motion is not WILDLY more than the wheels'. Asymmetric
+        # and generous (mult=3 + 5cm) so normal wheel slip is tolerated but gross
+        # runaway glitches (e.g. the observed 7 m jump) are rejected.
+        self._bridge_xcheck_mult = 3.0
+        self._bridge_xcheck_abs = 0.05     # m
 
     @staticmethod
     def _odom_xyyaw(msg):
@@ -353,6 +359,22 @@ class NavTfNode:
             s['good'] = 0
         return s['good'] >= self._bridge_hyst
 
+    def _step_dist(self, key):
+        """Per-cycle translation distance of a source (since last reference)."""
+        s = self._src[key]
+        if s['ref'] is None:
+            return None
+        return math.hypot(s['x'] - s['ref'][0], s['y'] - s['ref'][1])
+
+    def _wheel_consistent(self, key):
+        """Reject a source whose per-cycle motion runs away far beyond the wheels'
+        (glitch protection). Asymmetric: a source moving LESS than wheels is fine."""
+        wd = self._step_dist('wheel')
+        sd = self._step_dist(key)
+        if wd is None or sd is None:
+            return True
+        return sd <= self._bridge_xcheck_mult * wd + self._bridge_xcheck_abs
+
     def update_bridge_preview(self):
         now = rospy.Time.now().to_sec()
         # keep the wheel source fresh from the live wheel odom message
@@ -371,7 +393,7 @@ class NavTfNode:
         else:
             # GPS denied -> dead-reckon with the best gated source
             # (lowest-covariance visual/lidar; wheel/IMU as last resort)
-            cands = [k for k in ('vo', 'licp') if usable[k]]
+            cands = [k for k in ('vo', 'licp') if usable[k] and self._wheel_consistent(k)]
             active = min(cands, key=lambda k: self._src[k]['cov']) if cands else 'wheel'
             self._bridge_active = active
             s = self._src[active]

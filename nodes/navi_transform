@@ -307,6 +307,8 @@ class NavTfNode:
         self._bridge_cov_thresh = 1.0      # m^2; rtabmap inflates pose cov when tracking is lost
         self._bridge_fresh_s = 0.5         # a source older than this is considered stale
         self._bridge_hyst = 3              # consecutive good samples before a source is trusted
+        self._bridge_max_step = 0.3        # m; reject larger single-cycle deltas (reset/glitch jumps)
+        self._bridge_max_yaw = 0.3         # rad; same, for rotation
 
     @staticmethod
     def _odom_xyyaw(msg):
@@ -376,13 +378,19 @@ class NavTfNode:
             ref = s['ref']
             if ref is not None:
                 dx, dy, dyaw = s['x'] - ref[0], s['y'] - ref[1], self._wrap(s['yaw'] - ref[2])
-                # express the source delta in the robot frame at ref, then compose onto bridge
-                c, sn = math.cos(-ref[2]), math.sin(-ref[2])
-                lx, ly = c * dx - sn * dy, sn * dx + c * dy
-                bc, bs = math.cos(self._bridge['yaw']), math.sin(self._bridge['yaw'])
-                self._bridge['x'] += bc * lx - bs * ly
-                self._bridge['y'] += bs * lx + bc * ly
-                self._bridge['yaw'] = self._wrap(self._bridge['yaw'] + dyaw)
+                # Reject implausibly large single-cycle jumps. With auto-reset on,
+                # an odometry source teleports its frame to a new origin when it
+                # re-initialises; that shows up as a huge one-cycle delta. At 30 Hz
+                # even fast driving is < ~0.1 m/cycle, so anything beyond the clamp
+                # is a reset/glitch -> skip it (the reference is still refreshed
+                # below, so normal integration resumes next cycle).
+                if math.hypot(dx, dy) <= self._bridge_max_step and abs(dyaw) <= self._bridge_max_yaw:
+                    c, sn = math.cos(-ref[2]), math.sin(-ref[2])
+                    lx, ly = c * dx - sn * dy, sn * dx + c * dy
+                    bc, bs = math.cos(self._bridge['yaw']), math.sin(self._bridge['yaw'])
+                    self._bridge['x'] += bc * lx - bs * ly
+                    self._bridge['y'] += bs * lx + bc * ly
+                    self._bridge['yaw'] = self._wrap(self._bridge['yaw'] + dyaw)
 
         # advance every source's reference to current so source switching is seamless
         for k, s in self._src.items():

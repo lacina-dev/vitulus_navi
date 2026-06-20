@@ -12,6 +12,12 @@
         <arg name="map_topic" value="$(arg map_topic)"/>
     </include>
 
+    <!-- Phase 1 bridge odometry sources (VO + lidar ICP). Included in the nav
+         stack so they restart cleanly WITH it on every indoor/outdoor map
+         switch; running them standalone left stale state across the restart. -->
+    <include file="$(find vitulus_navi)/launch/vo_rgbd_odometry.launch"/>
+    <include file="$(find vitulus_navi)/launch/lidar_icp_odometry.launch"/>
+
     <!--    Proxy for interactive marker usage on web gui-->
     <node name="proxy" pkg="interactive_marker_proxy" type="proxy" args="topic_ns:=/interactive_marker target_frame:=/map"/>
 

@@ -14,7 +14,7 @@ from std_srvs.srv import Empty, EmptyResponse
 from vitulus_msgs.msg import Navi_transform
 from tf import TransformListener
 from vitulus_msgs.msg import Imu_status
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 from vitulus_navi.srv import Point_pose, Point_poseResponse
 import sys
 import serial
@@ -127,6 +127,18 @@ class NavTfNode:
         self.navi_indoor_sub = rospy.Subscriber("/navi_manager/is_indoor", Bool, self.callback_navi_indoor)
         self.set_pose_sub = rospy.Subscriber("/nav_tf/set_pose", PoseWithCovarianceStamped, self.callback_set_pose)
         self.set_dock_pose_sub = rospy.Subscriber("/nav_tf/set_dock_pose", Bool, self.callback_set_dock_pose)
+
+        # --- vitulus_ui Phase 1: shadow bridge preview (Step A) ----------------
+        # ADDITIVE / SHADOW ONLY: evaluates the VO (/vo/odom) and lidar
+        # (/licp/odom) odometry as gated relative-motion sources for bridging
+        # GPS-denied stretches, and publishes a *preview* pose + status. It does
+        # NOT modify the live /odometry/odom or any TF. See update_bridge_preview.
+        self.bridge_init_state()
+        self.vo_odom_sub = rospy.Subscriber("/vo/odom", Odometry, self.callback_vo_odom, queue_size=50)
+        self.licp_odom_sub = rospy.Subscriber("/licp/odom", Odometry, self.callback_licp_odom, queue_size=50)
+        self.bridge_preview_pub = rospy.Publisher("/nav_tf/odom_bridge_preview", Odometry, queue_size=20)
+        self.bridge_status_pub = rospy.Publisher("/nav_tf/bridge_status", String, queue_size=5)
+        # ----------------------------------------------------------------------
 
         self.tf2_Buffer = tf2_ros.Buffer()
         self.tf2_TransformListener = tf2_ros.TransformListener(self.tf2_Buffer)
@@ -275,6 +287,133 @@ class NavTfNode:
         self.rtk_odom_heading_msg = copy.deepcopy(msg)
         self.rtk_odom_heading_msg.pose.pose.orientation = self.fused_msg.orientation
 
+
+    # ===== vitulus_ui Phase 1: shadow bridge preview (Step A) =================
+    # Purpose: validate, WITHOUT touching the live pose, whether visual odometry
+    # (/vo/odom) and/or lidar ICP odometry (/licp/odom) can bridge GPS-denied
+    # stretches better than wheel/IMU alone. Each source is confidence-gated
+    # (covariance + freshness + hysteresis, mirroring the GPS fix_usable logic).
+    # While GPS is usable the preview pose is anchored to the live fused pose;
+    # while GPS is denied it dead-reckons using the best available gated source.
+    # Output: /nav_tf/odom_bridge_preview (Odometry) and /nav_tf/bridge_status.
+    def bridge_init_state(self):
+        self._src = {
+            'vo':    {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'cov': 1e9, 't': 0.0, 'have': False, 'ref': None, 'good': 0},
+            'licp':  {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'cov': 1e9, 't': 0.0, 'have': False, 'ref': None, 'good': 0},
+            'wheel': {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'cov': 0.0, 't': 0.0, 'have': False, 'ref': None, 'good': 0},
+        }
+        self._bridge = {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'init': False}
+        self._bridge_active = 'none'
+        self._bridge_cov_thresh = 1.0      # m^2; rtabmap inflates pose cov when tracking is lost
+        self._bridge_fresh_s = 0.5         # a source older than this is considered stale
+        self._bridge_hyst = 3              # consecutive good samples before a source is trusted
+
+    @staticmethod
+    def _odom_xyyaw(msg):
+        q = msg.pose.pose.orientation
+        (_, _, yaw) = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        return msg.pose.pose.position.x, msg.pose.pose.position.y, yaw
+
+    @staticmethod
+    def _wrap(a):
+        while a > math.pi:
+            a -= 2 * math.pi
+        while a < -math.pi:
+            a += 2 * math.pi
+        return a
+
+    def _store_src(self, key, msg):
+        try:
+            x, y, yaw = self._odom_xyyaw(msg)
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(yaw)):
+                return
+            s = self._src[key]
+            s['x'], s['y'], s['yaw'] = x, y, yaw
+            s['cov'] = msg.pose.covariance[0]
+            s['t'] = rospy.Time.now().to_sec()
+            s['have'] = True
+        except Exception:
+            pass
+
+    def callback_vo_odom(self, msg):
+        self._store_src('vo', msg)
+
+    def callback_licp_odom(self, msg):
+        self._store_src('licp', msg)
+
+    def _src_usable(self, key, now):
+        s = self._src[key]
+        fresh = s['have'] and (now - s['t']) < self._bridge_fresh_s
+        quality = True if key == 'wheel' else (s['cov'] < self._bridge_cov_thresh)
+        if fresh and quality:
+            s['good'] = min(s['good'] + 1, self._bridge_hyst)
+        else:
+            s['good'] = 0
+        return s['good'] >= self._bridge_hyst
+
+    def update_bridge_preview(self):
+        now = rospy.Time.now().to_sec()
+        # keep the wheel source fresh from the live wheel odom message
+        if self.wheel_odom_msg is not None and self.wheel_odom_msg.header.stamp.to_sec() > 0:
+            self._store_src('wheel', self.wheel_odom_msg)
+
+        usable = {k: self._src_usable(k, now) for k in self._src}
+        cur = {k: (s['x'], s['y'], s['yaw']) for k, s in self._src.items()}
+        gps_good = bool(self.fix_usable)
+
+        if gps_good or not self._bridge['init']:
+            # anchor the preview to the live fused pose; reset all references
+            bx, by, byaw = self._odom_xyyaw(self.base_odom_msg)
+            self._bridge.update({'x': bx, 'y': by, 'yaw': byaw, 'init': True})
+            self._bridge_active = 'gps' if gps_good else 'init'
+        else:
+            # GPS denied -> dead-reckon with the best gated source
+            # (lowest-covariance visual/lidar; wheel/IMU as last resort)
+            cands = [k for k in ('vo', 'licp') if usable[k]]
+            active = min(cands, key=lambda k: self._src[k]['cov']) if cands else 'wheel'
+            self._bridge_active = active
+            s = self._src[active]
+            ref = s['ref']
+            if ref is not None:
+                dx, dy, dyaw = s['x'] - ref[0], s['y'] - ref[1], self._wrap(s['yaw'] - ref[2])
+                # express the source delta in the robot frame at ref, then compose onto bridge
+                c, sn = math.cos(-ref[2]), math.sin(-ref[2])
+                lx, ly = c * dx - sn * dy, sn * dx + c * dy
+                bc, bs = math.cos(self._bridge['yaw']), math.sin(self._bridge['yaw'])
+                self._bridge['x'] += bc * lx - bs * ly
+                self._bridge['y'] += bs * lx + bc * ly
+                self._bridge['yaw'] = self._wrap(self._bridge['yaw'] + dyaw)
+
+        # advance every source's reference to current so source switching is seamless
+        for k, s in self._src.items():
+            s['ref'] = cur[k]
+
+        self._publish_bridge(usable, gps_good)
+
+    def _publish_bridge(self, usable, gps_good):
+        out = Odometry()
+        out.header.stamp = rospy.Time.now()
+        out.header.frame_id = "odom"
+        out.child_frame_id = "base_link_bridge"
+        out.pose.pose.position.x = self._bridge['x']
+        out.pose.pose.position.y = self._bridge['y']
+        q = quaternion_from_euler(0, 0, self._bridge['yaw'])
+        out.pose.pose.orientation.x, out.pose.pose.orientation.y = q[0], q[1]
+        out.pose.pose.orientation.z, out.pose.pose.orientation.w = q[2], q[3]
+        self.bridge_preview_pub.publish(out)
+        try:
+            lx, ly, _ = self._odom_xyyaw(self.base_odom_msg)
+            div = math.hypot(self._bridge['x'] - lx, self._bridge['y'] - ly)
+        except Exception:
+            div = float('nan')
+        st = ("gps_good=%d active=%s div_from_live=%.3fm | vo[use=%d cov=%.3g] "
+              "licp[use=%d cov=%.3g] wheel[use=%d]" % (
+                  int(gps_good), self._bridge_active, div,
+                  int(usable['vo']), self._src['vo']['cov'],
+                  int(usable['licp']), self._src['licp']['cov'],
+                  int(usable['wheel'])))
+        self.bridge_status_pub.publish(String(data=st))
+    # ===== end shadow bridge preview =========================================
 
 
     def callback_gnss_fix(self, msg):
@@ -923,6 +1062,12 @@ class NavTfNode:
         self.fused_nav_time = (int(str(rospy.Time.now())) - int(str(self.nav_last_fused_time))) / 1000000000
         self.fused_fix_time = (int(str(rospy.Time.now())) - int(str(self.fix_last_fused_time))) / 1000000000
         self.init_navsat()
+        # vitulus_ui Phase 1 (Step A): shadow bridge preview. Wrapped so a bug
+        # here can NEVER disturb the live odometry pipeline above.
+        try:
+            self.update_bridge_preview()
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[bridge_preview] %s" % e)
 
 
 if __name__ == '__main__':

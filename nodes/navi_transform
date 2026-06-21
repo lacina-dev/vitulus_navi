@@ -143,6 +143,9 @@ class NavTfNode:
         self.licp_odom_sub = rospy.Subscriber("/licp/odom", Odometry, self.callback_licp_odom, queue_size=50)
         self.bridge_preview_pub = rospy.Publisher("/nav_tf/odom_bridge_preview", Odometry, queue_size=20)
         self.bridge_status_pub = rospy.Publisher("/nav_tf/bridge_status", String, queue_size=5)
+        # Runtime on/off for live bridging (Phase 1 go-live). Publish std_msgs/Bool
+        # to /nav_tf/bridge_live_enable to toggle without a restart.
+        self.bridge_live_enable_sub = rospy.Subscriber("/nav_tf/bridge_live_enable", Bool, self.callback_bridge_live_enable, queue_size=1)
         # ----------------------------------------------------------------------
 
         self.tf2_Buffer = tf2_ros.Buffer()
@@ -325,6 +328,11 @@ class NavTfNode:
         # runaway glitches (e.g. the observed 7 m jump) are rejected.
         self._bridge_xcheck_mult = 3.0
         self._bridge_xcheck_abs = 0.05     # m
+        # Phase 1 go-live: when True and GPS is denied, drive the LIVE pose from
+        # the bridge (VO/lidar dead-reckon) instead of letting the EKF drift on
+        # wheels. Default OFF for safety (dock/undock + startup run on known-good
+        # wheel odom); enable per-drive via param or /nav_tf/bridge_live_enable.
+        self._bridge_live_enable = rospy.get_param('~bridge/live_enable', False)
 
     @staticmethod
     def _odom_xyyaw(msg):
@@ -455,13 +463,40 @@ class NavTfNode:
             div = math.hypot(self._bridge['x'] - lx, self._bridge['y'] - ly)
         except Exception:
             div = float('nan')
-        st = ("gps_good=%d active=%s div_from_live=%.3fm | vo[use=%d cov=%.3g] "
+        live = (not gps_good) and self._bridge_live_enable and self._bridge.get('init') \
+            and self._bridge_active in ('vo', 'licp')
+        st = ("gps_good=%d live=%d active=%s div_from_live=%.3fm | vo[use=%d cov=%.3g] "
               "licp[use=%d cov=%.3g] wheel[use=%d]" % (
-                  int(gps_good), self._bridge_active, div,
+                  int(gps_good), int(live), self._bridge_active, div,
                   int(usable['vo']), self._src['vo']['cov'],
                   int(usable['licp']), self._src['licp']['cov'],
                   int(usable['wheel'])))
         self.bridge_status_pub.publish(String(data=st))
+
+    def callback_bridge_live_enable(self, msg):
+        self._bridge_live_enable = bool(msg.data)
+        rospy.logwarn("[bridge] live bridging %s" % ("ENABLED" if msg.data else "DISABLED"))
+
+    def set_bridge_live_pose(self):
+        """Drive the live pose from the bridge during a GPS dropout. Position from
+        the bridge dead-reckon (VO/lidar), orientation from the IMU-fused heading
+        (continuous) — mirroring the RTK correction in set_wheel_base_nav_pose,
+        just with the bridge position instead of RTK. Same EKF set_pose service."""
+        try:
+            pose_srv = SetPoseRequest()
+            pose_srv.pose.pose.pose.position.x = self._bridge['x']
+            pose_srv.pose.pose.pose.position.y = self._bridge['y']
+            pose_srv.pose.pose.pose.position.z = 0.0
+            pose_srv.pose.pose.pose.orientation.x = self.fused_msg.orientation.x
+            pose_srv.pose.pose.pose.orientation.y = self.fused_msg.orientation.y
+            pose_srv.pose.pose.pose.orientation.z = self.fused_msg.orientation.z
+            pose_srv.pose.pose.pose.orientation.w = self.fused_msg.orientation.w
+            pose_srv.pose.header.frame_id = 'odom'
+            pose_srv.pose.header.stamp = rospy.Time.now()
+            srv = rospy.ServiceProxy('/ekf_wheel_nav_odometry/set_pose', SetPose)
+            srv(pose_srv)
+        except rospy.ServiceException as e:
+            rospy.logerr("set_bridge_live_pose set_pose failed: %s" % e)
     # ===== end shadow bridge preview =========================================
 
 
@@ -1125,6 +1160,19 @@ class NavTfNode:
                 self.fix_last_fused_time = rospy.Time.now()
                 # self.set_nav_wheel_odom()
                 self.set_wheel_base_nav_pose()
+        # Phase 1 GO-LIVE: GPS denied -> if live bridging is enabled and a TRUSTED
+        # relative source (VO/lidar, already covariance + freshness + hysteresis +
+        # wheel-cross-check gated) is carrying the bridge, drive the live pose from
+        # the bridge instead of drifting on wheels. On long dropouts where VO/lidar
+        # are lost the bridge falls back to 'wheel' -> we skip and let the EKF
+        # dead-reckon as before (bounds the risk). Wrapped so a fault here can
+        # never disturb the GPS-anchored path above.
+        elif self._bridge_live_enable and self._bridge.get('init') \
+                and self._bridge_active in ('vo', 'licp'):
+            try:
+                self.set_bridge_live_pose()
+            except Exception as e:
+                rospy.logwarn_throttle(10.0, "[bridge_live] %s" % e)
 
 
     def loop30hz(self, event=None):

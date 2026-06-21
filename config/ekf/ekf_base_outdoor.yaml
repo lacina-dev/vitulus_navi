@@ -24,6 +24,13 @@ ekf_wheel_odometry:
   odom0_nodelay: true
   odom0_differential: false
   odom0_relative: true
+  # Gate the single-frame garbage wheel-odom velocity spike (~-350..-550 m/s,
+  # cmd_vel=0) that mobile_base_controller emits on motor ENABLE, which otherwise
+  # gets fused and teleports the pose (jump grows with distance driven; 2026-06-21
+  # confirmed on robot). 50 = Mahalanobis sigma: the spike is >=350 sigma so it is
+  # always rejected, while the robot tops ~0.5 m/s so legitimate wheel velocity
+  # never approaches 50 sigma -> ZERO effect on normal localization/navigation.
+  odom0_twist_rejection_threshold: 50.0
 
   imu0: /bno085/imu
   imu0_config: [ false, false, false,
@@ -99,6 +106,13 @@ ekf_wheel_nav_odometry:
   odom0_nodelay: true
   odom0_differential: false
   odom0_relative: true
+  # Gate the single-frame garbage wheel-odom velocity spike (~-350..-550 m/s,
+  # cmd_vel=0) that mobile_base_controller emits on motor ENABLE, which otherwise
+  # gets fused and teleports the pose (jump grows with distance driven; 2026-06-21
+  # confirmed on robot). 50 = Mahalanobis sigma: the spike is >=350 sigma so it is
+  # always rejected, while the robot tops ~0.5 m/s so legitimate wheel velocity
+  # never approaches 50 sigma -> ZERO effect on normal localization/navigation.
+  odom0_twist_rejection_threshold: 50.0
 
   # ---- Multi-source GPS-denied bridging (2026-06-21) -----------------------
   # Visual odometry (rgbd_odometry, /vo/odom) and lidar ICP odometry

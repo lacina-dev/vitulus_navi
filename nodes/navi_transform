@@ -57,6 +57,8 @@ class NavTfNode:
         self.fix_usable = False
         self.fix_usable_history = [0, 0, 0]
         self.heading_fix_usable = False
+        self._heading_last_good = 0.0      # last time RTK heading was usable
+        self._heading_grace_s = 3.0        # tolerate brief heading dropouts (flapping)
         self.nav_last_fused_time = 0
         self.fix_last_fused_time = 0
         self.imu_delay = 0
@@ -453,7 +455,7 @@ class NavTfNode:
                 and msg.position_covariance[4] <= 0.000197:
             if msg.status.status == 2:
                 if self.launch_navsat is None:
-                    if self.heading_fix_usable:
+                    if self._heading_ok():
                         usable = True
                 else:
                     usable = True
@@ -476,7 +478,15 @@ class NavTfNode:
             if msg.status.status == 2:
                 usable = True
         self.heading_fix_usable = usable
+        if usable:
+            self._heading_last_good = time.time()
         # print("gnss_heading_fix usable: ", usable)
+
+    def _heading_ok(self):
+        """Heading usable now, or was within a short grace window — smooths the
+        rapid RTK-heading flapping that otherwise dropped GPS acceptance
+        (gps_good ~35% despite RTK ~71%). IMU heading + last offset cover the gap."""
+        return self.heading_fix_usable or (time.time() - self._heading_last_good) < self._heading_grace_s
 
     def callback_navheading(self, msg):
         self.offset_navheading_imu(msg)
@@ -860,8 +870,11 @@ class NavTfNode:
         self.rtk_err = rtk_error_z
         if delay <= 6 and self.fix_usable and self.heading_fix_usable:
 
-            # if rtk_error_z <= 0.00068 and rtk_error_z >= 0.00042:
-            if rtk_error_z <= 0.00065 and rtk_error_z >= 0.00051:
+            # Accept any sufficiently-good RTK heading. The previous lower bound
+            # (>= 0.00051) wrongly REJECTED *better* (more accurate) heading,
+            # leaving the IMU-heading offset stale whenever the dual-antenna fix
+            # was tight. Upper bound only.
+            if rtk_error_z <= 0.0008:
                 self.nav_last_fused_time = rospy.Time.now()
                 (imu_roll, imu_pitch, imu1_yaw) = euler_from_quaternion([self.imu_msg.orientation.x,
                                                                         self.imu_msg.orientation.y,
@@ -1073,7 +1086,7 @@ class NavTfNode:
 
         if sum(self.fix_usable_history) == 3:
             if self.launch_navsat is not None:
-                if self.heading_fix_usable:
+                if self._heading_ok():
                     self.fix_last_fused_time = rospy.Time.now()
                     self.set_wheel_base_nav_pose()
             else:

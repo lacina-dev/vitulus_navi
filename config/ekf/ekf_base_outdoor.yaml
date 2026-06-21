@@ -100,6 +100,42 @@ ekf_wheel_nav_odometry:
   odom0_differential: false
   odom0_relative: true
 
+  # ---- Multi-source GPS-denied bridging (2026-06-21) -----------------------
+  # Visual odometry (rgbd_odometry, /vo/odom) and lidar ICP odometry
+  # (icp_odometry, /licp/odom) fused as CONTINUOUS velocity sources so the EKF
+  # dead-reckons on VO/lidar (slip-free) instead of wheels alone when RTK is
+  # denied. TWIST ONLY (vx, vy) — their absolute pose is in a separate,
+  # auto-resetting odom origin (Odom/ResetCountdown=1) so it must NOT be fused;
+  # the body-frame twist is reset-robust. vyaw left to the IMU/RTK heading for
+  # now (licp yaw is noisy ~2.8 deg/s at rest). twist_rejection_threshold gates
+  # reset/glitch velocity spikes (Mahalanobis); on tracking loss rtabmap
+  # inflates covariance so the EKF self-attenuates the source. RTK still anchors
+  # position via the set_pose path (loop3sec) — unchanged. Replaces the failed
+  # 10 Hz set_pose-snap go-live (commit e32e0ee) which fought this EKF.
+  odom1: /vo/odom
+  odom1_config: [ false, false, false,
+                  false, false, false,
+                  true, true, false,
+                  false, false, false,
+                  false, false, false ]
+  odom1_queue_size: 10
+  odom1_nodelay: true
+  odom1_differential: false
+  odom1_relative: false
+  odom1_twist_rejection_threshold: 1.0
+
+  odom2: /licp/odom
+  odom2_config: [ false, false, false,
+                  false, false, false,
+                  true, true, false,
+                  false, false, false,
+                  false, false, false ]
+  odom2_queue_size: 10
+  odom2_nodelay: true
+  odom2_differential: false
+  odom2_relative: false
+  odom2_twist_rejection_threshold: 1.0
+
   imu0: /gnss_heading/nav_fused
   imu0_config: [ false, false, false,
                  true,  true,  true,

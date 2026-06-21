@@ -56,6 +56,9 @@ class NavTfNode:
         self.fused_msg.orientation.w = 1
         self.fix_usable = False
         self.fix_usable_history = [0, 0, 0]
+        # Phase-2 decouple: RTK position acceptance independent of heading.
+        self.position_fix_usable = False
+        self.position_fix_usable_history = [0, 0, 0]
         self.heading_fix_usable = False
         self._heading_last_good = 0.0      # last time RTK heading was usable
         self._heading_grace_s = 3.0        # tolerate brief heading dropouts (flapping)
@@ -309,7 +312,12 @@ class NavTfNode:
         self._bridge_cov_thresh = 1.0      # m^2; rtabmap inflates pose cov when tracking is lost
         self._bridge_fresh_s = 0.5         # a source older than this is considered stale
         self._bridge_hyst = 3              # consecutive good samples before a source is trusted
-        self._bridge_max_step = 0.3        # m; reject larger single-cycle deltas (reset/glitch jumps)
+        # Per-cycle deltas above these are reset/glitch jumps -> rejected. The
+        # bridge integrates at 30 Hz and the robot tops out ~0.5 m/s (~0.017
+        # m/cycle), so 0.08 m leaves a generous margin yet caps a stuck-glitch
+        # accumulation at ~0.08*30*3s ≈ 7 m instead of the 0.3 m clamp's ~27 m
+        # (the observed 26.7 m spike). 0.3 m allowed an absurd 9 m/s.
+        self._bridge_max_step = 0.08       # m; reject larger single-cycle deltas (reset/glitch jumps)
         self._bridge_max_yaw = 0.3         # rad; same, for rotation
         # Wheel cross-check (Step B layer 1): a VO/lidar source is only trusted
         # if its per-cycle motion is not WILDLY more than the wheels'. Asymmetric
@@ -373,8 +381,14 @@ class NavTfNode:
         (glitch protection). Asymmetric: a source moving LESS than wheels is fine."""
         wd = self._step_dist('wheel')
         sd = self._step_dist(key)
-        if wd is None or sd is None:
-            return True
+        if sd is None:
+            return True            # source just (re)initialised; nothing to check yet
+        if wd is None:
+            # No wheel reference to compare against (e.g. right after an anchor
+            # reset) — exactly when odometry-frame teleports/glitches strike. Fail
+            # SAFE: trust only tiny motion instead of bypassing the check (the old
+            # `return True` here let the 26.7 m glitch through).
+            return sd <= self._bridge_xcheck_abs
         return sd <= self._bridge_xcheck_mult * wd + self._bridge_xcheck_abs
 
     def update_bridge_preview(self):
@@ -385,7 +399,10 @@ class NavTfNode:
 
         usable = {k: self._src_usable(k, now) for k in self._src}
         cur = {k: (s['x'], s['y'], s['yaw']) for k, s in self._src.items()}
-        gps_good = bool(self.fix_usable)
+        # Phase-2 decouple: the live pose now re-anchors on RTK position alone, so
+        # the shadow bridge mirrors that (denied = real position dropout, not a
+        # heading flap). Keeps shadow div_from_live meaningful vs the live pose.
+        gps_good = bool(self.position_fix_usable)
 
         if gps_good or not self._bridge['init']:
             # anchor the preview to the live fused pose; reset all references
@@ -450,10 +467,13 @@ class NavTfNode:
 
     def callback_gnss_fix(self, msg):
         usable = False
+        position_usable = False
         if msg.position_covariance[8] <= 0.0001 \
                 and msg.position_covariance[0] <= 0.000197 \
                 and msg.position_covariance[4] <= 0.000197:
             if msg.status.status == 2:
+                # RTK position is ~1.4 cm here regardless of heading quality.
+                position_usable = True
                 if self.launch_navsat is None:
                     if self._heading_ok():
                         usable = True
@@ -465,6 +485,15 @@ class NavTfNode:
         self.fix_usable = usable
         self.fix_usable_history.pop(0)
         self.fix_usable_history.append(usable)
+        # Phase-2 decouple: track position usability separately from heading.
+        # The dual-antenna RTK heading is unreliable while DRIVING (cov 0.02-0.16,
+        # σ≈8-23°), which used to gate the whole fix and throw away the perfect
+        # position too. The live correction (loop3sec -> set_wheel_base_nav_pose)
+        # applies RTK position + the IMU-fused heading, so anchoring position on
+        # this alone is safe and keeps the pose on RTK far more of the time.
+        self.position_fix_usable = position_usable
+        self.position_fix_usable_history.pop(0)
+        self.position_fix_usable_history.append(position_usable)
         # print(self.fix_usable_history)
         # print("gnss_fix usable: ", usable)
 
@@ -1082,9 +1111,12 @@ class NavTfNode:
         node_gnss.publish_status()
 
     def loop3sec(self, event=None):
-        # print(sum(self.fix_usable_history))
-
-        if sum(self.fix_usable_history) == 3:
+        # Phase-2 decouple: gate the live RTK position correction on POSITION
+        # usability (not the heading-coupled fix_usable). set_wheel_base_nav_pose
+        # uses RTK position + IMU-fused heading, so this is safe and keeps the
+        # pose anchored to RTK whenever position is good (~86% vs ~31% before),
+        # cutting dead-reckoning drift and the map "corrections" it caused.
+        if sum(self.position_fix_usable_history) == 3:
             if self.launch_navsat is not None:
                 if self._heading_ok():
                     self.fix_last_fused_time = rospy.Time.now()

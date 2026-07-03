@@ -1007,6 +1007,11 @@ class Node:
                 self.indoor = False
             if not init:
                 self.shutdown_navi_launch()
+            # Stop the rtabmap container BEFORE overwriting rtabmap.db: a running
+            # rtabmap holds the sqlite file open and SAVES into it on shutdown, so
+            # copying first let the dying container write ~20 kB of its session over
+            # the freshly loaded map -> corrupt db -> rtabmap segfault on next start.
+            self.rtabmap_mapping.stop()
             self.status_msg_pub.publish("Loading the map...")
             shutil.copyfile("/home/vitulus/.vitulus/saves/maps/" + msg.data + ".db",
                             "/home/vitulus/.ros/rtabmap.db")
@@ -1014,7 +1019,15 @@ class Node:
                             "/home/vitulus/.ros/mapdata.pkl")
             self.status_msg_pub.publish("Map " + msg.data + " saved.")
             rospy.loginfo("Map " + msg.data + " loaded.")
-            self.start_navi_launch(["localization:=true"])
+            if self.params.get('rtabmap_on_start', False):
+                # Unified localization: bring rtabmap up in LOCALIZATION mode on the
+                # loaded map (instead of stopping the container) so the robot can
+                # localize in it without GPS — the dock seed publishes the docked pose
+                # to /rtabmap/initialpose and lidar proximity locks. Applies to boot
+                # (load_map_on_start) and UI map loads alike; config-gated for rollback.
+                self.start_navi_launch(["localization:=true_rtabmap"])
+            else:
+                self.start_navi_launch(["localization:=true"])
             self.load_running_map_data()
             self.set_map_utm_transform()
             # self.map_status = "Ready"
@@ -1035,6 +1048,9 @@ class Node:
             self.status_msg_pub.publish("Map {} will be loaded...".format(msg.data))
             if not init:
                 self.shutdown_navi_launch()
+            # Stop the rtabmap container BEFORE overwriting rtabmap.db (see
+            # callback_load_map — shutdown save into the open sqlite corrupts it).
+            self.rtabmap_mapping.stop()
             self.status_msg_pub.publish("Loading the map...")
             shutil.copyfile("/home/vitulus/.vitulus/saves/maps/" + msg.data + ".db",
                             "/home/vitulus/.ros/rtabmap.db")

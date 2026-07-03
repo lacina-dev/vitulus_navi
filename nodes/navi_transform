@@ -104,6 +104,15 @@ class NavTfNode:
         self.map_coords_msg = PoseStamped()
         self.map_odom_transform = TransformStamped()
         self.map_odom_transform.transform.rotation.w = 1
+        # GPS-denied heading correction carried by map->odom ROTATION (yaw, rad).
+        # Normally 0: with GPS the absolute heading is anchored INSIDE odom->base
+        # (diff_yaw -> fused -> EKF), so map->odom stays translation-only. External
+        # map-frame localization (rtabmap via /nav_tf/set_map_pose) sets it when GPS
+        # is denied; it is RESET to 0 whenever heading is re-anchored in odom->base
+        # (GNSS offset_navheading_imu, /nav_tf/set_heading) or the GPS georef path
+        # (callback_map_coords) takes map->odom over — otherwise yaw would be
+        # counted twice. odom->base is never touched -> no rtabmap feedback loop.
+        self.map_odom_yaw = 0.0
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
         self.init = True
@@ -142,9 +151,10 @@ class NavTfNode:
         # WITHOUT going through the odom-frame EKF set_pose. rtabmap reads its odom guess from
         # odom->base_link; the old dock bridge wrote that same EKF, so its correction moved
         # rtabmap's own input -> feedback loop (pose jumped 5+ m, never locked). Correcting
-        # map->odom instead leaves odom->base untouched -> no feedback. map->odom is
-        # translation-only here (transform_map_to_odom forces identity rotation), so we set
-        # only the xy offset; the absolute heading is carried separately via /nav_tf/set_heading.
+        # map->odom instead leaves odom->base untouched -> no feedback. Carries the FULL 2D
+        # pose: xy translation + a map->odom yaw correction (map_odom_yaw; GPS-denied
+        # drive-away heading fix). /nav_tf/set_heading remains for one-shot absolute
+        # anchoring inside odom->base (dock).
         # Same priority rule as set_heading: callers publish ONLY when their higher-priority
         # source (GNSS) is unavailable, so this never fights the GPS map->odom path.
         self.set_map_pose_sub = rospy.Subscriber("/nav_tf/set_map_pose", PoseStamped, self.callback_set_map_pose, queue_size=1)
@@ -223,26 +233,40 @@ class NavTfNode:
 
     def callback_set_map_pose(self, msg):
         """Drive the live map->odom from an external map-frame robot pose (rtabmap lidar
-        localization when GPS is denied). map->odom is published translation-only
-        (transform_map_to_odom forces identity rotation), so:
+        localization when GPS is denied), FULL 2D pose incl. yaw:
 
-            map->base.xy = map->odom.t + odom->base.xy   =>   map->odom.t = wanted.xy - odom->base.xy
+            map->base = R(map_odom_yaw) . odom->base + t
+            map_odom_yaw = wanted.yaw - odom->base.yaw
+            t = wanted.xy - R(map_odom_yaw) . odom->base.xy
 
         We do NOT touch the odom-frame EKF (unlike the old set_pose bridge), so odom->base —
-        rtabmap's own odometry input — is left alone and there is no feedback loop. Heading is
-        anchored separately by callback_set_heading. No-GPS gating lives in the caller (the dock
-        seed bridge publishes only when gps_good==0), so this never fights callback_map_coords."""
+        rtabmap's own odometry input — is left alone and there is no feedback loop; the yaw
+        correction lives purely in map->odom (drive-away heading fix without GPS). No-GPS
+        gating lives in the caller (the dock seed bridge publishes only when gps_good==0),
+        so this never fights callback_map_coords / the GNSS heading anchor (both reset
+        map_odom_yaw to 0 when they take over)."""
         odom_base = self.get_base_link_transform()   # odom->base_link
         if odom_base is None:
             rospy.logwarn_throttle(5.0, "[set_map_pose] no odom->base_link TF yet — skipping")
             return
-        self.map_odom_transform.transform.translation.x = msg.pose.position.x - odom_base.transform.translation.x
-        self.map_odom_transform.transform.translation.y = msg.pose.position.y - odom_base.transform.translation.y
+        # Full 2D correction: map->base = R(map_odom_yaw) * odom->base + t.
+        # Yaw first (t depends on it): map yaw = map_odom_yaw + odom->base yaw.
+        wanted_yaw = euler_from_quaternion([msg.pose.orientation.x, msg.pose.orientation.y,
+                                            msg.pose.orientation.z, msg.pose.orientation.w])[2]
+        ob_q = odom_base.transform.rotation
+        odom_yaw = euler_from_quaternion([ob_q.x, ob_q.y, ob_q.z, ob_q.w])[2]
+        m = math.atan2(math.sin(wanted_yaw - odom_yaw), math.cos(wanted_yaw - odom_yaw))
+        self.map_odom_yaw = m
+        ob_x = odom_base.transform.translation.x
+        ob_y = odom_base.transform.translation.y
+        self.map_odom_transform.transform.translation.x = msg.pose.position.x - (math.cos(m) * ob_x - math.sin(m) * ob_y)
+        self.map_odom_transform.transform.translation.y = msg.pose.position.y - (math.sin(m) * ob_x + math.cos(m) * ob_y)
         rospy.loginfo_throttle(5.0,
-            "[set_map_pose] map->odom set from external map pose (%.2f, %.2f) -> t=(%.2f, %.2f)",
-            msg.pose.position.x, msg.pose.position.y,
+            "[set_map_pose] map->odom set from external map pose (%.2f, %.2f, %.1fdeg) -> "
+            "t=(%.2f, %.2f) yaw=%.2fdeg",
+            msg.pose.position.x, msg.pose.position.y, math.degrees(wanted_yaw),
             self.map_odom_transform.transform.translation.x,
-            self.map_odom_transform.transform.translation.y)
+            self.map_odom_transform.transform.translation.y, math.degrees(m))
 
     def callback_navi_indoor(self, msg):
         was_indoor = self.is_indoor
@@ -314,6 +338,9 @@ class NavTfNode:
             map_odom_transform.transform.rotation.w = quaternion[3]
 
             self.map_odom_transform = map_odom_transform
+            # GPS georef owns map->odom again -> drop the GPS-denied yaw correction
+            # (its translation math above assumes the identity-rotation broadcast).
+            self.map_odom_yaw = 0.0
         self.map_coords_msg = msg
 
     def callback_base_odom(self, msg):
@@ -668,10 +695,15 @@ class NavTfNode:
             map_odom_tf.transform.translation = self.map_odom_transform.transform.translation
             if odom_base_tf is not None:
                 map_odom_tf.transform.translation.z = (odom_base_tf.transform.translation.z * -1)
-            map_odom_tf.transform.rotation.x = 0
-            map_odom_tf.transform.rotation.y = 0
-            map_odom_tf.transform.rotation.z = 0
-            map_odom_tf.transform.rotation.w = 1
+            # Rotation = the explicit GPS-denied yaw correction ONLY (normally 0).
+            # NOT the quaternion stored by callback_map_coords — heading is anchored
+            # inside odom->base with GPS, so broadcasting that residual would
+            # double-count yaw (that is why identity was forced here historically).
+            q = quaternion_from_euler(0.0, 0.0, self.map_odom_yaw)
+            map_odom_tf.transform.rotation.x = q[0]
+            map_odom_tf.transform.rotation.y = q[1]
+            map_odom_tf.transform.rotation.z = q[2]
+            map_odom_tf.transform.rotation.w = q[3]
 
             self.tf2_TransformBroadcaster.sendTransform(map_odom_tf)
 
@@ -995,6 +1027,9 @@ class NavTfNode:
                     imu1_yaw += 2 * math.pi
                 self.diff_yaw = (rtk_yaw - imu1_yaw) + 1.5708  # 90 degrees
                 self.init = False
+                # GNSS re-anchors heading inside odom->base -> drop any map->odom
+                # yaw correction or the angle would be applied twice.
+                self.map_odom_yaw = 0.0
 
     def callback_set_heading(self, msg):
         """Anchor the ABSOLUTE heading from an external map-frame yaw (radians). The IMU is
@@ -1013,6 +1048,9 @@ class NavTfNode:
             wanted += 2 * math.pi
         self.diff_yaw = wanted - imu_yaw
         self.init = False
+        # heading re-anchored inside odom->base -> reset the map->odom yaw
+        # correction (same double-count rule as the GNSS path).
+        self.map_odom_yaw = 0.0
         rospy.loginfo("[navi_tf] heading anchored to external map yaw %.3f rad (diff_yaw=%.3f)"
                       % (msg.data, self.diff_yaw))
 

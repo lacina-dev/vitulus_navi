@@ -829,6 +829,49 @@ class Node:
         rospy.loginfo("Vitulus navi stopped.")
         self.status_msg_pub.publish("Vitulus navi stopped.")
 
+    def switch_rtabmap_to_mapping(self):
+        """ Failure B fix helper. Switch an already-running, relocalized rtabmap
+        container from LOCALIZATION mode to incremental MAPPING using the rtabmap
+        runtime service (std_srvs/Empty; default /rtabmap/set_mode_mapping, the
+        inverse of set_mode_localization). This preserves the loaded map id so new
+        mapping connects to the existing graph, instead of relaunching the docker in
+        mapping mode (which starts a NEW, disconnected map).
+
+        Defensive / non-breaking: service name + timeouts are ROS params, the call
+        is wrapped in try/except and NEVER raises. Returns True on success, False if
+        the service is unavailable so the caller can fall back to the legacy relaunch.
+        """
+        srv_name = rospy.get_param('~set_mode_mapping_service', '/rtabmap/set_mode_mapping')
+        wait_timeout = float(rospy.get_param('~set_mode_mapping_wait', 30.0))
+        # Give rtabmap a chance to relocalize (loop closure / dock initialpose seed)
+        # before flipping to mapping. We prefer a CONFIRMED relocalization (a message on
+        # /rtabmap/localization_pose) over a blind sleep; on timeout we fall back to the
+        # fixed settle so behaviour degrades gracefully and never blocks indefinitely.
+        settle = float(rospy.get_param('~set_mode_mapping_settle', 5.0))
+        reloc_topic = rospy.get_param('~reloc_pose_topic', '/rtabmap/localization_pose')
+        try:
+            rospy.wait_for_service(srv_name, timeout=wait_timeout)
+            if settle > 0.0:
+                rospy.loginfo("Waiting up to %.1fs for rtabmap to relocalize "
+                              "(%s) before mapping...", settle, reloc_topic)
+                try:
+                    rospy.wait_for_message(reloc_topic, PoseWithCovarianceStamped,
+                                           timeout=settle)
+                    rospy.loginfo("rtabmap relocalization confirmed; switching to mapping.")
+                except rospy.ROSException:
+                    rospy.logwarn("No relocalization confirmed within %.1fs (no %s); "
+                                  "switching to mapping anyway (visual loop closure may "
+                                  "still merge later).", settle, reloc_topic)
+            switch = rospy.ServiceProxy(srv_name, Empty)
+            switch()
+            rospy.loginfo("rtabmap switched to incremental mapping via %s "
+                          "(map stays connected).", srv_name)
+            self.status_msg_pub.publish("Mapping continues on the loaded map.")
+            return True
+        except Exception as e:
+            rospy.logwarn("Could not switch rtabmap to mapping via %s: %s", srv_name, e)
+            return False
+
     def callback_save_map(self, msg):
         if msg.data != "":
             # self.map_status = "Loading"
@@ -914,9 +957,28 @@ class Node:
             self.start_navi_launch(["localization:=true"])
             # self.map_status = "Ready"
         else:
+            # --- Failure B fix: localize-then-map on an EXISTING map ---------------
+            # Old behavior relaunched rtabmap fresh in mapping mode
+            # (start_navi_launch(["localization:=false"])), which made rtabmap draw a
+            # NEW, disconnected map because it never relocalized into the loaded one.
+            # Instead: bring rtabmap up in LOCALIZATION mode on the loaded db so it
+            # can relocalize (visual loop closure or the dock /rtabmap/initialpose
+            # seed), THEN flip to incremental mapping via the rtabmap runtime service
+            # set_mode_mapping (keeps the same map id -> mapping stays connected).
+            # If the service is unavailable, fall back to the legacy relaunch so the
+            # current map-edit flow is never broken.
             self.status_msg_pub.publish("Current map is in edit mode.")
             rospy.loginfo("Current map is in edit mode.")
-            self.start_navi_launch(["localization:=false"])
+            self.start_navi_launch(["localization:=true_rtabmap"])
+            if not self.switch_rtabmap_to_mapping():
+                rospy.logwarn("set_mode_mapping unavailable -> falling back to legacy "
+                              "relaunch in mapping mode (localization:=false). The new "
+                              "map may be disconnected from the loaded one.")
+                # Tear down the localization-mode stack first so we do not leak the
+                # previous roslaunch / double-launch move_base + rtabmap container.
+                self.shutdown_navi_launch()
+                self.start_navi_launch(["localization:=false"])
+            # ----------------------------------------------------------------------
 
     def callback_load_map(self, msg, init=False):
         if msg.data != "":
@@ -1111,6 +1173,20 @@ class Node:
             resp.point_pose = msg
             resp.result = True
             return resp
+        # Safe guard (dock-anchor): a map point with this name is NOT guaranteed to
+        # exist. A map can be created/saved WITHOUT a "dock" point — the "dock" point
+        # is only created when the dock workflow publishes name "dock" to
+        # /navi_manager/save_waypoint at the dock; nothing forces it on map save.
+        # Return a well-formed response with result=False (instead of None, which
+        # would raise a ServiceException) so callers like the dock_localization_seed
+        # node can branch cleanly on resp.result.
+        rospy.logwarn("get_point_pose: point '%s' not found in current map "
+                      "(running_map_data); returning result=False.", srv.name)
+        resp = Point_poseResponse()
+        resp.point_pose = PoseStamped()
+        resp.point_pose.header.frame_id = "map"
+        resp.result = False
+        return resp
 
 
     def publish_map_point_list(self):

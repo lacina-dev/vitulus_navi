@@ -14,7 +14,7 @@ from std_srvs.srv import Empty, EmptyResponse
 from vitulus_msgs.msg import Navi_transform
 from tf import TransformListener
 from vitulus_msgs.msg import Imu_status
-from std_msgs.msg import Bool, Float32MultiArray, String
+from std_msgs.msg import Bool, Float32MultiArray, String, Float64
 from vitulus_navi.srv import Point_pose, Point_poseResponse
 import sys
 import serial
@@ -132,6 +132,22 @@ class NavTfNode:
         self.navi_indoor_sub = rospy.Subscriber("/navi_manager/is_indoor", Bool, self.callback_navi_indoor)
         self.set_pose_sub = rospy.Subscriber("/nav_tf/set_pose", PoseWithCovarianceStamped, self.callback_set_pose)
         self.set_dock_pose_sub = rospy.Subscriber("/nav_tf/set_dock_pose", Bool, self.callback_set_dock_pose)
+        # Anchor the ABSOLUTE heading from an EXTERNAL map-frame yaw (Float64, radians). The
+        # bno085 IMU is relative-only (no usable magnetometer), so the absolute reference is
+        # supplied externally. Priority is handled by the CALLERS (each only sets when its
+        # higher-priority source is unavailable): GNSS dual-antenna (offset_navheading_imu,
+        # highest) > DOCK when docked + no satellite > later other sources (rtabmap, ...).
+        self.set_heading_sub = rospy.Subscriber("/nav_tf/set_heading", Float64, self.callback_set_heading, queue_size=1)
+        # External map-frame localization (e.g. rtabmap lidar) -> live map->odom DIRECTLY,
+        # WITHOUT going through the odom-frame EKF set_pose. rtabmap reads its odom guess from
+        # odom->base_link; the old dock bridge wrote that same EKF, so its correction moved
+        # rtabmap's own input -> feedback loop (pose jumped 5+ m, never locked). Correcting
+        # map->odom instead leaves odom->base untouched -> no feedback. map->odom is
+        # translation-only here (transform_map_to_odom forces identity rotation), so we set
+        # only the xy offset; the absolute heading is carried separately via /nav_tf/set_heading.
+        # Same priority rule as set_heading: callers publish ONLY when their higher-priority
+        # source (GNSS) is unavailable, so this never fights the GPS map->odom path.
+        self.set_map_pose_sub = rospy.Subscriber("/nav_tf/set_map_pose", PoseStamped, self.callback_set_map_pose, queue_size=1)
 
         # --- vitulus_ui Phase 1: shadow bridge preview (Step A) ----------------
         # ADDITIVE / SHADOW ONLY: evaluates the VO (/vo/odom) and lidar
@@ -204,6 +220,29 @@ class NavTfNode:
                     rospy.logwarn("Dock point pose not found.")
             except rospy.ServiceException as e:
                 rospy.logerr("Service /navi_manager/get_point_pose call failed: %s" % e)
+
+    def callback_set_map_pose(self, msg):
+        """Drive the live map->odom from an external map-frame robot pose (rtabmap lidar
+        localization when GPS is denied). map->odom is published translation-only
+        (transform_map_to_odom forces identity rotation), so:
+
+            map->base.xy = map->odom.t + odom->base.xy   =>   map->odom.t = wanted.xy - odom->base.xy
+
+        We do NOT touch the odom-frame EKF (unlike the old set_pose bridge), so odom->base —
+        rtabmap's own odometry input — is left alone and there is no feedback loop. Heading is
+        anchored separately by callback_set_heading. No-GPS gating lives in the caller (the dock
+        seed bridge publishes only when gps_good==0), so this never fights callback_map_coords."""
+        odom_base = self.get_base_link_transform()   # odom->base_link
+        if odom_base is None:
+            rospy.logwarn_throttle(5.0, "[set_map_pose] no odom->base_link TF yet — skipping")
+            return
+        self.map_odom_transform.transform.translation.x = msg.pose.position.x - odom_base.transform.translation.x
+        self.map_odom_transform.transform.translation.y = msg.pose.position.y - odom_base.transform.translation.y
+        rospy.loginfo_throttle(5.0,
+            "[set_map_pose] map->odom set from external map pose (%.2f, %.2f) -> t=(%.2f, %.2f)",
+            msg.pose.position.x, msg.pose.position.y,
+            self.map_odom_transform.transform.translation.x,
+            self.map_odom_transform.transform.translation.y)
 
     def callback_navi_indoor(self, msg):
         was_indoor = self.is_indoor
@@ -954,6 +993,26 @@ class NavTfNode:
                     imu1_yaw += 2 * math.pi
                 self.diff_yaw = (rtk_yaw - imu1_yaw) + 1.5708  # 90 degrees
                 self.init = False
+
+    def callback_set_heading(self, msg):
+        """Anchor the ABSOLUTE heading from an external map-frame yaw (radians). The IMU is
+        relative-only (no magnetometer), so the absolute offset is supplied externally. This
+        mirrors the GNSS path above (fused = imu_yaw + diff_yaw): set diff_yaw = wanted - imu_yaw
+        so the fused heading equals the supplied map yaw NOW and then tracks correctly via the
+        relative IMU as the robot turns. NO +90 deg here: the input is already a MAP yaw (the
+        dock / rtabmap orientation in the map frame), unlike rtk_yaw which is the RTK heading.
+        Used when there is no satellite heading (dock, later rtabmap); GNSS overrides via
+        offset_navheading_imu whenever a good RTK heading is present, so it keeps priority."""
+        wanted = msg.data
+        imu_yaw = self.imu_yaw
+        if imu_yaw < 0:
+            imu_yaw += 2 * math.pi
+        if wanted < 0:
+            wanted += 2 * math.pi
+        self.diff_yaw = wanted - imu_yaw
+        self.init = False
+        rospy.loginfo("[navi_tf] heading anchored to external map yaw %.3f rad (diff_yaw=%.3f)"
+                      % (msg.data, self.diff_yaw))
 
     def print_info(self):
 

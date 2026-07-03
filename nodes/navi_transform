@@ -677,7 +677,9 @@ class NavTfNode:
 
 
     def publish_odom_for_gps(self):
-        self.odom_for_gps_msg = self.odom_for_gps_msg
+        # Intentionally ORIENTATION-ONLY: navsat_transform consumes this as its
+        # odometry input (remapped odometry/filtered) and needs the fused heading;
+        # position stays zero by design so the GPS datum is not dragged around.
         self.odom_for_gps_msg.header.stamp = rospy.Time.now()
         self.odom_for_gps_msg.pose.pose.orientation = self.fused_msg.orientation
         self.odom_for_gps_msg.header.frame_id = "odom"
@@ -1205,6 +1207,12 @@ class NavTfNode:
         node_gnss.publish_status()
 
     def loop3sec(self, event=None):
+        # NOTE the misleading name: this runs at 10 Hz (registered with
+        # Duration(1/10) since the first commit) and that IS the field-validated
+        # behavior — the pose stays pinned to RTK whenever position is usable.
+        # The "3" gate below means 3 consecutive usable GNSS FIX MESSAGES
+        # (history appended per message in callback_gnss_fix), not 3 seconds.
+        # Do not "fix" the rate without re-validating GPS-anchored driving.
         # Phase-2 decouple: gate the live RTK position correction on POSITION
         # usability (not the heading-coupled fix_usable). set_wheel_base_nav_pose
         # uses RTK position + IMU-fused heading, so this is safe and keeps the

@@ -465,9 +465,11 @@ class Node:
             self.nex_log_info_pub.publish("The name is empty!")
 
     def callback_stop_autopath(self, msg):
-        self.autopath_name = None
-        self.autopath_last_pose = None
-        if self.autopath_name is not None and self.autopath_last_pose is not None:     
+        # Check BEFORE clearing — the state was cleared first, so the condition
+        # below was always False and the user always saw "not running".
+        if self.autopath_name is not None and self.autopath_last_pose is not None:
+            self.autopath_name = None
+            self.autopath_last_pose = None
             self.status_msg_pub.publish("Autopath stopped.")
             rospy.loginfo("Autopath stopped.")
         else:
@@ -488,7 +490,12 @@ class Node:
                 self.status_msg_pub.publish("New path {} added with first waypoint.".format(msg.data))
                 rospy.loginfo("New path {} with first waypoint.".format(msg.data))
             else:
-                path_exist = path
+                # Restart the EXISTING stored path in place. The old code only
+                # reassigned the local variable (path_exist = path), so the new
+                # path never reached running_map_data and the stale one was saved.
+                path_exist.poses = [pose]
+                path_exist.tf_frame = tf_frame
+                path_exist.create_path_msg()
                 self.save_running_map_data()
                 self.status_msg_pub.publish("{} path changed.".format(msg.data))
                 rospy.loginfo("{} path changed.".format(msg.data))
@@ -508,7 +515,12 @@ class Node:
                 self.status_msg_pub.publish("New path {} added with first waypoint.".format(msg.data))
                 rospy.loginfo("New path {} with first waypoint.".format(msg.data))
             else:
-                path_exist = path
+                # Restart the EXISTING stored path in place (same fix as
+                # callback_start_new_autopath: the local reassignment never
+                # updated running_map_data).
+                path_exist.poses = [pose]
+                path_exist.tf_frame = tf_frame
+                path_exist.create_path_msg()
                 self.save_running_map_data()
                 self.status_msg_pub.publish("{} path changed.".format(msg.data))
                 rospy.loginfo("{} path changed.".format(msg.data))
@@ -917,7 +929,10 @@ class Node:
                 self.status_msg_pub.publish("There is no map to save.")
                 self.nex_log_info_pub.publish("No map to save.")
                 rospy.loginfo("There is no map to save.")
-            self.navi_launch = self.start_navi_launch(["localization:=true"])
+            # start_navi_launch() sets self.navi_launch internally and returns None —
+            # assigning the return value here overwrote the live ROSLaunchParent with
+            # None, so a later shutdown_navi_launch() skipped the shutdown (leak).
+            self.start_navi_launch(["localization:=true"])
             self.active_map = msg.data + ind_outd
             # self.map_status = "Ready"
         else:

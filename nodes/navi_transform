@@ -771,10 +771,18 @@ class NavTfNode:
 
 
     def publish_odom_for_gps(self):
-        # Intentionally ORIENTATION-ONLY: navsat_transform consumes this as its
-        # odometry input (remapped odometry/filtered) and needs the fused heading;
-        # position stays zero by design so the GPS datum is not dragged around.
+        # navsat_transform consumes this as its odometry input. It uses the
+        # POSITION at datum time to place the utm->odom transform — the old
+        # zero-position ('orientation-only') design implicitly assumed navsat is
+        # datumed while the robot sits at the odom origin (undock at the dock).
+        # With gated/late navsat launches the datum can now happen anywhere, and
+        # a zero position made gps_odom originate AT THE ROBOT's datum spot ->
+        # corrections dragged the pose toward a bogus target (drive 7: walked
+        # 14 m off-map at the slew rate). Real odom position fixes the frame
+        # alignment for ANY datum time; heading stays the fused one.
         self.odom_for_gps_msg.header.stamp = rospy.Time.now()
+        self.odom_for_gps_msg.pose.pose.position.x = self.ekf_wheel_nav_odom_msg.pose.pose.position.x
+        self.odom_for_gps_msg.pose.pose.position.y = self.ekf_wheel_nav_odom_msg.pose.pose.position.y
         self.odom_for_gps_msg.pose.pose.orientation = self.fused_msg.orientation
         self.odom_for_gps_msg.header.frame_id = "odom"
         self.odom_for_gps_msg.child_frame_id = "base_link"

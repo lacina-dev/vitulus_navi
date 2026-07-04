@@ -113,8 +113,12 @@ class NavTfNode:
         # (callback_map_coords) takes map->odom over — otherwise yaw would be
         # counted twice. odom->base is never touched -> no rtabmap feedback loop.
         self.map_odom_yaw = 0.0
-        # GPS-ownership hysteresis for callback_map_coords (see there)
-        self._map_coords_good_since = None
+        # GPS-acquisition hysteresis: GPS corrections (map_coords georef AND the
+        # loop3sec RTK set_pose) may act only after the position fix has been
+        # continuously usable this long. At acquisition the fused heading (and
+        # navsat's heading-dependent datum) may still be wrong -> the first
+        # corrections threw the pose metres aside (observed twice, 2026-07-04).
+        self._gps_good_since = None
         self._map_coords_hysteresis_s = float(rospy.get_param('~map_coords_hysteresis_s', 5.0))
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
@@ -234,6 +238,11 @@ class NavTfNode:
             except rospy.ServiceException as e:
                 rospy.logerr("Service /navi_manager/get_point_pose call failed: %s" % e)
 
+    def _gps_stable(self):
+        """GPS position continuously usable for the acquisition-hysteresis window."""
+        return self._gps_good_since is not None and \
+            (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s
+
     def callback_set_map_pose(self, msg):
         """Drive the live map->odom from an external map-frame robot pose (rtabmap lidar
         localization when GPS is denied), FULL 2D pose incl. yaw:
@@ -300,13 +309,7 @@ class NavTfNode:
         # the GPS-denied external corrections (rtabmap bridge /nav_tf/set_map_pose)
         # — and RTK flapping (observed 38 flips/2 min in rain) toggled ownership
         # and yanked the pose around ("caught one GPS -> thrown elsewhere").
-        now = rospy.get_time()
-        if not self.position_fix_usable:
-            self._map_coords_good_since = None
-        elif self._map_coords_good_since is None:
-            self._map_coords_good_since = now
-        if self._map_coords_good_since is None \
-                or (now - self._map_coords_good_since) < self._map_coords_hysteresis_s:
+        if not self._gps_stable():
             self.map_coords_msg = msg
             return
         trans = None
@@ -611,6 +614,14 @@ class NavTfNode:
         self.position_fix_usable = position_usable
         self.position_fix_usable_history.pop(0)
         self.position_fix_usable_history.append(position_usable)
+        # GPS-acquisition hysteresis (shared by callback_map_coords AND the
+        # loop3sec set_pose path): track how long the position has been
+        # CONTINUOUSLY usable. Tracked here per fix message so it ticks even
+        # when map_coords is quiet.
+        if not position_usable:
+            self._gps_good_since = None
+        elif self._gps_good_since is None:
+            self._gps_good_since = rospy.get_time()
         # print(self.fix_usable_history)
         # print("gnss_fix usable: ", usable)
 
@@ -1272,7 +1283,11 @@ class NavTfNode:
         # uses RTK position + IMU-fused heading, so this is safe and keeps the
         # pose anchored to RTK whenever position is good (~86% vs ~31% before),
         # cutting dead-reckoning drift and the map "corrections" it caused.
-        if sum(self.position_fix_usable_history) == 3:
+        # _gps_stable(): additionally require the fix to be continuously usable
+        # for the acquisition-hysteresis window — the FIRST corrections after a
+        # (re)acquisition used navsat output whose datum/heading was still wrong
+        # and threw the pose metres aside (observed 2026-07-04, both drives).
+        if sum(self.position_fix_usable_history) == 3 and self._gps_stable():
             if self.launch_navsat is not None:
                 if self._heading_ok():
                     self.fix_last_fused_time = rospy.Time.now()

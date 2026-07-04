@@ -209,6 +209,7 @@ catkin_install_python(PROGRAMS
   nodes/smach_exe_path
   nodes/smach_exe_goal
   nodes/navi_transform
+  nodes/gloc_server
 
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

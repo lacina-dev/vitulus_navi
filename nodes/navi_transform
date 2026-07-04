@@ -669,10 +669,6 @@ class NavTfNode:
         self.heading_fix_usable = usable
         if usable:
             self._heading_last_good = time.time()
-            # acquisition gate: at least one good RTK heading since the position
-            # fix (re)acquired — navsat's datum is heading-dependent, so position
-            # corrections before ANY heading anchor still jumped (drive 3).
-            self._heading_good_after_acq = True
         # print("gnss_heading_fix usable: ", usable)
 
     def _heading_ok(self):
@@ -1093,6 +1089,12 @@ class NavTfNode:
                 # GNSS re-anchors heading inside odom->base -> drop any map->odom
                 # yaw correction or the angle would be applied twice.
                 self.map_odom_yaw = 0.0
+                # Acquisition gate flag set HERE — only when the dual-antenna
+                # heading anchor has ACTUALLY been applied (drive 5: a single
+                # good-covariance heading sample set the old flag while diff_yaw
+                # was never re-anchored -> corrections ran with a gyro-drifted
+                # orientation -> brief jump / wrong orientation with one GPS).
+                self._heading_good_after_acq = True
 
     def callback_set_heading(self, msg):
         """Anchor the ABSOLUTE heading from an external map-frame yaw (radians). The IMU is

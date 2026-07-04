@@ -122,6 +122,12 @@ class NavTfNode:
         self._heading_good_after_acq = False
         self._map_coords_hysteresis_s = float(rospy.get_param('~map_coords_hysteresis_s', 5.0))
         self._rtk_odom_rx_t = 0.0   # last /odometry/gps receive time (navsat output)
+        self._gps_bad_since = None
+        self._gps_dropout_grace_s = float(rospy.get_param('~gps_dropout_grace_s', 3.0))
+        # skip external map-pose corrections while rotating fast: the source pose
+        # (rtabmap localization) is measured slightly in the past, so applying it
+        # mid-rotation smears the pose ('ujete v rotaci', drive 4)
+        self._set_map_pose_max_wz = float(rospy.get_param('~set_map_pose_max_wz', 0.3))
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
         self.init = True
@@ -266,6 +272,14 @@ class NavTfNode:
         odom_base = self.get_base_link_transform()   # odom->base_link
         if odom_base is None:
             rospy.logwarn_throttle(5.0, "[set_map_pose] no odom->base_link TF yet — skipping")
+            return
+        # Rotation guard: the external pose (rtabmap localization) is measured
+        # slightly in the past; applying it while spinning smears the pose.
+        # Skip and let the next (post-rotation) correction land instead.
+        wz = abs(self.ekf_wheel_nav_odom_msg.twist.twist.angular.z)
+        if wz > self._set_map_pose_max_wz:
+            rospy.loginfo_throttle(5.0, "[set_map_pose] rotating (%.2f rad/s) — deferring "
+                                        "external correction", wz)
             return
         # Full 2D correction: map->base = R(map_odom_yaw) * odom->base + t.
         # Yaw first (t depends on it): map yaw = map_odom_yaw + odom->base yaw.
@@ -625,11 +639,21 @@ class NavTfNode:
         # loop3sec set_pose path): track how long the position has been
         # CONTINUOUSLY usable. Tracked here per fix message so it ticks even
         # when map_coords is quiet.
+        now_t = rospy.get_time()
         if not position_usable:
-            self._gps_good_since = None
-            self._heading_good_after_acq = False
-        elif self._gps_good_since is None:
-            self._gps_good_since = rospy.get_time()
+            if self._gps_bad_since is None:
+                self._gps_bad_since = now_t
+            # Dropout GRACE: only a SUSTAINED outage resets the acquisition
+            # window. RTK flapping (seconds-long dropouts, up to 46/2 min
+            # measured) otherwise starved the corrections completely and the
+            # pose drifted on odometry/bridge (drive 4: 'dost to ujizdelo').
+            if now_t - self._gps_bad_since > self._gps_dropout_grace_s:
+                self._gps_good_since = None
+                self._heading_good_after_acq = False
+        else:
+            self._gps_bad_since = None
+            if self._gps_good_since is None:
+                self._gps_good_since = now_t
         # print(self.fix_usable_history)
         # print("gnss_fix usable: ", usable)
 

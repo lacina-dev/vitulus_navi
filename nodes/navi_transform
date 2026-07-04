@@ -113,6 +113,9 @@ class NavTfNode:
         # (callback_map_coords) takes map->odom over — otherwise yaw would be
         # counted twice. odom->base is never touched -> no rtabmap feedback loop.
         self.map_odom_yaw = 0.0
+        # GPS-ownership hysteresis for callback_map_coords (see there)
+        self._map_coords_good_since = None
+        self._map_coords_hysteresis_s = float(rospy.get_param('~map_coords_hysteresis_s', 5.0))
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
         self.init = True
@@ -290,9 +293,22 @@ class NavTfNode:
                 rospy.loginfo("[navi_transform] navsat_transform was not running — will launch fresh on GPS ready")
 
     def callback_map_coords(self, msg):
-        # if msg.pose != self.map_coords_msg.pose:
-        #     print("Map changed")
-        #     print(msg.pose)
+        # GPS georef may own map->odom ONLY while the GPS position is USABLE and
+        # has been stable for a few seconds. Without this gate, once navsat has
+        # ever established utm->odom, every map_coords message re-pinned map->odom
+        # from a possibly bad/multipath datum even with gps_good=0 — overwriting
+        # the GPS-denied external corrections (rtabmap bridge /nav_tf/set_map_pose)
+        # — and RTK flapping (observed 38 flips/2 min in rain) toggled ownership
+        # and yanked the pose around ("caught one GPS -> thrown elsewhere").
+        now = rospy.get_time()
+        if not self.position_fix_usable:
+            self._map_coords_good_since = None
+        elif self._map_coords_good_since is None:
+            self._map_coords_good_since = now
+        if self._map_coords_good_since is None \
+                or (now - self._map_coords_good_since) < self._map_coords_hysteresis_s:
+            self.map_coords_msg = msg
+            return
         trans = None
         try:
             trans = self.tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))

@@ -932,7 +932,13 @@ class Node:
             # start_navi_launch() sets self.navi_launch internally and returns None —
             # assigning the return value here overwrote the live ROSLaunchParent with
             # None, so a later shutdown_navi_launch() skipped the shutdown (leak).
-            self.start_navi_launch(["localization:=true"])
+            # rtabmap_on_start: keep rtabmap running in LOCALIZATION mode after a map
+            # save too (same as callback_load_map) — the plain localization:=true
+            # branch otherwise STOPS the container and localization dies.
+            if self.params.get('rtabmap_on_start', False):
+                self.start_navi_launch(["localization:=true_rtabmap"])
+            else:
+                self.start_navi_launch(["localization:=true"])
             self.active_map = msg.data + ind_outd
             # self.map_status = "Ready"
         else:

@@ -51,7 +51,15 @@ class GlocServer(object):
         self.dist_cap_m = rospy.get_param('~dist_cap_m', 1.0)
         self.occ_thresh = int(rospy.get_param('~occ_thresh', 65))
         self.ambiguity_radius = rospy.get_param('~ambiguity_radius_m', 1.5)
-        self.apply_min_margin = rospy.get_param('~apply_min_margin', 0.5)  # 50 %
+        # Lawn test 2026-07-04: a mirrored (~180deg-flipped) hypothesis reached
+        # margin 95% on open grass -> 50% was not safe there. 100% + the IMU-yaw
+        # sanity check below killed every observed false-confident case.
+        self.apply_min_margin = rospy.get_param('~apply_min_margin', 1.0)  # 100 %
+        # The gyro tracks rotation even when the robot is carried (kidnap), so the
+        # current heading stays roughly valid when position is lost — a candidate
+        # whose yaw disagrees wildly is a mirror alias, not the robot.
+        self.apply_max_yaw_dev = math.radians(
+            rospy.get_param('~apply_max_yaw_dev_deg', 45.0))
         self.scan_topic = rospy.get_param('~scan_topic', '/scan')
         self.auto_apply = bool(rospy.get_param('~auto_apply', False))
         self.map_frame = rospy.get_param('~map_frame', 'map')
@@ -213,6 +221,10 @@ class GlocServer(object):
                 break
 
         cur = self._current_pose()
+        yaw_sane = True
+        if cur is not None:
+            yaw_dev = abs(math.atan2(math.sin(byaw - cur[2]), math.cos(byaw - cur[2])))
+            yaw_sane = bool(yaw_dev <= self.apply_max_yaw_dev)
         result = {
             'stamp': rospy.Time.now().to_sec(),
             'best': {'x': round(bx, 2), 'y': round(by, 2),
@@ -220,6 +232,8 @@ class GlocServer(object):
                      'score_m': round(float(best_score[ib]), 4)},
             'margin': round(margin, 3) if math.isfinite(margin) else 999.0,
             'margin_ok': bool(margin >= self.apply_min_margin),
+            'yaw_sane': yaw_sane,
+            'apply_ok': bool(margin >= self.apply_min_margin and yaw_sane),
             'apply_min_margin': self.apply_min_margin,
             'top': top,
             'current_pose': None if cur is None else
@@ -332,12 +346,14 @@ class GlocServer(object):
             rospy.logwarn('[gloc] apply requested but no result yet')
             return
         force = (msg.data == 'force')
-        if not r['margin_ok'] and not force:
-            rospy.logwarn('[gloc] apply REFUSED: margin %.0f%% < gate %.0f%% '
-                          "(publish 'force' to override)",
-                          r['margin'] * 100, self.apply_min_margin * 100)
-            self._set_status('apply refused: margin %.0f%% < %.0f%%'
-                             % (r['margin'] * 100, self.apply_min_margin * 100))
+        if not r.get('apply_ok', r['margin_ok']) and not force:
+            why = ('margin %.0f%% < gate %.0f%%' % (r['margin'] * 100,
+                                                    self.apply_min_margin * 100)
+                   if not r['margin_ok'] else
+                   'candidate yaw deviates > %.0f deg from current heading '
+                   '(mirror alias?)' % math.degrees(self.apply_max_yaw_dev))
+            rospy.logwarn("[gloc] apply REFUSED: %s (publish 'force' to override)", why)
+            self._set_status('apply refused: %s' % why)
             return
         self._do_apply(r, why='force' if force else 'manual')
 

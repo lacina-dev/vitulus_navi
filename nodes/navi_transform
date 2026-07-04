@@ -128,6 +128,9 @@ class NavTfNode:
         # (rtabmap localization) is measured slightly in the past, so applying it
         # mid-rotation smears the pose ('ujete v rotaci', drive 4)
         self._set_map_pose_max_wz = float(rospy.get_param('~set_map_pose_max_wz', 0.3))
+        # smooth takeover: slew rates for large corrections after GPS acquisition
+        self._heading_slew_dps = float(rospy.get_param('~heading_slew_dps', 5.0))
+        self._pos_slew_mps = float(rospy.get_param('~pos_slew_mps', 0.3))
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
         self.init = True
@@ -1032,8 +1035,24 @@ class NavTfNode:
         try:
             pose_srv = SetPoseRequest()
             if pose is None:
-                pose_srv.pose.pose.pose.position.x = self.rtk_odom_msg.pose.pose.position.x
-                pose_srv.pose.pose.pose.position.y = self.rtk_odom_msg.pose.pose.position.y
+                # SMOOTH position convergence: after a GPS-denied stretch the
+                # odometry has drifted; snapping the EKF straight to the RTK
+                # position was the second half of the takeover jump (drive-6
+                # forensics: 0.5 m step right when the gate opened). Large
+                # deltas converge at ~pos_slew_mps via capped per-call steps
+                # (corrections run at ~10 Hz); small ones apply directly.
+                tx = self.rtk_odom_msg.pose.pose.position.x
+                ty = self.rtk_odom_msg.pose.pose.position.y
+                cx = self.ekf_wheel_nav_odom_msg.pose.pose.position.x
+                cy = self.ekf_wheel_nav_odom_msg.pose.pose.position.y
+                dx, dy = tx - cx, ty - cy
+                dist = math.hypot(dx, dy)
+                max_step = self._pos_slew_mps * 0.1   # per call at ~10 Hz
+                if dist > max(max_step, 0.10):
+                    scale = max_step / dist
+                    tx, ty = cx + dx * scale, cy + dy * scale
+                pose_srv.pose.pose.pose.position.x = tx
+                pose_srv.pose.pose.pose.position.y = ty
                 pose_srv.pose.pose.pose.position.z = self.rtk_odom_msg.pose.pose.position.z
                 pose_srv.pose.pose.pose.orientation.x = self.fused_msg.orientation.x
                 pose_srv.pose.pose.pose.orientation.y = self.fused_msg.orientation.y
@@ -1084,7 +1103,20 @@ class NavTfNode:
                     rtk_yaw += 2 * math.pi
                 if imu1_yaw < 0:
                     imu1_yaw += 2 * math.pi
-                self.diff_yaw = (rtk_yaw - imu1_yaw) + 1.5708  # 90 degrees
+                target = (rtk_yaw - imu1_yaw) + 1.5708  # 90 degrees
+                # SMOOTH re-anchor: forensics (drive 6) showed the anchor snapped
+                # the heading by 12 deg within 2 s of RTK acquiring — the visible
+                # 'jump when GPS turns green'. Large corrections now SLEW at
+                # ~heading_slew_dps toward the GNSS target instead of stepping;
+                # small ones (< ~2 deg) apply directly. First-ever anchor (init)
+                # still snaps (nothing to jump FROM).
+                err = math.atan2(math.sin(target - self.diff_yaw),
+                                 math.cos(target - self.diff_yaw))
+                max_step = math.radians(self._heading_slew_dps) * 0.1  # called ~10 Hz w/ heading fixes
+                if self.init or abs(err) <= math.radians(2.0):
+                    self.diff_yaw = target
+                else:
+                    self.diff_yaw += max(-max_step, min(max_step, err))
                 self.init = False
                 # GNSS re-anchors heading inside odom->base -> drop any map->odom
                 # yaw correction or the angle would be applied twice.

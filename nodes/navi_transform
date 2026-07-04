@@ -121,6 +121,7 @@ class NavTfNode:
         self._gps_good_since = None
         self._heading_good_after_acq = False
         self._map_coords_hysteresis_s = float(rospy.get_param('~map_coords_hysteresis_s', 5.0))
+        self._rtk_odom_rx_t = 0.0   # last /odometry/gps receive time (navsat output)
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
         self.init = True
@@ -382,6 +383,7 @@ class NavTfNode:
 
     def callback_rtk_odom(self, msg):
         self.rtk_odom_msg = msg
+        self._rtk_odom_rx_t = rospy.get_time()
         self.rtk_odom_heading_msg = copy.deepcopy(msg)
         self.rtk_odom_heading_msg.pose.pose.orientation = self.fused_msg.orientation
 
@@ -1298,14 +1300,24 @@ class NavTfNode:
         # (re)acquisition used navsat output whose datum/heading was still wrong
         # and threw the pose metres aside (observed 2026-07-04, both drives).
         if sum(self.position_fix_usable_history) == 3 and self._gps_stable():
+            # Corrections may ONLY use a FRESH navsat output. rtk_odom_msg
+            # (/odometry/gps) is ZEROS before navsat ever publishes and STALE
+            # right after a (re)launch — set_pose from it teleported the robot
+            # to ~map origin at every first GPS acquisition (the 'brief jump to
+            # a completely different position', drives 1-3, 2026-07-04).
+            rtk_fresh = (rospy.get_time() - self._rtk_odom_rx_t) < 2.0
             if self.launch_navsat is not None:
-                if self._heading_ok():
+                if self._heading_ok() and rtk_fresh:
                     self.fix_last_fused_time = rospy.Time.now()
                     self.set_wheel_base_nav_pose()
+                elif not rtk_fresh:
+                    # keep init_navsat's launch condition alive without moving
+                    # the robot from a zero/stale gps_odom
+                    self.fix_last_fused_time = rospy.Time.now()
             else:
+                # navsat not launched yet: only bootstrap its launch condition
+                # (init_navsat checks fused_fix_time<1); NEVER set_pose here.
                 self.fix_last_fused_time = rospy.Time.now()
-                # self.set_nav_wheel_odom()
-                self.set_wheel_base_nav_pose()
         # Phase 1 GO-LIVE: GPS denied -> if live bridging is enabled and a TRUSTED
         # relative source (VO/lidar, already covariance + freshness + hysteresis +
         # wheel-cross-check gated) is carrying the bridge, drive the live pose from

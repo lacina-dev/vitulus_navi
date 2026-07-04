@@ -258,9 +258,13 @@ class Node:
 
     def callback_web_plan_show_map(self, msg):
         if msg.data == "rtabmap":
-            #  Test if rtabmap docker is running and start if not
+            #  Test if rtabmap docker is RUNNING and start if not. An EXISTING but
+            #  exited container (e.g. after a crash) must not block the start —
+            #  run() stops/removes it first.
             try:
                 tst_cont = self.rtabmap_mapping.client.containers.get(self.rtabmap_mapping.cont_name)
+                if tst_cont is not None and tst_cont.status != "running":
+                    tst_cont = None
             except:
                 tst_cont = None
             if tst_cont is None:
@@ -911,6 +915,14 @@ class Node:
                     # self.pub_active_map.publish(String(node.active_map))
 
             self.shutdown_navi_launch()
+            # Stop the rtabmap container BEFORE copying the live db OUT: rtabmap
+            # holds the sqlite open and keeps writing (in localization mode it
+            # writes Admin opt_* blobs on close/periodically) — copying a live db
+            # produced a snapshot whose Admin opt state SEGFAULTS rtabmap 0.21.4
+            # on the next load (observed 2026-07-04; recovered by nulling the
+            # blobs). A cleanly-closed db saves safely; the container is started
+            # again right after by start_navi_launch (rtabmap_on_start).
+            self.rtabmap_mapping.stop()
             self.status_msg_pub.publish("Saving the map...")
             self.nex_log_info_pub.publish("Saving the map.")
             if (exists("/home/vitulus/.ros/rtabmap.db") and exists("/home/vitulus/.ros/mapdata.pkl")):

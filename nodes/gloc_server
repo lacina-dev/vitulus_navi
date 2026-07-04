@@ -241,7 +241,7 @@ class GlocServer(object):
         if with_heatmap:
             try:
                 self._publish_heatmap(occ, free, res, ox, oy, H, W,
-                                      fr, fc, best_score, (bx, by), cur)
+                                      fr, fc, best_score, (bx, by, byaw), cur)
             except Exception as e:
                 rospy.logwarn('[gloc] heatmap failed: %s', e)
         rospy.loginfo('[gloc] best (%.2f, %.2f, %.1fdeg) score %.3f margin %.0f%% in %.2fs',
@@ -250,23 +250,46 @@ class GlocServer(object):
         return result
 
     def _publish_heatmap(self, occ, free, res, ox, oy, H, W, fr, fc,
-                         best_score, best_xy, cur):
+                         best_score, best_xyyaw, cur):
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         heat = np.full((H, W), np.nan, dtype=np.float32)
-        heat[fr, fc] = best_score
+        # paint a stride-sized block per sampled position — single pixels vanish
+        # at render resolution and the heatmap looked empty
+        s = max(1, int(round(self.pos_stride_m / res)))
+        for dr in range(-(s // 2), s // 2 + 1):
+            for dc in range(-(s // 2), s // 2 + 1):
+                rr2 = np.clip(fr + dr, 0, H - 1)
+                cc2 = np.clip(fc + dc, 0, W - 1)
+                heat[rr2, cc2] = best_score
         fig, ax = plt.subplots(figsize=(7, 7 * H / max(W, 1)))
         bg = np.where(occ, 0.0, np.where(free, 1.0, 0.6))
         ax.imshow(bg, cmap='gray', vmin=0, vmax=1, origin='lower')
         hm = ax.imshow(heat, cmap='viridis_r', alpha=0.85, origin='lower')
         fig.colorbar(hm, ax=ax, label='score [m] (lower = better)')
-        bx, by = best_xy
-        ax.plot((bx - ox) / res - 0.5, (by - oy) / res - 0.5,
-                'wo', ms=11, mfc='none', mew=2.5, label='best')
+
+        def draw_pose(x, y, yaw, color, label, crosshair=False):
+            # cross pinpoints the position; short arrow shows the heading;
+            # optional full-image dashed crosshair makes it findable at a glance
+            c = (x - ox) / res - 0.5
+            r = (y - oy) / res - 0.5
+            if crosshair:
+                ax.axhline(r, color=color, lw=0.7, ls='--', alpha=0.35)
+                ax.axvline(c, color=color, lw=0.7, ls='--', alpha=0.35)
+            arrow_px = 0.8 / res
+            ax.annotate('', xy=(c + arrow_px * math.cos(yaw),
+                                r + arrow_px * math.sin(yaw)),
+                        xytext=(c, r),
+                        arrowprops=dict(arrowstyle='-|>', color=color,
+                                        lw=1.8, shrinkA=0, shrinkB=0))
+            ax.plot(c, r, marker='+', color=color, ms=15, mew=2.5,
+                    label=label, zorder=5)
+
+        bx, by, byaw = best_xyyaw
+        draw_pose(bx, by, byaw, '#1e6fff', 'best hypothesis', crosshair=True)
         if cur is not None:
-            ax.plot((cur[0] - ox) / res - 0.5, (cur[1] - oy) / res - 0.5,
-                    'r*', ms=15, label='current pose')
+            draw_pose(cur[0], cur[1], cur[2], 'red', 'current pose')
         ax.legend(loc='upper right')
         ax.set_axis_off()
         buf = io.BytesIO()

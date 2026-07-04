@@ -64,11 +64,13 @@ class DockerConnection:
                 time.sleep(0.3)
             except:
                 break
+        # deliberate stop -> the watchdog must not resurrect it
+        self.cont_command = None
         return True
 
     def run(self, command):
-        self.cont_command = command
         self.stop()
+        self.cont_command = command
         self.cont = self.client.containers.run("vitulus/rtabmap_ros:noetic-latest", auto_remove=False, detach=True,
                                     environment=["ROS_HOME=/tmp/.ros"],
                                     command=self.cont_command,
@@ -92,6 +94,7 @@ class Node:
         self.map_name = "INIT"
         self.navi_launch = None
         self.odom_sub = None
+        self._wd_last_restart = {}   # container watchdog rate limit
         self.map_data = MapData("new")
         self.running_map_data = MapData("new")
         self.point_to_publish = ""
@@ -845,6 +848,34 @@ class Node:
         rospy.loginfo("Vitulus navi stopped.")
         self.status_msg_pub.publish("Vitulus navi stopped.")
 
+    def container_watchdog(self):
+        """Restart docker containers that SHOULD be running (cont_command set,
+        not deliberately stopped) but died. rtabmap 0.21.4 segfaults starting
+        under boot load (observed 2026-07-04, deterministic-ish race); a quiet
+        retry succeeds. Rate-limited to one restart attempt per minute per
+        container."""
+        now = time.time()
+        for conn in (self.rtabmap_mapping, self.rtabmap_obstacles, self.rtabmap_odom_sync):
+            cmd = conn.cont_command
+            if not cmd:
+                continue
+            try:
+                status = conn.client.containers.get(conn.cont_name).status
+            except Exception:
+                status = 'absent'
+            if status == 'running':
+                continue
+            last = self._wd_last_restart.get(conn.cont_name, 0)
+            if now - last < 60.0:
+                continue
+            self._wd_last_restart[conn.cont_name] = now
+            rospy.logwarn('[watchdog] container %s is %s -> restarting (%s)',
+                          conn.cont_name, status, ' '.join(cmd[:3]))
+            try:
+                conn.run(list(cmd))
+            except Exception as e:
+                rospy.logerr('[watchdog] restart of %s failed: %s', conn.cont_name, e)
+
     def switch_rtabmap_to_mapping(self):
         """ Failure B fix helper. Switch an already-running, relocalized rtabmap
         container from LOCALIZATION mode to incremental MAPPING using the rtabmap
@@ -1319,6 +1350,7 @@ if __name__ == '__main__':
                 node.set_map_status()
                 node.publish_map()
                 node.rtabmap_settings_publish()
+                node.container_watchdog()
                 
                 # node.publish_map_coords()
                 slow_counter = 0

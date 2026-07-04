@@ -119,6 +119,7 @@ class NavTfNode:
         # navsat's heading-dependent datum) may still be wrong -> the first
         # corrections threw the pose metres aside (observed twice, 2026-07-04).
         self._gps_good_since = None
+        self._heading_good_after_acq = False
         self._map_coords_hysteresis_s = float(rospy.get_param('~map_coords_hysteresis_s', 5.0))
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
@@ -239,9 +240,13 @@ class NavTfNode:
                 rospy.logerr("Service /navi_manager/get_point_pose call failed: %s" % e)
 
     def _gps_stable(self):
-        """GPS position continuously usable for the acquisition-hysteresis window."""
+        """GPS corrections allowed: position continuously usable for the
+        acquisition-hysteresis window AND at least one good RTK heading seen
+        since acquisition (the fused heading / navsat datum is heading-dependent
+        — position-only stability still produced a brief jump, drive 3)."""
         return self._gps_good_since is not None and \
-            (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s
+            (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s and \
+            self._heading_good_after_acq
 
     def callback_set_map_pose(self, msg):
         """Drive the live map->odom from an external map-frame robot pose (rtabmap lidar
@@ -620,6 +625,7 @@ class NavTfNode:
         # when map_coords is quiet.
         if not position_usable:
             self._gps_good_since = None
+            self._heading_good_after_acq = False
         elif self._gps_good_since is None:
             self._gps_good_since = rospy.get_time()
         # print(self.fix_usable_history)
@@ -637,6 +643,10 @@ class NavTfNode:
         self.heading_fix_usable = usable
         if usable:
             self._heading_last_good = time.time()
+            # acquisition gate: at least one good RTK heading since the position
+            # fix (re)acquired — navsat's datum is heading-dependent, so position
+            # corrections before ANY heading anchor still jumped (drive 3).
+            self._heading_good_after_acq = True
         # print("gnss_heading_fix usable: ", usable)
 
     def _heading_ok(self):

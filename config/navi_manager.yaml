@@ -5,7 +5,7 @@
 # robot in it immediately (no GPS needed). The map MUST contain the "docked"
 # waypoint (be docked + localized, then publish "docked" to /navi_manager/save_waypoint
 # and SAVE the map).
-load_map_on_start: "aaaa***env*OUTDOOR"
+load_map_on_start: "GARDEN_2026***env*OUTDOOR"
 
 # When loading a map (at boot AND from the UI), also start the rtabmap docker
 # container in LOCALIZATION mode on it. This is what lets the robot localize in

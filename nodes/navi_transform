@@ -123,6 +123,7 @@ class NavTfNode:
         self._map_coords_hysteresis_s = float(rospy.get_param('~map_coords_hysteresis_s', 5.0))
         self._rtk_odom_rx_t = 0.0   # last /odometry/gps receive time (navsat output)
         self._docked = False   # /dock_smach/dock_status == 0 (see _gps_stable)
+        self._rtabmap_confident = False   # /nav_tf/rtabmap_confident (ownership pivot)
         self._gps_bad_since = None
         self._gps_dropout_grace_s = float(rospy.get_param('~gps_dropout_grace_s', 3.0))
         # skip external map-pose corrections while rotating fast: the source pose
@@ -182,6 +183,10 @@ class NavTfNode:
         self.dock_status_sub = rospy.Subscriber("/dock_smach/dock_status", _Int8,
                                                 lambda m: setattr(self, '_docked', int(m.data) == 0),
                                                 queue_size=2)
+        # ownership pivot: map owns the pose while rtabmap is confident
+        self.rtabmap_conf_sub = rospy.Subscriber("/nav_tf/rtabmap_confident", Bool,
+                                                 lambda m: setattr(self, '_rtabmap_confident', bool(m.data)),
+                                                 queue_size=2)
 
         # --- vitulus_ui Phase 1: shadow bridge preview (Step A) ----------------
         # ADDITIVE / SHADOW ONLY: evaluates the VO (/vo/odom) and lidar
@@ -263,8 +268,12 @@ class NavTfNode:
         NEVER while DOCKED: the dock bay is a known multipath trap — RTK there
         occasionally passes the covariance gates with confident garbage and
         yanked the pose 2.4 m (2026-07-05 night); the dock anchor + rtabmap own
-        the pose at the dock."""
-        if self._docked:
+        the pose at the dock.
+        OWNERSHIP PIVOT: while rtabmap is CONFIDENTLY localized (published by the
+        dock seed bridge as /nav_tf/rtabmap_confident), the MAP owns the pose —
+        mowing zones live in the map frame, so map-consistency beats
+        RTK-consistency. GPS resumes on open lawn where the lidar has nothing."""
+        if self._docked or self._rtabmap_confident:
             return False
         return self._gps_good_since is not None and \
             (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s and \

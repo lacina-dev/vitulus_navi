@@ -122,6 +122,7 @@ class NavTfNode:
         self._heading_good_after_acq = False
         self._map_coords_hysteresis_s = float(rospy.get_param('~map_coords_hysteresis_s', 5.0))
         self._rtk_odom_rx_t = 0.0   # last /odometry/gps receive time (navsat output)
+        self._docked = False   # /dock_smach/dock_status == 0 (see _gps_stable)
         self._gps_bad_since = None
         self._gps_dropout_grace_s = float(rospy.get_param('~gps_dropout_grace_s', 3.0))
         # skip external map-pose corrections while rotating fast: the source pose
@@ -176,6 +177,11 @@ class NavTfNode:
         # Same priority rule as set_heading: callers publish ONLY when their higher-priority
         # source (GNSS) is unavailable, so this never fights the GPS map->odom path.
         self.set_map_pose_sub = rospy.Subscriber("/nav_tf/set_map_pose", PoseStamped, self.callback_set_map_pose, queue_size=1)
+        # docked truth (Int8, latched, 0 == docked) -> suppress GPS ownership at the dock
+        from std_msgs.msg import Int8 as _Int8
+        self.dock_status_sub = rospy.Subscriber("/dock_smach/dock_status", _Int8,
+                                                lambda m: setattr(self, '_docked', int(m.data) == 0),
+                                                queue_size=2)
 
         # --- vitulus_ui Phase 1: shadow bridge preview (Step A) ----------------
         # ADDITIVE / SHADOW ONLY: evaluates the VO (/vo/odom) and lidar
@@ -253,7 +259,13 @@ class NavTfNode:
         """GPS corrections allowed: position continuously usable for the
         acquisition-hysteresis window AND at least one good RTK heading seen
         since acquisition (the fused heading / navsat datum is heading-dependent
-        — position-only stability still produced a brief jump, drive 3)."""
+        — position-only stability still produced a brief jump, drive 3).
+        NEVER while DOCKED: the dock bay is a known multipath trap — RTK there
+        occasionally passes the covariance gates with confident garbage and
+        yanked the pose 2.4 m (2026-07-05 night); the dock anchor + rtabmap own
+        the pose at the dock."""
+        if self._docked:
+            return False
         return self._gps_good_since is not None and \
             (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s and \
             self._heading_good_after_acq

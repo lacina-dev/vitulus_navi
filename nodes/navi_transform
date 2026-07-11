@@ -172,6 +172,22 @@ class NavTfNode:
         # newest lag-old sample fails motion verification — protects the pose
         # from a lying multipath tail). None until the first verified anchor.
         self._anchor_verified = None
+        # FIX3 (telemfix 2026-07-11): anchor observability. Wall time the
+        # verified anchor last ADVANCED (a fresh lag-old sample verified) so
+        # loc_status can expose its age; a warn fires (throttled) when it stays
+        # frozen > _anchor_frozen_warn_s while GPS owns the pose — a frozen
+        # anchor means the multipath tail is being rejected (correct) but the
+        # pose is running open-loop on the wheel EKF and the operator must see it.
+        self._anchor_last_advance_t = None
+        self._anchor_frozen_warn_s = float(rospy.get_param('~anchor_frozen_warn_s', 5.0))
+        # FIX1 (telemfix 2026-07-11): capture the live nav pose AND time-paired
+        # RTK pose at the resume tick BEFORE the first new correction is applied,
+        # so the drift report is measured against INDEPENDENT RTK truth (not the
+        # self-referential frozen anchor, which cancelled the error to 0.082 m
+        # against a true 0.27 m). Populated in loop3sec on the resume tick.
+        self._resume_live_pose = None     # (x, y) live nav-EKF pose at resume, pre-correction
+        self._resume_rtk_pose = None      # (x, y) time-paired RTK pose at resume
+        self._resume_rtk_fresh = False    # was the RTK sample fresh at resume
         self._anchor_owned = False        # were we writing continuous anchors last tick
         self._anchor_lost_t = None        # wall time GPS ownership was lost
         self._anchor_lost_pose = None     # (map x, y, yaw) at the moment ownership was lost
@@ -343,6 +359,10 @@ class NavTfNode:
         # health, so downstream stops string-parsing bridge_status. Published at
         # 1 Hz from loop1hz (see publish_loc_status).
         self.loc_status_pub = rospy.Publisher("/nav_tf/loc_status", String, queue_size=1, latch=True)
+        # FIX4 (telemfix): edge-triggered loc_status. Baseline stays 1 Hz; on an
+        # owner-change edge publish_loc_status is called immediately so an
+        # ownership transition is not smeared into the next 1 Hz tick.
+        self._last_published_owner = None
         # Runtime on/off for live bridging (Phase 1 go-live). Publish std_msgs/Bool
         # to /nav_tf/bridge_live_enable to toggle without a restart.
         self.bridge_live_enable_sub = rospy.Subscriber("/nav_tf/bridge_live_enable", Bool, self.callback_bridge_live_enable, queue_size=1)
@@ -720,6 +740,23 @@ class NavTfNode:
         # runaway glitches (e.g. the observed 7 m jump) are rejected.
         self._bridge_xcheck_mult = float(rospy.get_param('~bridge/wheel_xcheck_mult', 3.0))
         self._bridge_xcheck_abs = float(rospy.get_param('~bridge/wheel_xcheck_abs_m', 0.05))  # m
+        # FIX2 (telemfix 2026-07-11): creeping-yaw / frame-reset containment.
+        # (a) Accumulated-divergence guard: track |bridge - wheel-EKF-delta pose|
+        #     over the dropout; when it exceeds ~bridge/max_accum_div_m the bridge
+        #     has drifted (source yaw crept, e.g. licp -152deg->+30deg while parked)
+        #     -> RESET the bridge to the wheel-EKF-based estimate. Validated on the
+        #     t=586-611 window: unguarded div 2.64 m -> capped 1.00 m.
+        # (b) Frame-reset blackout: a source msg whose pose jumps >2 m or lands ~at
+        #     origin after a nonzero pose is a frame RESET (VO@586.6, licp@605-611
+        #     flipped origin<->pose every ~0.3 s) -> force that source unusable for
+        #     ~bridge/reset_blackout_s so a teleport delta cannot enter the bridge.
+        self._bridge_max_accum_div = float(rospy.get_param('~bridge/max_accum_div_m', 1.0))  # m
+        self._bridge_reset_blackout_s = float(rospy.get_param('~bridge/reset_blackout_s', 3.0))
+        self._bridge_reset_jump_m = float(rospy.get_param('~bridge/reset_jump_m', 2.0))  # m
+        # per-source frame-reset blackout expiry (wall time); anchor at the moment
+        # the bridge last (re)anchored, for the accumulated-divergence measure.
+        self._src_reset_until = {'vo': 0.0, 'licp': 0.0}
+        self._bridge_wheel_anchor = None   # (bx,by,byaw, wheel_x,wheel_y, theta) at (re)anchor
         # Phase 1 go-live: when True and GPS is denied, drive the LIVE pose from
         # the bridge (VO/lidar dead-reckon) instead of letting the EKF drift on
         # wheels. Default OFF for safety (dock/undock + startup run on known-good
@@ -746,6 +783,23 @@ class NavTfNode:
             if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(yaw)):
                 return
             s = self._src[key]
+            # FIX2 (telemfix): frame-RESET signature on this source message —
+            # a pose jump > reset_jump_m, or landing ~at origin after a nonzero
+            # pose (VO/licp teleport their odom frame origin on re-init). Force
+            # the source unusable for ~reset_blackout_s so the teleport delta
+            # never enters the bridge integration.
+            if key in self._src_reset_until and s.get('have'):
+                jump = math.hypot(x - s['x'], y - s['y'])
+                near_origin = (math.hypot(x, y) < 0.05
+                               and math.hypot(s['x'], s['y']) > 0.5)
+                if jump > self._bridge_reset_jump_m or near_origin:
+                    self._src_reset_until[key] = (rospy.Time.now().to_sec()
+                                                  + self._bridge_reset_blackout_s)
+                    rospy.logwarn_throttle(
+                        3.0, "[bridge] source '%s' frame-reset (jump=%.2fm%s) — "
+                        "blackout %.1fs", key, jump,
+                        ", origin" if near_origin else "",
+                        self._bridge_reset_blackout_s)
             s['x'], s['y'], s['yaw'] = x, y, yaw
             s['cov'] = msg.pose.covariance[0]
             s['t'] = rospy.Time.now().to_sec()
@@ -763,6 +817,9 @@ class NavTfNode:
         s = self._src[key]
         fresh = s['have'] and (now - s['t']) < self._bridge_fresh_s
         quality = True if key == 'wheel' else (s['cov'] < self._bridge_cov_thresh)
+        # FIX2 (telemfix): a source under a frame-reset blackout is unusable.
+        if key in self._src_reset_until and now < self._src_reset_until[key]:
+            quality = False
         if fresh and quality:
             s['good'] = min(s['good'] + 1, self._bridge_hyst)
         else:
@@ -791,6 +848,42 @@ class NavTfNode:
             return sd <= self._bridge_xcheck_abs
         return sd <= self._bridge_xcheck_mult * wd + self._bridge_xcheck_abs
 
+    def _bridge_reanchor_wheel(self, bx, by, byaw):
+        """FIX2 (telemfix): capture the accumulated-divergence anchor — the
+        bridge pose and the correction-free wheel-EKF pose (+ the map<-wheel yaw
+        offset) at the instant the bridge is (re)anchored. The guard rotates the
+        wheel-EKF delta since this anchor into the map frame and compares."""
+        wp = self.ekf_wheel_odom_msg.pose.pose
+        wq = wp.orientation
+        wyaw = euler_from_quaternion([wq.x, wq.y, wq.z, wq.w])[2]
+        theta = math.atan2(math.sin(byaw - wyaw), math.cos(byaw - wyaw))
+        self._bridge_wheel_anchor = (bx, by, wp.position.x, wp.position.y, theta)
+
+    def _bridge_accum_guard(self):
+        """FIX2 (telemfix): if the bridge has diverged from the wheel-EKF-delta
+        estimate by more than ~bridge/max_accum_div_m, reset it to that estimate.
+        The wheel EKF is never set_pose'd (correction-free) and its heading drift
+        over a short dropout is small, so it is a valid referee for a source whose
+        yaw is creeping (licp). Silent no-op when there is no anchor yet."""
+        a = self._bridge_wheel_anchor
+        if a is None:
+            return
+        bx0, by0, wx0, wy0, theta = a
+        wp = self.ekf_wheel_odom_msg.pose.pose.position
+        ct, st = math.cos(theta), math.sin(theta)
+        ex = bx0 + (ct * (wp.x - wx0) - st * (wp.y - wy0))
+        ey = by0 + (st * (wp.x - wx0) + ct * (wp.y - wy0))
+        div = math.hypot(self._bridge['x'] - ex, self._bridge['y'] - ey)
+        if div > self._bridge_max_accum_div:
+            rospy.logwarn_throttle(
+                3.0, "[bridge] accumulated divergence %.2fm > %.2fm — resetting "
+                "to wheel-EKF estimate (source yaw crept)",
+                div, self._bridge_max_accum_div)
+            self._bridge['x'], self._bridge['y'] = ex, ey
+            # keep the current bridge yaw; the wheel-EKF heading is the reference
+            # only for position runaway. Re-anchor so divergence restarts from 0.
+            self._bridge_reanchor_wheel(ex, ey, self._bridge['yaw'])
+
     def update_bridge_preview(self):
         now = rospy.Time.now().to_sec()
         # keep the wheel source fresh from the live wheel odom message
@@ -809,6 +902,7 @@ class NavTfNode:
             bx, by, byaw = self._odom_xyyaw(self.base_odom_msg)
             self._bridge.update({'x': bx, 'y': by, 'yaw': byaw, 'init': True})
             self._bridge_active = 'gps' if gps_good else 'init'
+            self._bridge_reanchor_wheel(bx, by, byaw)   # FIX2 divergence anchor
         else:
             # GPS denied -> dead-reckon with the best gated source
             # (lowest-covariance visual/lidar; wheel/IMU as last resort)
@@ -832,6 +926,14 @@ class NavTfNode:
                     self._bridge['x'] += bc * lx - bs * ly
                     self._bridge['y'] += bs * lx + bc * ly
                     self._bridge['yaw'] = self._wrap(self._bridge['yaw'] + dyaw)
+            # FIX2 (telemfix): accumulated-divergence guard. A creeping source
+            # yaw (licp -152deg->+30deg while parked) walks the bridge away with
+            # no single-cycle jump the clamp above can catch. Compare the bridge
+            # to the correction-free wheel-EKF delta (rotated into the map frame
+            # at re-anchor); when the accumulated divergence exceeds
+            # ~bridge/max_accum_div_m, RESET the bridge to that wheel-based
+            # estimate. Validated on t=586-611: unguarded 2.64 m -> capped 1.00 m.
+            self._bridge_accum_guard()
 
         # advance every source's reference to current so source switching is seamless
         for k, s in self._src.items():
@@ -901,6 +1003,16 @@ class NavTfNode:
                 owner = fresh_src
             else:
                 owner = 'dr'
+            # FIX3 (telemfix): anchor observability. anchor_age_s = seconds since
+            # the verified anchor last advanced (None until the first advance);
+            # anchor_frozen = it has been frozen past ~anchor_frozen_warn_s while
+            # GPS owns the pose (pose running open-loop on the wheel EKF).
+            anchor_age = None
+            anchor_frozen = False
+            if self._anchor_last_advance_t is not None:
+                anchor_age = round(now_s - self._anchor_last_advance_t, 2)
+                anchor_frozen = bool(gps_stable
+                                     and anchor_age > self._anchor_frozen_warn_s)
             status = {
                 'owner': owner,
                 'gps_good': bool(gps_stable),
@@ -909,12 +1021,38 @@ class NavTfNode:
                 'docked': bool(self._docked),
                 'probation_proven': bool(self._gps_proven),
                 'rtabmap_confident': bool(self._rtabmap_confident),
+                'anchor_age_s': anchor_age,
+                'anchor_frozen': anchor_frozen,
                 'map_pose_sources': sources,
                 'drift_report': self._drift_report,
             }
+            self._last_published_owner = owner    # FIX4: keep edge detector in sync
             self.loc_status_pub.publish(String(data=json.dumps(status)))
         except Exception as e:
             rospy.logwarn_throttle(10.0, "[loc_status] %s" % e)
+
+    def _current_owner(self):
+        """FIX4 (telemfix): owner predicate for edge detection — identical logic
+        to publish_loc_status (gps > dock > freshest map_pose source > dr)."""
+        if self._gps_stable():
+            return 'gps'
+        if self._docked:
+            return 'dock'
+        now_s = rospy.get_time()
+        for s in self._map_pose_priority:   # priority order
+            if now_s - self._map_pose_last_accept.get(s, 0.0) < self._map_pose_hold_s:
+                return s
+        return 'dr'
+
+    def maybe_publish_owner_edge(self):
+        """FIX4 (telemfix): publish loc_status IMMEDIATELY on an owner-change edge
+        (baseline 1 Hz stays; called every loop3sec tick where ownership settles).
+        A transition is thus visible at once instead of up to ~1 s late."""
+        try:
+            if self._current_owner() != self._last_published_owner:
+                self.publish_loc_status()
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[loc_status_edge] %s" % e)
 
     def callback_bridge_live_enable(self, msg):
         self._bridge_live_enable = bool(msg.data)
@@ -1153,6 +1291,7 @@ class NavTfNode:
         # keep the frozen last-verified anchor (multipath-tail immunity).
         if self._entry_motion_verified(cand):
             self._anchor_verified = cand
+            self._anchor_last_advance_t = now_t   # FIX3: anchor advanced
         elif self._anchor_verified is None:
             # nothing has ever verified yet -> cannot anchor safely; bootstrap
             return False
@@ -1211,55 +1350,63 @@ class NavTfNode:
         self._anchor_owned = wrote
 
     def _emit_drift_report(self):
-        """On GPS ownership RESUME after an outage, log (INFO) and stash the
-        accumulated-error vector: how far the pose drifted while GPS was gone.
-        dx/dy = fresh verified GPS anchor(now) - live nav-EKF pose(now) (the
-        discontinuity the returning GPS would impose = the DR error absorbed
-        over the outage); dyaw = fused heading now - heading at loss; distance
-        = wheel-EKF path length driven without GPS; duration = outage length.
-        Slewed in, so no visible jump — this only REPORTS the accumulated error."""
+        """FIX1 (telemfix 2026-07-11): drift report measured against INDEPENDENT
+        RTK truth, not the self-referential frozen anchor.
+
+        OLD design compared the live pose against the frozen verified anchor
+        PROPAGATED BY THE SAME WHEEL ODOMETRY -> the dead-reckoning error
+        cancelled itself (reported 0.082 m against a true 0.27 m at the t=610
+        resume). NEW design: on the resume tick the caller snapshots the live
+        nav-EKF pose AND the time-paired RTK pose BEFORE the first new GPS
+        correction is applied (self._resume_live_pose / self._resume_rtk_pose).
+        The report error is live_pose(resume) - RTK_pose(resume) — the actual
+        discontinuity independent RTK would impose = the DR error accumulated
+        while blind. dyaw = fused heading at resume vs heading at loss (omitted
+        when heading was not healthy at resume); distance = wheel-EKF path
+        driven blind; duration = outage length. Slewed in downstream, so no
+        visible jump — this only REPORTS the accumulated error.
+        Bag anchor_test_2026-07-11: reconstructs the t=610 resume at 0.236 m."""
         if self._anchor_lost_pose is None or self._anchor_lost_t is None:
             return
+        if self._resume_live_pose is None or self._resume_rtk_pose is None:
+            return
         now_t = rospy.get_time()
-        # fresh verified GPS anchor position at NOW (same math as the live
-        # correction), else fall back to raw rtk(NOW).
-        anchor = self._anchor_verified
-        if anchor is not None:
-            ta, (rx, ry), (wx, wy), wyaw, nyaw = anchor
-            theta = math.atan2(math.sin(nyaw - wyaw), math.cos(nyaw - wyaw))
-            o = self.ekf_wheel_odom_msg.pose.pose.position
-            ct, st = math.cos(theta), math.sin(theta)
-            gx = rx + (ct * (o.x - wx) - st * (o.y - wy))
-            gy = ry + (st * (o.x - wx) + ct * (o.y - wy))
-        else:
-            gx = self.rtk_odom_msg.pose.pose.position.x
-            gy = self.rtk_odom_msg.pose.pose.position.y
-        c = self.ekf_wheel_nav_odom_msg.pose.pose
-        dx = gx - c.position.x
-        dy = gy - c.position.y
-        dyaw = math.degrees(math.atan2(
-            math.sin(self.fused_yaw - self._anchor_lost_pose[2]),
-            math.cos(self.fused_yaw - self._anchor_lost_pose[2])))
+        lx, ly = self._resume_live_pose
+        gx, gy = self._resume_rtk_pose
+        dx = gx - lx
+        dy = gy - ly
         dist = 0.0
         if self._anchor_odom_at_loss is not None:
             ow = self.ekf_wheel_odom_msg.pose.pose.position
             dist = math.hypot(ow.x - self._anchor_odom_at_loss[0],
                               ow.y - self._anchor_odom_at_loss[1])
         dur = now_t - self._anchor_lost_t
-        self._drift_report = {
+        report = {
             'dx': round(dx, 3), 'dy': round(dy, 3),
             'dist_m': round(math.hypot(dx, dy), 3),
-            'dyaw_deg': round(dyaw, 2),
             'driven_no_gps_m': round(dist, 2),
             'outage_s': round(dur, 1),
+            'measured_vs': 'rtk_resume',
         }
+        # dyaw only when the RTK heading was healthy at resume (else omit — a
+        # stale/flapping heading would report a meaningless yaw error).
+        if self._resume_rtk_fresh and self._heading_ok():
+            dyaw = math.degrees(math.atan2(
+                math.sin(self.fused_yaw - self._anchor_lost_pose[2]),
+                math.cos(self.fused_yaw - self._anchor_lost_pose[2])))
+            report['dyaw_deg'] = round(dyaw, 2)
+        self._drift_report = report
         rospy.loginfo(
             "[drift_report] GPS ownership RESUMED after %.1fs / %.2f m driven "
-            "blind — accumulated error dx=%.3f dy=%.3f (|%.3f m|) dyaw=%.2fdeg",
-            dur, dist, dx, dy, math.hypot(dx, dy), dyaw)
+            "blind — accumulated error dx=%.3f dy=%.3f (|%.3f m|)%s [vs rtk_resume]",
+            dur, dist, dx, dy, math.hypot(dx, dy),
+            (" dyaw=%.2fdeg" % report['dyaw_deg']) if 'dyaw_deg' in report else "")
         self._anchor_lost_pose = None
         self._anchor_lost_t = None
         self._anchor_odom_at_loss = None
+        self._resume_live_pose = None
+        self._resume_rtk_pose = None
+        self._resume_rtk_fresh = False
 
     def _update_gps_probation(self, fix_msg, position_usable):
         """GPS-first arbiter probation (POSE_DATUM_PLAN, 2026-07-06 user
@@ -2059,13 +2206,36 @@ class NavTfNode:
                     # back to the legacy rtk(NOW) correction while the buffer is
                     # not yet lag-deep (bootstrap / just-acquired GPS).
                     resumed = not self._anchor_owned
+                    # FIX1 (telemfix): on the resume tick, snapshot the live
+                    # nav-EKF pose AND the time-paired RTK pose BEFORE the first
+                    # new correction is applied — the drift report measures the
+                    # accumulated blind error against INDEPENDENT RTK truth.
+                    if resumed:
+                        cpos = self.ekf_wheel_nav_odom_msg.pose.pose.position
+                        rpos = self.rtk_odom_msg.pose.pose.position
+                        self._resume_live_pose = (cpos.x, cpos.y)
+                        self._resume_rtk_pose = (rpos.x, rpos.y)
+                        self._resume_rtk_fresh = (
+                            (rospy.get_time() - self._rtk_odom_rx_t) < self._rtk_fresh_s)
                     if not self._apply_continuous_anchor():
                         self.set_wheel_base_nav_pose()   # bootstrap fallback
-                    # drift report AFTER the anchor so it uses the freshest
-                    # verified anchor available on the resume tick.
+                    # drift report AFTER the anchor call (snapshot already taken
+                    # pre-correction above, so the measurement is uncontaminated).
                     if resumed:
                         self._emit_drift_report()
                     wrote_anchor = True
+                    # FIX3 (telemfix): anchor observability — warn (throttled)
+                    # when the verified anchor has stayed frozen (not advanced)
+                    # longer than ~anchor_frozen_warn_s while GPS owns the pose.
+                    # A frozen anchor is CORRECT (a lying multipath tail is being
+                    # rejected) but means the pose runs open-loop on the wheel
+                    # EKF — the operator must be able to see it.
+                    if self._anchor_last_advance_t is not None:
+                        age = rospy.get_time() - self._anchor_last_advance_t
+                        if age > self._anchor_frozen_warn_s:
+                            rospy.logwarn_throttle(
+                                10.0, "[anchor] verified anchor FROZEN %.1fs "
+                                "(motion-verify failing — pose on wheel EKF)", age)
                 elif not rtk_fresh:
                     # keep init_navsat's launch condition alive without moving
                     # the robot from a zero/stale gps_odom
@@ -2090,6 +2260,9 @@ class NavTfNode:
         # Reconcile ownership edge ONCE per tick (records loss state on the
         # True->False transition for the next resume's drift report).
         self._note_ownership(wrote_anchor)
+        # FIX4 (telemfix): edge-triggered loc_status on owner change (this loop
+        # runs at 10 Hz and is where ownership is decided; baseline 1 Hz stays).
+        self.maybe_publish_owner_edge()
 
 
     def loop30hz(self, event=None):

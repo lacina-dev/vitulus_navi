@@ -190,6 +190,25 @@ Pořadí oprav: (a) brána 1.0→2.45 + vx-only [levné, bezpečné, kód hned];
 (d) po (b): fúzovat licp vyaw; (e) dlouhodobě: EDT tracker (Fáze 2) = absolutní
 kotva headingu i pozice — řeší kořen, (a)–(d) zmenšují chybu mezi kotvami.
 
+**AKCE 2026-07-11 — rtabmap→póza bridge VYPNUT (rozhodnutí uživatele).**
+Bag garden2_drive_2026-07-11_13-33-35: pod střechou (GPS-denied) rtabmap
+korigoval live pózu **77×** jako map_pose_source. Kvantifikace z bagu:
+- V DOKU a FYZICKY NEHYBNĚ (0–70 s) fúzovaný senzorový odhad (VO+licp+wheel)
+  seděl ustáleně **~1.56 m (1.52–1.60 m)** od live map pózy, kterou bridge řídil
+  → celý ten ~1.56 m je čistá dezlokalizace vlitá do live pózy (smeared garáž
+  v rtabmap mapě), robot se přitom nehýbal.
+- Při rtabmap ownershipu (72–77 s) → předání DR: `div_from_live` spadl z ~1,4 m
+  na ~0,2 m během ~8 s, jak fúzovaná dráha stáhla pózu zpět = rtabmap držel pózu
+  ~1,4 m mimo. (Globální peak div 6,08 m v DR segmentu je heading/RTK-splice, ne
+  rtabmap — viz výše.)
+ZMĚNA: `~bridge_enable` default → **false** v kódu (dock_localization_seed) +
+explicitně `bridge_enable=false` v launch/dock_detector.launch. Zdroje pózy nyní
+= **fúze odom EKF (wheel+IMU+licp+VO) + GPS-RTK (proven) + DOCK seed only**;
+rtabmap už pózu NEZAPISUJE. PONECHÁNO: dock one-shot seed (/rtabmap/initialpose —
+rtabmap smí seed PŘIJÍMAT), /nav_tf/rtabmap_confident (jen observability).
+EDT tracker (defer/poor_match, gated OFF) zůstává plánovaná budoucí map-kotva
+(Fáze 2) — NE rtabmap. Re-enable bridge až po de-smeared mapě + tracker anchoru.
+
 ### Fáze 4 — zdraví zdrojů a sezónnost
 - Jednotný health modul (wheel slip cross-check, imu_status, VO/licp
   staleness) → loc_status + gating.

@@ -143,6 +143,11 @@ class Node:
         self.nm_local_costmap_pub = rospy.Publisher('navi_manager/local_costmap', OccupancyGrid, queue_size=1, latch=True)
         self.nm_map_pub = rospy.Publisher('navi_manager/map', OccupancyGrid, queue_size=1, latch=True)
         self.pub_map_source = rospy.Publisher('navi_manager/map_source', String, queue_size=10, latch=False)
+        # Ask mapping_manager (mapping_v3) to (re)serve its latched site_map. Empty
+        # string == newest raster of newest site. Used when octomap is the selected
+        # map source but we have not yet received a site_map (e.g. mapping_manager
+        # started after us, or has not served yet at boot).
+        self.pub_serve_site = rospy.Publisher('/mapping_manager/serve_site', String, queue_size=1, latch=True)
         self.nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10)
         self.planner_new_map_pub = rospy.Publisher('/web_plan/new_map', String, queue_size=10)
         self.rtabmap_settings_pub = rospy.Publisher('navi_manager/rtabmap_settings', Rtabmap_settings, queue_size=10)
@@ -183,6 +188,13 @@ class Node:
         # rospy.Subscriber("/navi_manager/is_indoor", Bool, self.callback_is_indoor)
         rospy.Subscriber("/move_base_flex/local_costmap/costmap", OccupancyGrid, self.callback_local_costmap)
         rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_rtabmap_grid_map)
+        # Map source "octomap": the mapping_v3 octomap pipeline raster served by
+        # mapping_manager as a latched OccupancyGrid (frame map, 0.05 m). This is
+        # the first-class map source once rtabmap is out of map-making (localization
+        # v2, 2026-07-11). When show_map == "octomap", republish this on
+        # /navi_manager/map (same latched semantics the costmap static layer +
+        # planner already depend on).
+        rospy.Subscriber("/mapping_manager/site_map", OccupancyGrid, self.callback_site_map)
         rospy.Subscriber("/web_plan/map_edited", OccupancyGrid, self.callback_web_plan_map)
         rospy.Subscriber("/navi_manager/show_map", String, self.callback_web_plan_show_map)
         rospy.Subscriber("/navi_manager/rtabmap_settings_set", Rtabmap_settings, self.callback_rtabmap_settings_set)
@@ -190,6 +202,7 @@ class Node:
         self.is_map_to_publish = True
         self.rtabmap_grid_map_msg = None
         self.planner_map_msg = None
+        self.site_map_msg = None
         self.point_pose_srvs = rospy.Service("navi_manager/get_point_pose", Point_pose, self.srv_cb_map_point_pose)
 
 
@@ -222,19 +235,45 @@ class Node:
             self.callback_load_map(map_msg, init=True)
             rospy.loginfo("Map " + self.params['load_map_on_start'] + " loaded.")
 
+        # Default DISPLAYED / SERVED map source at boot. Localization v2 (2026-07-11,
+        # user decision): rtabmap is out of map-making — the map served on
+        # /navi_manager/map (costmap static layer, planner, UI) is the mapping_v3
+        # octomap raster. callback_load_map / start_navi_launch reset map_show to
+        # "planner"; override it here so boot serves the configured source (default
+        # "octomap"). This does NOT start RTABMAP_MAPPING.
+        map_source_on_start = self.params.get('map_source_on_start', 'planner')
+        if map_source_on_start:
+            self.callback_web_plan_show_map(String(map_source_on_start))
+            rospy.loginfo("Default map source at boot: %s", map_source_on_start)
+
     def callback_rtabmap_settings_set(self, msg):
         rospy.set_param('/rtabmap/rtabmap/Grid/Sensor', msg.grid_sensor)
         rospy.set_param('/rtabmap/rtabmap/Grid/RangeMax', msg.grid_sensor_distance)
-        rospy.wait_for_service('/rtabmap/update_parameters')
+        # rtabmap may be out of map-making (RTABMAP_MAPPING not running) — the
+        # update_parameters service then never appears. Bound the wait so this
+        # UI-triggered callback cannot hang the callback thread forever.
         try:
+            rospy.wait_for_service('/rtabmap/update_parameters', timeout=3.0)
             srv = rospy.ServiceProxy('/rtabmap/update_parameters', Empty)  # Connect to the service
             response = srv()
+        except rospy.ROSException:
+            rospy.logwarn("rtabmap /update_parameters unavailable (RTABMAP_MAPPING not "
+                          "running?) — Grid settings stored as params only.")
         except rospy.ServiceException as e:
             rospy.logerr("Service /rtabmap/update_parameters call failed: %s" % e)
 
         self.rtabmap_settings_publish()
 
     def rtabmap_settings_publish(self):
+        # With rtabmap out of map-making (localization v2), RTABMAP_MAPPING may not be
+        # running, so /rtabmap/rtabmap/Grid/* params are absent. That is expected, not
+        # an error — skip quietly (throttled debug) instead of spamming logerr every
+        # tick. When rtabmap IS running (mapping / edit / new-map / rtabmap_on_start),
+        # the params exist and settings publish as before.
+        if not rospy.has_param('/rtabmap/rtabmap/Grid/Sensor'):
+            rospy.logdebug_throttle(60.0, "rtabmap settings: /rtabmap params absent "
+                                    "(RTABMAP_MAPPING not running) — skipping publish")
+            return
         try:
             msg = Rtabmap_settings()
             msg.header.stamp = rospy.Time.now()
@@ -254,6 +293,14 @@ class Node:
     def callback_rtabmap_grid_map(self, msg):
         self.rtabmap_grid_map_msg = msg
         self.is_map_to_publish = True
+
+    def callback_site_map(self, msg):
+        # Octomap (mapping_v3) site raster from mapping_manager. Cache it and, if we
+        # are currently serving the octomap source, mark for republish so the served
+        # /navi_manager/map refreshes (e.g. mapping_manager serves a newer raster).
+        self.site_map_msg = msg
+        if self.map_show == "octomap":
+            self.is_map_to_publish = True
 
     def callback_web_plan_map(self, msg):
         self.planner_map_msg = msg
@@ -279,6 +326,13 @@ class Node:
                 self.status_msg_pub.publish("Wait for Rtabmap loaded".format(msg.data))
                 self.nex_log_info_pub.publish("Loading rtabmap... wait".format(msg.data))
                 self.is_rtabmap_pub.publish(Bool(True))
+        if msg.data == "octomap":
+            # Octomap (mapping_v3) source: no docker container to start. If we do not
+            # yet have a cached site_map, ask mapping_manager to (re)serve it (latched
+            # publish reaches us on connect). rtabmap is NOT started for this source.
+            if self.site_map_msg is None:
+                self.pub_serve_site.publish(String(""))
+            self.is_rtabmap_pub.publish(Bool(False))
         self.map_show = msg.data
         self.is_map_to_publish = True
 
@@ -294,6 +348,13 @@ class Node:
                 if self.rtabmap_grid_map_msg is not None:
                     self.nm_map_pub.publish(self.rtabmap_grid_map_msg)
                     self.pub_map_source.publish(String("rtabmap"))
+            if self.map_show == "octomap":
+                # mapping_v3 site raster. /navi_manager/map is a latched publisher,
+                # so this one republish keeps the costmap static layer + planner + UI
+                # fed exactly like the rtabmap/planner sources do.
+                if self.site_map_msg is not None:
+                    self.nm_map_pub.publish(self.site_map_msg)
+                    self.pub_map_source.publish(String("octomap"))
             self.is_map_to_publish = False
 
     def callback_odometry_odom(self, msg):

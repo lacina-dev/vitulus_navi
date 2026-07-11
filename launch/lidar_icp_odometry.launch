@@ -33,14 +33,67 @@
          good 600-point scan. The bridge consumer absorbs the reset jump. -->
     <param name="Odom/ResetCountdown"     type="string" value="1"/>
     <param name="Odom/Holonomic"          type="string" value="false"/>
-    <param name="Reg/Strategy"            type="string" value="1"/>   <!-- ICP -->
+    <param name="Reg/Strategy"            type="string" value="1"/>   <!-- ICP (Icp/* used) -->
     <param name="Reg/Force3DoF"           type="string" value="true"/>
-    <!-- 2D scan ICP tuning -->
+
+    <!-- ============================================================
+         QUALITY TUNING 2026-07-11 (LOCALIZATION_V2_PLAN "Vyšetřování
+         driftu pod střechou", finding 3). Verified against the INSTALLED
+         rtabmap_odom 0.21.10 binary (icp_odometry with the params flag).
+
+         Measured baseline (120 s standstill bag, 2026-07-11):
+           - at-REST yaw-rate noise  std = 1.408 deg/s   (2sigma=2.8 -> yaw
+             currently NOT fused by EKF)
+           - at-REST vx noise        std = 28.5 mm/s      (vs published twist
+             cov claiming 8.4 mm/s -> cov underestimates reality ~3-10x)
+           - vx mean 0.065 mm/s -> NO rest bias, it is pure match noise.
+
+         Goal: reduce per-match angle noise (~0.14 deg/match @10 Hz) and
+         improve yaw observability so the EKF can eventually fuse licp yaw
+         for heading stabilisation under-roof (no GPS).
+
+         RE-MEASURE after restart (same 120 s standstill + a drive pass):
+           - at-rest yaw std   TARGET < 0.5 deg/s   (from 1.408)
+           - at-rest vx  std   should drop toward the published ~8-9 mm/s
+           - in-motion: smoother /licp/odom twist, fewer EKF gate rejections
+             (see ekf gate fix ekf_base_outdoor.yaml:139,151, done in parallel)
+         ============================================================ -->
+
+    <!-- Deskew the 10 Hz spinning-scan (100 ms smear) using the constant-
+         velocity guess. Scan has time_increment populated so per-point
+         timestamps exist. NOTE: this is ON by default in 0.21.10, set
+         explicitly for clarity / to survive default changes. -->
+    <param name="Odom/Deskewing"          type="string" value="true"/>
+
+    <!-- 2D scan ICP tuning (libpointmatcher, Icp/Strategy=1 default) -->
     <param name="Icp/VoxelSize"                 type="string" value="0.05"/>
-    <param name="Icp/MaxCorrespondenceDistance" type="string" value="0.1"/>
-    <param name="Icp/PointToPlane"              type="string" value="false"/>
-    <param name="Icp/Iterations"                type="string" value="10"/>
-    <param name="Icp/Epsilon"                   type="string" value="0.001"/>
+    <!-- 0.1 was too tight: inter-scan displacement at 0.66 m/s + smear can
+         approach 0.1 m; widen to 0.2 (>= 2x VoxelSize) for stable matching. -->
+    <param name="Icp/MaxCorrespondenceDistance" type="string" value="0.2"/>
+    <!-- Point-to-plane (normals from Icp/PointToPlaneK 2D neighbours) gives
+         much better yaw observability on structured scenes than point-to-
+         point. Was explicitly disabled here; default is true. -->
+    <param name="Icp/PointToPlane"              type="string" value="true"/>
+    <param name="Icp/PointToPlaneK"             type="string" value="5"/>
+    <!-- Was 10; 30 is cheap at ~860 pts/rev and lets ICP fully converge. -->
+    <param name="Icp/Iterations"                type="string" value="30"/>
+    <!-- Was 0.001; tighten so convergence is decided by residual, not by a
+         loose early-stop that leaves per-match jitter. 0=only iters/dist. -->
+    <param name="Icp/Epsilon"                   type="string" value="0.0001"/>
+    <!-- Trimmed-outlier ratio for libpointmatcher; 0.85 = binary default,
+         set explicitly (rejects the worst 15% correspondences). -->
+    <param name="Icp/OutlierRatio"              type="string" value="0.85"/>
     <param name="Icp/MaxTranslation"            type="string" value="0.5"/>
+
+    <!-- COVARIANCE HONESTY: icp_odometry 0.21.10 exposes NO twist-covariance
+         scaling/multiplier param (Odom/Kalman* only apply when
+         Odom/FilteringStrategy>0, which we leave at 0). The published twist
+         cov underestimates reality ~3-10x (vx 8.4 vs 28.5 mm/s measured).
+         There is no launch-side knob to inflate it. This is compensated on
+         the CONSUMER side: the robot_localization Mahalanobis gate
+         (ekf_base_outdoor.yaml odomN_twist_rejection_threshold, being fixed
+         in parallel) rejects toward safety. If honest cov is required later,
+         post-process /licp/odom twist cov in navi_transform before feeding
+         the EKF, or enable Odom/FilteringStrategy for smoothed output. -->
   </node>
 </launch>

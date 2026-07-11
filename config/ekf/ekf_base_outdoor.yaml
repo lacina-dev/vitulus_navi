@@ -118,37 +118,57 @@ ekf_wheel_nav_odometry:
   # Visual odometry (rgbd_odometry, /vo/odom) and lidar ICP odometry
   # (icp_odometry, /licp/odom) fused as CONTINUOUS velocity sources so the EKF
   # dead-reckons on VO/lidar (slip-free) instead of wheels alone when RTK is
-  # denied. TWIST ONLY (vx, vy) — their absolute pose is in a separate,
-  # auto-resetting odom origin (Odom/ResetCountdown=1) so it must NOT be fused;
-  # the body-frame twist is reset-robust. vyaw left to the IMU/RTK heading for
-  # now (licp yaw is noisy ~2.8 deg/s at rest). twist_rejection_threshold gates
+  # denied. TWIST ONLY; their absolute pose is in a separate, auto-resetting
+  # odom origin (Odom/ResetCountdown=1) so it must NOT be fused; the
+  # body-frame twist is reset-robust. twist_rejection_threshold gates
   # reset/glitch velocity spikes (Mahalanobis); on tracking loss rtabmap
   # inflates covariance so the EKF self-attenuates the source. RTK still anchors
   # position via the set_pose path (loop3sec) — unchanged. Replaces the failed
   # 10 Hz set_pose-snap go-live (commit e32e0ee) which fought this EKF.
+  #
+  # 2026-07-11 gate fix (LOCALIZATION_V2_PLAN.md "Vyšetřování driftu pod
+  # střechou"): thr=1.0 was a 1-sigma joint Mahalanobis gate on the fused DOF
+  # set, verified against robot_localization filter_base.cpp:388
+  # (sqMahalanobis >= nsigmas^2, computed jointly). At 1.0 that rejected 61%
+  # of honest samples, and rejected licp specifically during wheel slip
+  # (exactly when it's needed). VO stays vx-only below: yaw from vision is
+  # untrusted (camera often dead at night, cov 9999) and its threshold is now
+  # chi2(1,0.95)=1.96 -> 2.0 for the single fused DOF.
   odom1: /vo/odom
   odom1_config: [ false, false, false,
                   false, false, false,
-                  true, true, false,
+                  true, false, false,
                   false, false, false,
                   false, false, false ]
   odom1_queue_size: 10
   odom1_nodelay: true
   odom1_differential: false
   odom1_relative: false
-  odom1_twist_rejection_threshold: 1.0
+  odom1_twist_rejection_threshold: 2.0
 
+  # licp: vy dropped (nonholonomic diff-drive, vy≈0 truth — fusing it only
+  # inflates the joint Mahalanobis distance for zero information). vyaw newly
+  # fused here (previously left to IMU/RTK heading because licp yaw was noisy
+  # ~2.8 deg/s peak-to-peak at rest) now that the licp deskewing/PointToPlane
+  # fix (parallel effort, same investigation) is landing — this stabilizes
+  # heading under the roof without RTK. RISK: licp's published twist yaw
+  # covariance still understates real yaw-rate noise (~1.4 deg/s std vs
+  # 7.76e-6 rad^2 declared, ~10x), so the Mahalanobis gate will see inflated
+  # distances for vyaw and reject more than a well-calibrated source would —
+  # that errs toward rejecting bad data, which is safe. Do NOT raise the
+  # threshold further to compensate; fix the source covariance instead.
+  # threshold = chi2(2,0.95) for the 2 fused DOF (vx, vyaw) = 2.45.
   odom2: /licp/odom
   odom2_config: [ false, false, false,
                   false, false, false,
-                  true, true, false,
-                  false, false, false,
+                  true, false, false,
+                  false, false, true,
                   false, false, false ]
   odom2_queue_size: 10
   odom2_nodelay: true
   odom2_differential: false
   odom2_relative: false
-  odom2_twist_rejection_threshold: 1.0
+  odom2_twist_rejection_threshold: 2.45
 
   imu0: /gnss_heading/nav_fused
   imu0_config: [ false, false, false,

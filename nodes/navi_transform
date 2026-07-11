@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 import copy
+import json
+import os
 import time
 
 import rospy
+import yaml
 import tf2_ros
 import roslaunch
 from geometry_msgs.msg import TransformStamped, PoseStamped, Pose, PoseWithCovarianceStamped
@@ -61,7 +64,8 @@ class NavTfNode:
         self.position_fix_usable_history = [0, 0, 0]
         self.heading_fix_usable = False
         self._heading_last_good = 0.0      # last time RTK heading was usable
-        self._heading_grace_s = 3.0        # tolerate brief heading dropouts (flapping)
+        # tolerate brief heading dropouts (flapping); ~param (WP2), default unchanged
+        self._heading_grace_s = float(rospy.get_param('~heading_grace_s', 3.0))
         self.nav_last_fused_time = 0
         self.fix_last_fused_time = 0
         self.imu_delay = 0
@@ -125,14 +129,81 @@ class NavTfNode:
         self._docked = False   # /dock_smach/dock_status == 0 (see _gps_stable)
         self._rtabmap_confident = False   # /nav_tf/rtabmap_confident (ownership pivot)
         self._gps_bad_since = None
-        self._gps_dropout_grace_s = float(rospy.get_param('~gps_dropout_grace_s', 3.0))
+        # GPS-first arbiter probation state (see _update_gps_probation)
+        self._gps_probe_anchor = None
+        self._gps_proven = False
+        self._gps_probation_travel_m = float(rospy.get_param(
+            '~gps_probation_travel_m', 1.0))
+        # Dual-antenna yaw-variance HEALTHY BAND (see offset_navheading_imu).
+        # UNITS: variance rad^2; the UI readout the user watches is
+        # sigma in DEGREES = degrees(sqrt(var)). Band per user field
+        # calibration 2026-07-06: acceptable sigma 1.2-1.6 deg, everything
+        # else is a bad solution (tighter = degenerate over-confident
+        # multipath, looser = driving noise). Bag gnss_2026-07-06_21-07-42:
+        # the healthy driving cluster sits at sigma 1.3-1.4 deg (var
+        # 5.2-5.5e-4, 55% of samples) — inside this band.
+        self._heading_var_min = float(rospy.get_param('~heading_var_min', 0.00043))
+        self._heading_var_max = float(rospy.get_param('~heading_var_max', 0.00079))
+        # REWIND handoff (POSE_DATUM_PLAN phase 2, user requirement): the
+        # quality metrics report GPS degradation LATE — the last ~1-2 s of
+        # 'good' GPS are already corrupted. On a CONFIRMED outage the pose is
+        # re-anchored from the buffered GPS pose at (outage_start - rewind_s)
+        # plus the wheel-EKF odometry delta since (the wheel EKF is never
+        # set_pose'd, so its deltas are correction-free).
+        self._rewind_enable = bool(rospy.get_param('~rewind_enable', True))
+        self._rewind_s = float(rospy.get_param('~rewind_s', 2.0))
+        self._rewind_max_m = float(rospy.get_param('~rewind_max_m', 2.0))
+        # RTK flapping at the roof edge confirmed an "outage" every few
+        # seconds and the un-slewed rewind splice THRASHED the pose (bag
+        # 22-17-24: ten 0.35-0.62 m steps in 80 s). One splice per genuine
+        # outage is the intent:
+        self._rewind_cooldown_s = float(rospy.get_param('~rewind_cooldown_s', 20.0))
+        self._last_rewind_t = -1e9
+        self._pose_buffer = deque(maxlen=200)   # (t, rtk_xy, wheel_xy) @ ~10 Hz
+        # Georef (map->odom) slew: rate-limit corrections from the utm georef
+        # path; only a kidnap-size mismatch snaps.
+        self._georef_slew_mps = float(rospy.get_param('~georef_slew_mps', 0.10))
+        self._georef_slew_dps = float(rospy.get_param('~georef_slew_dps', 1.0))
+        self._georef_kidnap_m = float(rospy.get_param('~georef_kidnap_m', 1.0))
+        self._georef_last_t = None
+        # ---- persistent site georeference (POSE_DATUM_PLAN phase 1b) --------
+        # When no navi map georef is live (/navi_manager/map_coords silent or
+        # zero), the site datum captured by mapping v3 (insertion_gate phase
+        # 1a, symlinked by mapping_manager) supplies utm_map instead, so GPS
+        # can own map->odom without a loaded navi map AND the zero-georef
+        # degenerate path (yaw from a null quaternion) can never fire.
+        # Inert while live nonzero map_coords keeps arriving.
+        self._site_datum_file = os.path.expanduser(rospy.get_param(
+            '~site_datum_file', '~/.vitulus/saves/site_datum.yaml'))
+        self._site_datum = None          # PoseStamped built from datum.yaml
+        self._site_datum_mtime = 0.0
+        self._map_coords_rx_t = 0.0      # last LIVE nonzero map_coords receive
+        # 3.0 -> 8.0 (2026-07-06): roof-edge RTK flaps run longer than 3 s and
+        # each expiry re-triggered acquisition+rewind churn; a genuine outage
+        # loses nothing by later confirmation (the rewind anchor is
+        # bad_since-based, not confirmation-based).
+        self._gps_dropout_grace_s = float(rospy.get_param('~gps_dropout_grace_s', 8.0))
         # skip external map-pose corrections while rotating fast: the source pose
         # (rtabmap localization) is measured slightly in the past, so applying it
         # mid-rotation smears the pose ('ujete v rotaci', drive 4)
         self._set_map_pose_max_wz = float(rospy.get_param('~set_map_pose_max_wz', 0.3))
         # smooth takeover: slew rates for large corrections after GPS acquisition
         self._heading_slew_dps = float(rospy.get_param('~heading_slew_dps', 5.0))
-        self._pos_slew_mps = float(rospy.get_param('~pos_slew_mps', 0.3))
+        self._pos_slew_mps = float(rospy.get_param('~pos_slew_mps', 0.5))
+        # WP2 (localization v2): magic constants -> ~params, defaults UNCHANGED.
+        self._probation_tol_abs_m = float(rospy.get_param('~probation_tol_abs_m', 0.1))
+        self._probation_tol_frac = float(rospy.get_param('~probation_tol_frac', 0.2))
+        self._datum_live_window_s = float(rospy.get_param('~datum_live_window_s', 10.0))
+        self._rtk_fresh_s = float(rospy.get_param('~rtk_fresh_s', 2.0))
+        # WP2 (localization v2): source-tagged /nav_tf/set_map_pose arbitration.
+        # Corrections arrive on per-source topics (dock/tracker/rtabmap) + the
+        # legacy topic; a lower-priority source is REJECTED while a strictly
+        # higher-priority one was accepted within ~map_pose_hold_s. Priority:
+        # dock > tracker > rtabmap > legacy (index = priority rank, 0=highest).
+        self._map_pose_hold_s = float(rospy.get_param('~map_pose_hold_s', 5.0))
+        self._map_pose_priority = ('dock', 'tracker', 'rtabmap', 'legacy')
+        # last accept time per source (for arbitration + loc_status observability)
+        self._map_pose_last_accept = {s: 0.0 for s in self._map_pose_priority}
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
         self.init = True
@@ -178,6 +249,20 @@ class NavTfNode:
         # Same priority rule as set_heading: callers publish ONLY when their higher-priority
         # source (GNSS) is unavailable, so this never fights the GPS map->odom path.
         self.set_map_pose_sub = rospy.Subscriber("/nav_tf/set_map_pose", PoseStamped, self.callback_set_map_pose, queue_size=1)
+        # WP2 (localization v2): source-tagged map-pose corrections. Each source
+        # routes into the SAME callback logic with its priority label; the arbiter
+        # (see callback_set_map_pose) drops a lower-priority source while a
+        # higher-priority one is fresh. Legacy /nav_tf/set_map_pose above stays as
+        # source "legacy" (lowest priority) so existing publishers keep working.
+        self.set_map_pose_dock_sub = rospy.Subscriber(
+            "/nav_tf/set_map_pose_dock", PoseStamped,
+            lambda m: self.callback_set_map_pose(m, source='dock'), queue_size=1)
+        self.set_map_pose_tracker_sub = rospy.Subscriber(
+            "/nav_tf/set_map_pose_tracker", PoseStamped,
+            lambda m: self.callback_set_map_pose(m, source='tracker'), queue_size=1)
+        self.set_map_pose_rtabmap_sub = rospy.Subscriber(
+            "/nav_tf/set_map_pose_rtabmap", PoseStamped,
+            lambda m: self.callback_set_map_pose(m, source='rtabmap'), queue_size=1)
         # docked truth (Int8, latched, 0 == docked) -> suppress GPS ownership at the dock
         from std_msgs.msg import Int8 as _Int8
         self.dock_status_sub = rospy.Subscriber("/dock_smach/dock_status", _Int8,
@@ -198,6 +283,10 @@ class NavTfNode:
         self.licp_odom_sub = rospy.Subscriber("/licp/odom", Odometry, self.callback_licp_odom, queue_size=50)
         self.bridge_preview_pub = rospy.Publisher("/nav_tf/odom_bridge_preview", Odometry, queue_size=20)
         self.bridge_status_pub = rospy.Publisher("/nav_tf/bridge_status", String, queue_size=5)
+        # WP2 (localization v2): typed status topic (JSON, latched) — owner +
+        # health, so downstream stops string-parsing bridge_status. Published at
+        # 1 Hz from loop1hz (see publish_loc_status).
+        self.loc_status_pub = rospy.Publisher("/nav_tf/loc_status", String, queue_size=1, latch=True)
         # Runtime on/off for live bridging (Phase 1 go-live). Publish std_msgs/Bool
         # to /nav_tf/bridge_live_enable to toggle without a restart.
         self.bridge_live_enable_sub = rospy.Subscriber("/nav_tf/bridge_live_enable", Bool, self.callback_bridge_live_enable, queue_size=1)
@@ -269,17 +358,30 @@ class NavTfNode:
         occasionally passes the covariance gates with confident garbage and
         yanked the pose 2.4 m (2026-07-05 night); the dock anchor + rtabmap own
         the pose at the dock.
-        OWNERSHIP PIVOT: while rtabmap is CONFIDENTLY localized (published by the
-        dock seed bridge as /nav_tf/rtabmap_confident), the MAP owns the pose —
-        mowing zones live in the map frame, so map-consistency beats
-        RTK-consistency. GPS resumes on open lawn where the lidar has nothing."""
-        if self._docked or self._rtabmap_confident:
+        GPS-FIRST ARBITER (2026-07-06, user directive — REVERSES the
+        2026-07-05 ownership pivot): GPS with quality is the MAIN pose
+        authority; rtabmap/odometry substitute only while GPS lacks quality
+        (typical cycle here: open lawn <-> roofed area with no GPS). A
+        confident rtabmap may hold the pose ONLY until GPS has PROVEN
+        itself in motion (_update_gps_probation: >= ~1 m wheel-odom travel
+        with agreeing GPS distance) — parked multipath garbage near the
+        roofed dock never proves itself, which keeps the 2026-07-05 trap
+        covered without demoting GPS everywhere."""
+        if self._docked:
+            return False
+        # UNIVERSAL probation (2026-07-06 evening, bag 21-36-30): GPS may
+        # take pose ownership ONLY after proving itself in motion — a
+        # PARKED robot near the roofed area got its pose grabbed by a
+        # partially-fixed GPS (the rtabmap-only probation gate did not
+        # cover it). Standing still never proves; ownership engages within
+        # the first metre of driving on usable fix.
+        if not self._gps_proven:
             return False
         return self._gps_good_since is not None and \
             (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s and \
             self._heading_good_after_acq
 
-    def callback_set_map_pose(self, msg):
+    def callback_set_map_pose(self, msg, source='legacy'):
         """Drive the live map->odom from an external map-frame robot pose (rtabmap lidar
         localization when GPS is denied), FULL 2D pose incl. yaw:
 
@@ -292,7 +394,27 @@ class NavTfNode:
         correction lives purely in map->odom (drive-away heading fix without GPS). No-GPS
         gating lives in the caller (the dock seed bridge publishes only when gps_good==0),
         so this never fights callback_map_coords / the GNSS heading anchor (both reset
-        map_odom_yaw to 0 when they take over)."""
+        map_odom_yaw to 0 when they take over).
+
+        WP2 (localization v2): source-tagged arbitration. `source` is one of
+        dock > tracker > rtabmap > legacy (priority order). A correction from a
+        lower-priority source is REJECTED while a strictly higher-priority source
+        was accepted within the last ~map_pose_hold_s — so the dock anchor no
+        longer loses to the tracker (the old two-writer last-writer-wins race).
+        All existing gates (rotation guard etc.) still apply below."""
+        # --- priority arbitration (WP2) -----------------------------------------
+        # Reject if a strictly-higher-priority source is still fresh.
+        try:
+            now_p = rospy.get_time()
+            my_rank = self._map_pose_priority.index(source)
+        except ValueError:
+            my_rank = len(self._map_pose_priority) - 1   # unknown -> lowest
+        for higher in self._map_pose_priority[:my_rank]:
+            if now_p - self._map_pose_last_accept.get(higher, 0.0) < self._map_pose_hold_s:
+                rospy.loginfo_throttle(
+                    5.0, "[set_map_pose] source '%s' rejected — higher-priority "
+                    "'%s' fresh within %.1fs", source, higher, self._map_pose_hold_s)
+                return
         odom_base = self.get_base_link_transform()   # odom->base_link
         if odom_base is None:
             rospy.logwarn_throttle(5.0, "[set_map_pose] no odom->base_link TF yet — skipping")
@@ -317,6 +439,9 @@ class NavTfNode:
         ob_y = odom_base.transform.translation.y
         self.map_odom_transform.transform.translation.x = msg.pose.position.x - (math.cos(m) * ob_x - math.sin(m) * ob_y)
         self.map_odom_transform.transform.translation.y = msg.pose.position.y - (math.sin(m) * ob_x + math.cos(m) * ob_y)
+        # WP2: correction ACCEPTED and applied — stamp this source for arbitration.
+        if source in self._map_pose_last_accept:
+            self._map_pose_last_accept[source] = rospy.get_time()
         rospy.loginfo_throttle(5.0,
             "[set_map_pose] map->odom set from external map pose (%.2f, %.2f, %.1fdeg) -> "
             "t=(%.2f, %.2f) yaw=%.2fdeg",
@@ -345,7 +470,52 @@ class NavTfNode:
             else:
                 rospy.loginfo("[navi_transform] navsat_transform was not running — will launch fresh on GPS ready")
 
-    def callback_map_coords(self, msg):
+    # ---- persistent site georeference (POSE_DATUM_PLAN phase 1b) ------------
+    def _load_site_datum(self):
+        """(Re)load the site datum captured by mapping v3 into a synthetic
+        map_coords PoseStamped. Returns silently when absent/unchanged."""
+        try:
+            path = os.path.realpath(self._site_datum_file)
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        if mtime == self._site_datum_mtime:
+            return
+        try:
+            with open(path) as f:
+                d = yaml.safe_load(f)
+            ps = PoseStamped()
+            ps.header.frame_id = 'utm'
+            ps.pose.position.x = float(d['utm_e'])
+            ps.pose.position.y = float(d['utm_n'])
+            ps.pose.position.z = float(d.get('alt', 0.0))
+            q = quaternion_from_euler(0, 0, float(d.get('yaw_rad', 0.0)))
+            ps.pose.orientation.x = q[0]
+            ps.pose.orientation.y = q[1]
+            ps.pose.orientation.z = q[2]
+            ps.pose.orientation.w = q[3]
+            self._site_datum = ps
+            self._site_datum_mtime = mtime
+            rospy.logwarn('[navi_transform] site datum loaded from %s: '
+                          'utm=(%.2f, %.2f) alt=%.2f yaw=%.2fdeg',
+                          path, ps.pose.position.x, ps.pose.position.y,
+                          ps.pose.position.z,
+                          math.degrees(float(d.get('yaw_rad', 0.0))))
+        except Exception as e:
+            rospy.logwarn('[navi_transform] site datum load failed: %s', e)
+
+    def maybe_apply_site_datum(self):
+        """Called at 1 Hz (loop1hz): when no LIVE nonzero map_coords georef
+        exists but a site datum does, feed the datum through the normal
+        georef path so GPS can own map->odom without a loaded navi map."""
+        self._load_site_datum()
+        if self._site_datum is None:
+            return
+        if rospy.get_time() - self._map_coords_rx_t < self._datum_live_window_s:
+            return                    # live navi-map georef owns it
+        self.callback_map_coords(self._site_datum, from_datum=True)
+
+    def callback_map_coords(self, msg, from_datum=False):
         # GPS georef may own map->odom ONLY while the GPS position is USABLE and
         # has been stable for a few seconds. Without this gate, once navsat has
         # ever established utm->odom, every map_coords message re-pinned map->odom
@@ -353,6 +523,16 @@ class NavTfNode:
         # the GPS-denied external corrections (rtabmap bridge /nav_tf/set_map_pose)
         # — and RTK flapping (observed 38 flips/2 min in rain) toggled ownership
         # and yanked the pose around ("caught one GPS -> thrown elsewhere").
+        zero = (msg.pose.position.x + msg.pose.position.y
+                + msg.pose.position.z) == 0
+        if not from_datum and not zero:
+            self._map_coords_rx_t = rospy.get_time()
+        if zero:
+            # Never derive a georef from a zero/null message (its yaw comes
+            # from a null quaternion). Pose stays with dock/odometry until a
+            # real georef or the site datum takes over.
+            self.map_coords_msg = msg
+            return
         if not self._gps_stable():
             self.map_coords_msg = msg
             return
@@ -387,6 +567,26 @@ class NavTfNode:
                 f"map_odom=({p_x:.3f}, {p_y:.3f}) "
                 f"yaw_diff={math.degrees(yaw_offset):.2f}deg "
                 f"navsat_running={self.launch_navsat is not None}")
+
+            # SLEW toward the georef target instead of snapping (POSE_DATUM_PLAN
+            # phase 3): with the site-datum path this callback runs at ~1 Hz,
+            # so a snap here re-pinned map->odom visibly. Rate-limit the
+            # translation approach; only a kidnap-size mismatch snaps.
+            now_g = rospy.get_time()
+            cur = self.map_odom_transform.transform.translation
+            d_x, d_y, d_z = p_x - cur.x, p_y - cur.y, p_z - cur.z
+            dist_g = math.hypot(d_x, d_y)
+            first = self._georef_last_t is None
+            if not first and dist_g <= self._georef_kidnap_m:
+                dt_g = min(now_g - self._georef_last_t, 3.0)
+                max_step = self._georef_slew_mps * max(dt_g, 0.1)
+                if dist_g > max_step:
+                    s = max_step / dist_g
+                    p_x, p_y, p_z = cur.x + d_x * s, cur.y + d_y * s, cur.z + d_z * s
+            elif not first:
+                rospy.logwarn('[map->odom] georef mismatch %.2f m > kidnap '
+                              '%.2f m — snapping', dist_g, self._georef_kidnap_m)
+            self._georef_last_t = now_g
 
             map_odom_transform = TransformStamped()
             map_odom_transform.header.stamp = rospy.Time.now()
@@ -442,22 +642,23 @@ class NavTfNode:
         }
         self._bridge = {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'init': False}
         self._bridge_active = 'none'
-        self._bridge_cov_thresh = 1.0      # m^2; rtabmap inflates pose cov when tracking is lost
-        self._bridge_fresh_s = 0.5         # a source older than this is considered stale
-        self._bridge_hyst = 3              # consecutive good samples before a source is trusted
+        # WP2 (localization v2): bridge gates -> ~params, defaults UNCHANGED.
+        self._bridge_cov_thresh = float(rospy.get_param('~bridge/cov_thresh', 1.0))  # m^2; rtabmap inflates pose cov when tracking is lost
+        self._bridge_fresh_s = float(rospy.get_param('~bridge/fresh_s', 0.5))        # a source older than this is considered stale
+        self._bridge_hyst = int(rospy.get_param('~bridge/hyst', 3))                  # consecutive good samples before a source is trusted
         # Per-cycle deltas above these are reset/glitch jumps -> rejected. The
         # bridge integrates at 30 Hz and the robot tops out ~0.5 m/s (~0.017
         # m/cycle), so 0.08 m leaves a generous margin yet caps a stuck-glitch
         # accumulation at ~0.08*30*3s ≈ 7 m instead of the 0.3 m clamp's ~27 m
         # (the observed 26.7 m spike). 0.3 m allowed an absurd 9 m/s.
-        self._bridge_max_step = 0.08       # m; reject larger single-cycle deltas (reset/glitch jumps)
-        self._bridge_max_yaw = 0.3         # rad; same, for rotation
+        self._bridge_max_step = float(rospy.get_param('~bridge/max_step_m', 0.08))  # m; reject larger single-cycle deltas (reset/glitch jumps)
+        self._bridge_max_yaw = float(rospy.get_param('~bridge/max_yaw_rad', 0.3))   # rad; same, for rotation
         # Wheel cross-check (Step B layer 1): a VO/lidar source is only trusted
         # if its per-cycle motion is not WILDLY more than the wheels'. Asymmetric
         # and generous (mult=3 + 5cm) so normal wheel slip is tolerated but gross
         # runaway glitches (e.g. the observed 7 m jump) are rejected.
-        self._bridge_xcheck_mult = 3.0
-        self._bridge_xcheck_abs = 0.05     # m
+        self._bridge_xcheck_mult = float(rospy.get_param('~bridge/wheel_xcheck_mult', 3.0))
+        self._bridge_xcheck_abs = float(rospy.get_param('~bridge/wheel_xcheck_abs_m', 0.05))  # m
         # Phase 1 go-live: when True and GPS is denied, drive the LIVE pose from
         # the bridge (VO/lidar dead-reckon) instead of letting the EKF drift on
         # wheels. Default OFF for safety (dock/undock + startup run on known-good
@@ -595,13 +796,63 @@ class NavTfNode:
             div = float('nan')
         live = (not gps_good) and self._bridge_live_enable and self._bridge.get('init') \
             and self._bridge_active in ('vo', 'licp')
-        st = ("gps_good=%d live=%d active=%s div_from_live=%.3fm | vo[use=%d cov=%.3g] "
+        # WP2 (localization v2): the PUBLISHED gps_good is now the actual
+        # pose-ownership predicate _gps_stable() (docked/probation/hysteresis/
+        # heading), NOT the raw position_fix_usable that anchors the shadow
+        # bridge internally. Downstream (dock bridge, gloc tracker) gate on
+        # 'gps_good=1' and must follow ownership, not raw fix usability — so
+        # they correctly run during GPS probation and at the dock. The raw fix
+        # usability is exposed as fix_usable=0/1 for observability. The rest of
+        # the string format (incl. live/active/div/vo/licp/wheel) is unchanged.
+        gps_stable = self._gps_stable()
+        st = ("gps_good=%d fix_usable=%d live=%d active=%s div_from_live=%.3fm | vo[use=%d cov=%.3g] "
               "licp[use=%d cov=%.3g] wheel[use=%d]" % (
-                  int(gps_good), int(live), self._bridge_active, div,
+                  int(gps_stable), int(gps_good), int(live), self._bridge_active, div,
                   int(usable['vo']), self._src['vo']['cov'],
                   int(usable['licp']), self._src['licp']['cov'],
                   int(usable['wheel'])))
         self.bridge_status_pub.publish(String(data=st))
+
+    def publish_loc_status(self):
+        """WP2 (localization v2): typed pose-ownership status (JSON, latched, 1 Hz).
+        Replaces string-parsing /nav_tf/bridge_status for downstream consumers.
+        owner: 'gps' when _gps_stable(); else 'dock' when docked; else the
+        highest-priority set_map_pose source heard within ~map_pose_hold_s; else
+        'dr' (dead-reckoning). rtabmap_confident is OBSERVABILITY only (no
+        behavioral coupling)."""
+        try:
+            gps_stable = self._gps_stable()
+            now_s = rospy.get_time()
+            # recently-heard set_map_pose sources (age within the hold window)
+            sources = {}
+            fresh_src = None
+            for s in self._map_pose_priority:   # already in priority order
+                age = now_s - self._map_pose_last_accept.get(s, 0.0)
+                if age < self._map_pose_hold_s:
+                    sources[s] = {'age_s': round(age, 2)}
+                    if fresh_src is None:
+                        fresh_src = s
+            if gps_stable:
+                owner = 'gps'
+            elif self._docked:
+                owner = 'dock'
+            elif fresh_src is not None:
+                owner = fresh_src
+            else:
+                owner = 'dr'
+            status = {
+                'owner': owner,
+                'gps_good': bool(gps_stable),
+                'fix_usable': bool(self.position_fix_usable),
+                'heading_ok': bool(self._heading_ok()),
+                'docked': bool(self._docked),
+                'probation_proven': bool(self._gps_proven),
+                'rtabmap_confident': bool(self._rtabmap_confident),
+                'map_pose_sources': sources,
+            }
+            self.loc_status_pub.publish(String(data=json.dumps(status)))
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[loc_status] %s" % e)
 
     def callback_bridge_live_enable(self, msg):
         self._bridge_live_enable = bool(msg.data)
@@ -659,6 +910,7 @@ class NavTfNode:
         self.position_fix_usable = position_usable
         self.position_fix_usable_history.pop(0)
         self.position_fix_usable_history.append(position_usable)
+        self._update_gps_probation(msg, position_usable)
         # GPS-acquisition hysteresis (shared by callback_map_coords AND the
         # loop3sec set_pose path): track how long the position has been
         # CONTINUOUSLY usable. Tracked here per fix message so it ticks even
@@ -672,8 +924,16 @@ class NavTfNode:
             # measured) otherwise starved the corrections completely and the
             # pose drifted on odometry/bridge (drive 4: 'dost to ujizdelo').
             if now_t - self._gps_bad_since > self._gps_dropout_grace_s:
+                if self._gps_good_since is not None:
+                    # confirmed outage transition: splice the pose back to the
+                    # last provably-good GPS anchor (T - rewind) + odometry
+                    self._do_rewind_handoff(now_t)
                 self._gps_good_since = None
                 self._heading_good_after_acq = False
+                # sustained outage also invalidates the probation proof —
+                # GPS must prove itself in motion again after it returns
+                self._gps_probe_anchor = None
+                self._gps_proven = False
         else:
             self._gps_bad_since = None
             if self._gps_good_since is None:
@@ -682,6 +942,98 @@ class NavTfNode:
         # print("gnss_fix usable: ", usable)
 
 
+
+    def _do_rewind_handoff(self, now_t):
+        """REWIND handoff (POSE_DATUM_PLAN phase 2): quality metrics admit a
+        GPS degradation late, so the pose at the moment an outage is
+        CONFIRMED already carries a corrupted tail. Re-anchor:
+            pose := rtk(T_a) + (wheel_now - wheel(T_a)),
+        T_a = outage_start - rewind_s, taken from the correction-time buffer;
+        the wheel EKF is never set_pose'd so its delta is correction-free.
+        One ~10 Hz-slewed EKF target does the rest (set_wheel_base_nav_pose
+        caps steps, so even this splice applies smoothly)."""
+        if not self._rewind_enable or not self._pose_buffer:
+            return
+        if now_t - self._last_rewind_t < self._rewind_cooldown_s:
+            rospy.loginfo('[rewind] suppressed (cooldown %.0fs — RTK flapping)',
+                          self._rewind_cooldown_s)
+            return
+        t_anchor = (self._gps_bad_since or now_t) - self._rewind_s
+        anchor = None
+        for entry in self._pose_buffer:
+            if entry[0] <= t_anchor:
+                anchor = entry
+            else:
+                break
+        if anchor is None:
+            rospy.logwarn('[rewind] no buffered sample older than %.1fs before '
+                          'the outage — skipping', self._rewind_s)
+            return
+        ta, (rx, ry), (wx, wy) = anchor
+        o = self.ekf_wheel_odom_msg.pose.pose.position
+        sx = rx + (o.x - wx)
+        sy = ry + (o.y - wy)
+        c = self.ekf_wheel_nav_odom_msg.pose.pose.position
+        d = math.hypot(sx - c.x, sy - c.y)
+        if d < 0.05:
+            rospy.loginfo('[rewind] corrupted tail negligible (%.3f m) — '
+                          'no splice needed', d)
+            return
+        if d > self._rewind_max_m:
+            rospy.logwarn('[rewind] splice %.2f m exceeds max %.2f m — '
+                          'refusing (kidnap-scale mismatch)', d,
+                          self._rewind_max_m)
+            return
+        pose = Pose()
+        pose.position.x = sx
+        pose.position.y = sy
+        pose.position.z = self.ekf_wheel_nav_odom_msg.pose.pose.position.z
+        pose.orientation = self.fused_msg.orientation
+        rospy.logwarn('[rewind] GPS outage confirmed — re-anchoring pose from '
+                      'T-%.1fs (%.1fs old sample), correcting %.2f m of '
+                      'corrupted tail', now_t - ta, self._rewind_s, d)
+        self._last_rewind_t = now_t
+        self.set_wheel_base_nav_pose(pose, frame='odom')
+
+    def _update_gps_probation(self, fix_msg, position_usable):
+        """GPS-first arbiter probation (POSE_DATUM_PLAN, 2026-07-06 user
+        directive): GPS may TAKE pose ownership from a confident rtabmap only
+        after it has PROVEN itself in motion — since the position became
+        usable, the robot must travel >= ~1 m (wheel-odom) with the
+        GPS-measured distance agreeing (straight-line, rotation/datum
+        invariant). Blocks the known trap: confident multipath garbage near
+        the roofed dock passing the covariance gates while parked (2.4 m
+        yank, 2026-07-05) — parked garbage never proves itself.
+        NOTE: a single unusable sample does NOT reset the probe — RTK flaps
+        tens of times per 2 min in bad weather and a per-message reset
+        would starve ownership completely; the probe resets only on a
+        SUSTAINED outage (same grace branch that triggers the rewind)."""
+        if not position_usable:
+            return
+        k = 111320.0
+        gx = fix_msg.longitude * k * math.cos(math.radians(fix_msg.latitude))
+        gy = fix_msg.latitude * k
+        o = self.ekf_wheel_odom_msg.pose.pose.position
+        if self._gps_probe_anchor is None:
+            self._gps_probe_anchor = (gx, gy, o.x, o.y)
+            return
+        ax, ay, aox, aoy = self._gps_probe_anchor
+        d_gps = math.hypot(gx - ax, gy - ay)
+        d_odom = math.hypot(o.x - aox, o.y - aoy)
+        if d_odom < self._gps_probation_travel_m:
+            return
+        if abs(d_gps - d_odom) <= self._probation_tol_abs_m + self._probation_tol_frac * d_odom:
+            if not self._gps_proven:
+                rospy.logwarn('[navi_transform] GPS PROVEN in motion '
+                              '(odom %.2f m vs gps %.2f m) -> may take pose '
+                              'ownership', d_odom, d_gps)
+            self._gps_proven = True
+        else:
+            rospy.logwarn_throttle(10.0, '[navi_transform] GPS probation '
+                                   'FAILED (odom %.2f m vs gps %.2f m) — '
+                                   're-probing', d_odom, d_gps)
+            self._gps_probe_anchor = (gx, gy, o.x, o.y)
+            self._gps_proven = False
 
     def callback_gnss_heading_fix(self, msg):
         usable = False
@@ -1059,7 +1411,7 @@ class NavTfNode:
         except rospy.ServiceException as e:
             rospy.logerr("Service /ekf_wheel_odometry/set_pose call failed: %s" % e)
 
-    def set_wheel_base_nav_pose(self, pose=None):
+    def set_wheel_base_nav_pose(self, pose=None, frame='map'):
         rospy.wait_for_service('/ekf_wheel_nav_odometry/set_pose')
         try:
             pose_srv = SetPoseRequest()
@@ -1090,7 +1442,7 @@ class NavTfNode:
                 pose_srv.pose.header.frame_id = ('odom')
             else:
                 pose_srv.pose.pose.pose = pose
-                pose_srv.pose.header.frame_id = ('map')
+                pose_srv.pose.header.frame_id = frame
 
             pose_srv.pose.header.stamp = rospy.Time.now()
 
@@ -1114,11 +1466,21 @@ class NavTfNode:
         self.rtk_err = rtk_error_z
         if delay <= 6 and self.fix_usable and self.heading_fix_usable:
 
-            # Accept any sufficiently-good RTK heading. The previous lower bound
-            # (>= 0.00051) wrongly REJECTED *better* (more accurate) heading,
-            # leaving the IMU-heading offset stale whenever the dual-antenna fix
-            # was tight. Upper bound only.
-            if rtk_error_z <= 0.0008:
+            # HEALTHY-BAND acceptance (2026-07-06, user field data): a
+            # SUSPICIOUSLY TIGHT yaw variance (< ~0.001; UI 'e' readout
+            # below ~1.0) comes from degenerate solutions near the roofed
+            # area and carries a WRONG heading with confident covariance —
+            # the robot drove mis-oriented for minutes while ONLY those
+            # samples passed the old 'upper bound only' gate (<= 0.0008),
+            # which simultaneously REJECTED the healthy ~0.0011 (UI 1.1).
+            # This restores the lower bound that was removed earlier and
+            # raises the cap. Both ends are params for field tuning.
+            if rtk_error_z < self._heading_var_min:
+                rospy.logwarn_throttle(
+                    30.0, '[navheading] suspiciously TIGHT yaw var %.5f '
+                    '(< %.5f) — degenerate solution, heading REJECTED',
+                    rtk_error_z, self._heading_var_min)
+            if self._heading_var_min <= rtk_error_z <= self._heading_var_max:
                 self.nav_last_fused_time = rospy.Time.now()
                 (imu_roll, imu_pitch, imu1_yaw) = euler_from_quaternion([self.imu_msg.orientation.x,
                                                                         self.imu_msg.orientation.y,
@@ -1369,6 +1731,8 @@ class NavTfNode:
     def loop1hz(self, event=None):
         node_gnss.print_info()
         node_gnss.publish_status()
+        node_gnss.maybe_apply_site_datum()
+        node_gnss.publish_loc_status()
 
     def loop3sec(self, event=None):
         # NOTE the misleading name: this runs at 10 Hz (registered with
@@ -1392,11 +1756,19 @@ class NavTfNode:
             # right after a (re)launch — set_pose from it teleported the robot
             # to ~map origin at every first GPS acquisition (the 'brief jump to
             # a completely different position', drives 1-3, 2026-07-04).
-            rtk_fresh = (rospy.get_time() - self._rtk_odom_rx_t) < 2.0
+            rtk_fresh = (rospy.get_time() - self._rtk_odom_rx_t) < self._rtk_fresh_s
             if self.launch_navsat is not None:
                 if self._heading_ok() and rtk_fresh:
                     self.fix_last_fused_time = rospy.Time.now()
                     self.set_wheel_base_nav_pose()
+                    # rewind buffer: pair the GPS pose with the never-set_pose'd
+                    # wheel-EKF pose at correction time (see _do_rewind_handoff)
+                    self._pose_buffer.append((
+                        rospy.get_time(),
+                        (self.rtk_odom_msg.pose.pose.position.x,
+                         self.rtk_odom_msg.pose.pose.position.y),
+                        (self.ekf_wheel_odom_msg.pose.pose.position.x,
+                         self.ekf_wheel_odom_msg.pose.pose.position.y)))
                 elif not rtk_fresh:
                     # keep init_navsat's launch condition alive without moving
                     # the robot from a zero/stale gps_odom

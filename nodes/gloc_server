@@ -37,7 +37,8 @@ import rospy
 import tf2_ros
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan, CompressedImage
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from std_msgs.msg import Bool
 from std_msgs.msg import String
 from std_srvs.srv import Trigger, TriggerResponse
 from tf.transformations import quaternion_from_euler, euler_from_quaternion
@@ -71,10 +72,38 @@ class GlocServer(object):
         self._apply_cov[0] = self._apply_cov[7] = pos_std ** 2
         self._apply_cov[35] = yaw_std ** 2
 
+        # ---- EDT TRACKER (POSE_DATUM_PLAN phase 5 / MAPPING_ARCHITECTURE
+        # plan: replaces rtabmap in the pose path): continuous LOCAL
+        # scan-to-EDT alignment (Gauss-Newton over x, y, yaw) of the live
+        # scan against the map, publishing map-frame pose corrections to
+        # /nav_tf/set_map_pose_tracker (WP2 source-tagged; navi_transform's
+        # arbiter ranks dock > tracker > rtabmap > legacy) — the same
+        # interface the rtabmap dock bridge uses, self-gated to GPS-denied
+        # stretches (roofed area) where the
+        # lidar has structure and GPS has nothing.
+        self.track_enable = bool(rospy.get_param('~track_enable', True))
+        self.track_rate_hz = float(rospy.get_param('~track_rate_hz', 1.0))
+        self.track_max_corr_m = float(rospy.get_param('~track_max_corr_m', 0.7))
+        self.track_max_corr_yaw_deg = float(rospy.get_param('~track_max_corr_yaw_deg', 6.0))
+        self.track_min_corr_m = float(rospy.get_param('~track_min_corr_m', 0.02))
+        self.track_max_rms_m = float(rospy.get_param('~track_max_rms_m', 0.20))
+        self.track_min_points = int(rospy.get_param('~track_min_points', 60))
+        self.track_max_iter = int(rospy.get_param('~track_max_iter', 8))
+        # degeneracy gate: weakest position eigendirection must carry at
+        # least this fraction of the point count (a single hedge/wall line
+        # constrains only ACROSS itself — sliding along stays free)
+        self.track_min_eig_frac = float(rospy.get_param('~track_min_eig_frac', 0.05))
+        self.track_defer_to_rtabmap = bool(rospy.get_param('~track_defer_to_rtabmap', True))
+
         self._grid = None          # (occ, free, res, ox, oy, h, w)
         self._edt = None
+        self._edt_gx = None        # d(EDT)/dx [m/m], same shape as grid
+        self._edt_gy = None
         self._grid_stamp = None
         self._last_result = None
+        self._last_scan = None
+        self._gps_good = False
+        self._rtab_conf = False
         self._lock = threading.Lock()
 
         self._tf_buf = tf2_ros.Buffer()
@@ -86,10 +115,32 @@ class GlocServer(object):
         self.pub_initialpose = rospy.Publisher('/rtabmap/initialpose',
                                                PoseWithCovarianceStamped, queue_size=1)
 
-        rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.cb_grid, queue_size=1)
+        map_topic = rospy.get_param('~map_topic', '/rtabmap/grid_map')
+        rospy.Subscriber(map_topic, OccupancyGrid, self.cb_grid, queue_size=1)
         rospy.Subscriber('/gloc/compute', String, self.cb_compute, queue_size=1)
         rospy.Subscriber('/gloc/apply', String, self.cb_apply, queue_size=1)
         rospy.Service('/gloc/localize', Trigger, self.srv_localize)
+
+        # tracker wiring
+        # WP2 (localization v2): publish to the source-tagged TRACKER topic so
+        # navi_transform's arbiter ranks it (dock > tracker > rtabmap > legacy).
+        # Tracker gating (gps_good / track_defer_to_rtabmap / gates) is unchanged.
+        self.pub_track_pose = rospy.Publisher('/nav_tf/set_map_pose_tracker',
+                                              PoseStamped, queue_size=1)
+        self.pub_track_status = rospy.Publisher('/gloc/track_status', String,
+                                                queue_size=1, latch=True)
+        rospy.Subscriber(self.scan_topic, LaserScan,
+                         lambda m: setattr(self, '_last_scan', m), queue_size=1)
+        rospy.Subscriber('/nav_tf/bridge_status', String,
+                         lambda m: setattr(self, '_gps_good',
+                                           'gps_good=1' in (m.data or '')),
+                         queue_size=1)
+        rospy.Subscriber('/nav_tf/rtabmap_confident', Bool,
+                         lambda m: setattr(self, '_rtab_conf', bool(m.data)),
+                         queue_size=1)
+        if self.track_enable and self.track_rate_hz > 0:
+            rospy.Timer(rospy.Duration(1.0 / self.track_rate_hz),
+                        self._track_tick)
 
         self._set_status('idle (no map yet)' if self._grid is None else 'idle')
         rospy.loginfo('[gloc] up: stride %.2f m, angles %.0f deg, %d rays, apply gate %.0f%%',
@@ -116,10 +167,16 @@ class GlocServer(object):
             rospy.logwarn_throttle(60, '[gloc] grid has almost no occupied cells, skipping')
             return
         edt = ndimage.distance_transform_edt(~occ) * msg.info.resolution
+        edt_capped = np.minimum(edt, self.dist_cap_m).astype(np.float32)
+        # tracker: EDT gradients (per metre). Points beyond the cap get zero
+        # gradient and thus no pull — built-in outlier robustness.
+        gy, gx = np.gradient(edt_capped)
         with self._lock:
             self._grid = (occ, free, msg.info.resolution,
                           msg.info.origin.position.x, msg.info.origin.position.y, h, w)
-            self._edt = np.minimum(edt, self.dist_cap_m).astype(np.float32)
+            self._edt = edt_capped
+            self._edt_gx = (gx / msg.info.resolution).astype(np.float32)
+            self._edt_gy = (gy / msg.info.resolution).astype(np.float32)
             self._grid_stamp = msg.header.stamp
         if self._last_result is None:
             self._set_status('idle')
@@ -147,6 +204,174 @@ class GlocServer(object):
         cb, sb = math.cos(lyaw), math.sin(lyaw)
         return (lx + cb * exl - sb * eyl, ly + sb * exl + cb * eyl,
                 int(good.sum()), len(rng))
+
+    # ---- EDT tracker (continuous local scan-to-map alignment) ----------------
+
+    def _scan_points_base(self, scan):
+        """Latest-scan variant of _scan_endpoints (non-blocking): scan
+        endpoints in the base frame, subsampled to ~n_rays."""
+        tr = self._tf_buf.lookup_transform(self.base_frame, scan.header.frame_id,
+                                           rospy.Time(0), rospy.Duration(0.2))
+        q = tr.transform.rotation
+        lyaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        lx, ly = tr.transform.translation.x, tr.transform.translation.y
+        rng = np.asarray(scan.ranges, dtype=np.float32)
+        ang = scan.angle_min + np.arange(len(rng)) * scan.angle_increment
+        good = np.isfinite(rng) & (rng > scan.range_min) & (rng < scan.range_max * 0.99)
+        rng, ang = rng[good], ang[good]
+        if len(rng) < self.track_min_points:
+            return None
+        step = max(1, len(rng) // self.n_rays)
+        rng, ang = rng[::step], ang[::step]
+        exl, eyl = rng * np.cos(ang), rng * np.sin(ang)
+        cb, sb = math.cos(lyaw), math.sin(lyaw)
+        return np.stack([lx + cb * exl - sb * eyl,
+                         ly + sb * exl + cb * eyl], axis=1)
+
+    def _bilinear(self, arr, cols, rows):
+        """Bilinear sample arr[rows, cols] at float indices; also validity."""
+        h, w = arr.shape
+        ok = (cols >= 0) & (cols < w - 1) & (rows >= 0) & (rows < h - 1)
+        c0 = np.clip(np.floor(cols).astype(int), 0, w - 2)
+        r0 = np.clip(np.floor(rows).astype(int), 0, h - 2)
+        fc = np.clip(cols - c0, 0, 1)
+        fr = np.clip(rows - r0, 0, 1)
+        v = (arr[r0, c0] * (1 - fc) * (1 - fr) + arr[r0, c0 + 1] * fc * (1 - fr)
+             + arr[r0 + 1, c0] * (1 - fc) * fr + arr[r0 + 1, c0 + 1] * fc * fr)
+        return v, ok
+
+    def _track_align(self, pts_base, pose0):
+        """Gauss-Newton scan-to-EDT: minimize sum EDT(R(yaw) p + t)^2 over
+        (x, y, yaw). Returns dict with the refined pose + quality metrics,
+        or a dict with 'reject' reason."""
+        with self._lock:
+            if self._edt is None:
+                return {'reject': 'no_map'}
+            edt, gx_a, gy_a = self._edt, self._edt_gx, self._edt_gy
+            _, _, res, ox, oy, h, w = self._grid
+        x, y, th = pose0
+        n_used = 0
+        best = None            # (rms, pose) — return the best iterate: near
+        first_eigs = None      # convergence the on-ridge EDT gradients
+        #                        collapse and a raw GN step OSCILLATES
+        for it in range(self.track_max_iter):
+            c, s = math.cos(th), math.sin(th)
+            wx = x + c * pts_base[:, 0] - s * pts_base[:, 1]
+            wy = y + s * pts_base[:, 0] + c * pts_base[:, 1]
+            cols = (wx - ox) / res - 0.5
+            rows = (wy - oy) / res - 0.5
+            r, ok1 = self._bilinear(edt, cols, rows)
+            gx, _ = self._bilinear(gx_a, cols, rows)
+            gy, _ = self._bilinear(gy_a, cols, rows)
+            use = ok1
+            n_used = int(use.sum())
+            if n_used < self.track_min_points:
+                return {'reject': 'few_points_in_map', 'n': n_used}
+            r, gx, gy = r[use], gx[use], gy[use]
+            px, py = pts_base[use, 0], pts_base[use, 1]
+            rms = float(np.sqrt(np.mean(r ** 2)))
+            if best is None or rms < best[0]:
+                best = (rms, (x, y, th))
+            dth = gx * (-s * px - c * py) + gy * (c * px - s * py)
+            J = np.stack([gx, gy, dth], axis=1)
+            H = J.T @ J
+            g = J.T @ r
+            if first_eigs is None:
+                # degeneracy is judged at the INITIAL pose: once converged the
+                # on-ridge gradients vanish and the eigenvalues say nothing
+                first_eigs = np.linalg.eigvalsh(H[:2, :2])
+            # adaptive Levenberg damping: when the gradients collapse near
+            # convergence, H collapses too — damping must scale WITH it or
+            # the solve produces a huge bogus step from numerical noise
+            lam = max(1e-3, 0.05 * float(np.trace(H)) / 3.0)
+            try:
+                delta = -np.linalg.solve(H + lam * np.eye(3), g)
+            except np.linalg.LinAlgError:
+                return {'reject': 'singular'}
+            # per-iteration step clamp (robustness belt)
+            dnorm = float(np.hypot(delta[0], delta[1]))
+            if dnorm > 0.20:
+                delta[:2] *= 0.20 / dnorm
+            delta[2] = max(-math.radians(2.0), min(math.radians(2.0), delta[2]))
+            x += delta[0]
+            y += delta[1]
+            th += delta[2]
+            if dnorm < 0.002 and abs(delta[2]) < 1e-4:
+                break
+        rms, pose = best
+        return {'pose': pose, 'rms': rms, 'n': n_used,
+                'eig_min': float(first_eigs[0]), 'eig_max': float(first_eigs[1])}
+
+    def _track_tick(self, _evt):
+        info = {'applied': False}
+        try:
+            scan = self._last_scan
+            now = rospy.Time.now()
+            if scan is None or (now - scan.header.stamp).to_sec() > 1.5:
+                info['state'] = 'no_scan'
+                return
+            pose0 = self._current_pose()
+            if pose0 is None:
+                info['state'] = 'no_tf'
+                return
+            pts = self._scan_points_base(scan)
+            if pts is None:
+                info['state'] = 'few_rays'
+                return
+            out = self._track_align(pts, pose0)
+            if 'reject' in out:
+                info['state'] = out['reject']
+                return
+            x, y, th = out['pose']
+            dx = math.hypot(x - pose0[0], y - pose0[1])
+            dyaw = math.degrees(abs(math.atan2(math.sin(th - pose0[2]),
+                                               math.cos(th - pose0[2]))))
+            info.update({'state': 'ok', 'rms': round(out['rms'], 3),
+                         'n': out['n'], 'corr_m': round(dx, 3),
+                         'corr_yaw_deg': round(dyaw, 2),
+                         'eig_min_frac': round(out['eig_min'] / out['n'], 3),
+                         'gps_good': self._gps_good,
+                         'rtabmap_confident': self._rtab_conf})
+            if out['rms'] > self.track_max_rms_m:
+                info['state'] = 'poor_match'
+                return
+            if out['eig_min'] < self.track_min_eig_frac * out['n']:
+                info['state'] = 'degenerate'
+                return
+            if dx > self.track_max_corr_m or dyaw > self.track_max_corr_yaw_deg:
+                info['state'] = 'corr_too_big'
+                return
+            # correction is healthy — apply only when GPS is denied (the GPS
+            # arbiter owns the pose otherwise) and rtabmap does not have
+            # priority (transition period; disable via ~track_defer_to_rtabmap)
+            if self._gps_good:
+                info['state'] = 'gps_owns'
+                return
+            if self.track_defer_to_rtabmap and self._rtab_conf:
+                info['state'] = 'rtabmap_owns'
+                return
+            if dx < self.track_min_corr_m and dyaw < 0.2:
+                info['state'] = 'aligned'
+                return
+            ps = PoseStamped()
+            ps.header.stamp = now
+            ps.header.frame_id = self.map_frame
+            ps.pose.position.x = x
+            ps.pose.position.y = y
+            q = quaternion_from_euler(0, 0, th)
+            ps.pose.orientation.x = q[0]
+            ps.pose.orientation.y = q[1]
+            ps.pose.orientation.z = q[2]
+            ps.pose.orientation.w = q[3]
+            self.pub_track_pose.publish(ps)
+            info['applied'] = True
+            rospy.loginfo_throttle(
+                10.0, '[gloc-track] correcting %.2f m / %.1f deg '
+                '(rms %.2f, n=%d)', dx, dyaw, out['rms'], out['n'])
+        except Exception as e:
+            info['state'] = 'error: %s' % e
+        finally:
+            self.pub_track_status.publish(String(json.dumps(info)))
 
     def _current_pose(self):
         try:

@@ -17,7 +17,7 @@
   <arg name="scan"       default="/scan"/>
   <arg name="frame_id"   default="base_link"/>
 
-  <node pkg="rtabmap_odom" type="icp_odometry" name="lidar_icp_odometry" output="screen">
+  <node pkg="rtabmap_odom" type="icp_odometry" name="lidar_icp_odometry" output="screen" respawn="true" respawn_delay="3">
     <remap from="scan"        to="$(arg scan)"/>
     <remap from="odom"        to="/licp/odom"/>
     <remap from="odom_info"   to="/licp/odom_info"/>
@@ -104,7 +104,7 @@
        overwrite: rtabmap's tracking-loss inflation (9999) is preserved so loss
        still signals to the EKF. It lives/dies with icp_odometry (same launch),
        and the EKF (ekf_base_outdoor.yaml) consumes /licp/odom_cov. -->
-  <node pkg="vitulus_navi" type="odom_cov_fix" name="licp_odom_cov_fix" output="screen">
+  <node pkg="vitulus_navi" type="odom_cov_fix" name="licp_odom_cov_fix" output="screen" respawn="true" respawn_delay="3">
     <param name="in_topic"       type="string" value="/licp/odom"/>
     <param name="out_topic"      type="string" value="/licp/odom_cov"/>
     <!-- measured at-rest: vx std 16.7 mm/s -> var 2.8e-4; vyaw std 0.70 deg/s

@@ -15,7 +15,7 @@
   <arg name="frame_id"      default="base_link"/>
   <arg name="approx_sync"   default="true"/>
 
-  <node pkg="rtabmap_odom" type="rgbd_odometry" name="vo_rgbd_odometry" output="screen">
+  <node pkg="rtabmap_odom" type="rgbd_odometry" name="vo_rgbd_odometry" output="screen" respawn="true" respawn_delay="3">
     <remap from="rgb/image"        to="/$(arg camera)/color/image_raw"/>
     <remap from="depth/image"      to="/$(arg camera)/aligned_depth_to_color/image_raw"/>
     <remap from="rgb/camera_info"  to="/$(arg camera)/color/camera_info"/>

@@ -12,7 +12,10 @@
         <node name="navi_transform" pkg="vitulus_navi" type="navi_transform" respawn="true" respawn_delay="1" output="log">
         </node>
         <!-- lidar global localization scorer (passive; apply is margin-gated) -->
-        <node name="gloc_server" pkg="vitulus_navi" type="gloc_server" respawn="true" respawn_delay="2" output="log" />
+        <node name="gloc_server" pkg="vitulus_navi" type="gloc_server" respawn="true" respawn_delay="2" output="log">
+            <!-- EDT tracker localizes against the served mapping-v3 site raster -->
+            <param name="map_topic" value="/mapping_manager/site_map"/>
+        </node>
     </group>
 
     <node name="node_mower_smach" pkg="vitulus_navi" type="mower_unit_smach" respawn="true" respawn_delay="1" output="log">

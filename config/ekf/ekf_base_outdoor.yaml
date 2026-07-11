@@ -131,20 +131,24 @@ ekf_wheel_nav_odometry:
   # set, verified against robot_localization filter_base.cpp:388
   # (sqMahalanobis >= nsigmas^2, computed jointly). At 1.0 that rejected 61%
   # of honest samples, and rejected licp specifically during wheel slip
-  # (exactly when it's needed). VO stays vx-only below: yaw from vision is
-  # untrusted (camera often dead at night, cov 9999) and its threshold is now
-  # chi2(1,0.95)=1.96 -> 2.0 for the single fused DOF.
+  # (exactly when it's needed). VO fuses vx + vyaw (2026-07-11): measured
+  # at-rest VO yaw-rate noise 0.0014 rad/s (~0.08 deg/s, BETTER than licp),
+  # while the PUBLISHED twist cov claims 0.021 rad/s std (~15x pessimistic) —
+  # the EKF therefore weights VO yaw conservatively by construction; safe.
+  # vx is the opposite (published ~2.3x optimistic) — the joint gate
+  # compensates by rejecting. Night: camera dies with cov 9999 -> excluded.
+  # vy dropped (nonholonomic). Threshold chi2(2,0.95) -> 2.45 for 2 DOF.
   odom1: /vo/odom
   odom1_config: [ false, false, false,
                   false, false, false,
                   true, false, false,
-                  false, false, false,
+                  false, false, true,
                   false, false, false ]
   odom1_queue_size: 10
   odom1_nodelay: true
   odom1_differential: false
   odom1_relative: false
-  odom1_twist_rejection_threshold: 2.0
+  odom1_twist_rejection_threshold: 2.45
 
   # licp: vy dropped (nonholonomic diff-drive, vy≈0 truth — fusing it only
   # inflates the joint Mahalanobis distance for zero information). vyaw newly

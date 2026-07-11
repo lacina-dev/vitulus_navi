@@ -27,7 +27,20 @@
     <param name="odom_frame_id"     type="string" value="vo_odom"/>
     <param name="publish_tf"        type="bool"   value="false"/>
     <param name="approx_sync"       type="bool"   value="$(arg approx_sync)"/>
-    <param name="wait_for_transform_duration" type="double" value="0.2"/>
+    <!-- 2026-07-11: was 0.2. On the auto-reset path (OdometryROS.cpp:850,
+         getTransform(odom_frame_id=vo_odom, base_link)), rtabmap blocks up to
+         this duration. Because publish_tf=false, vo_odom is NEVER in TF, so that
+         lookup can NEVER succeed and always burns the full wait before the reset
+         fires. In daylight (pose not null) the reset path is not entered, so this
+         costs nothing; at night pose goes null often (ResetCountdown=1, so one
+         null frame = one reset) and every such frame paid +0.2s AND emitted the
+         "Could not get transform from vo_odom to base_link ... does not exist"
+         warning seen in night logs (814 warns == 814 resets, lost=0). Set to 0.0
+         so the failing lookup returns immediately; RTAB-Map then resets to its
+         own latest computed pose, which is exactly what we want. The static
+         base_link to camera_link TF (real, published) is looked up on a separate
+         path that already resolves instantly, so 0.0 does not starve it. -->
+    <param name="wait_for_transform_duration" type="double" value="0.0"/>
 
     <!-- Auto-reset after losing tracking so the node ALWAYS recovers when good
          conditions return. With 0 (no reset) it stayed lost forever after a
@@ -40,5 +53,43 @@
     <param name="Reg/Force3DoF"       type="string" value="true"/>
     <param name="Vis/EstimationType"  type="string" value="1"/>   <!-- PnP (3D->2D) -->
     <param name="Vis/MinInliers"      type="string" value="15"/>
+
+    <!-- ===== 2026-07-11 THROUGHPUT TUNE (daylight compute-bound) =====
+      BASELINE (measured daylight, robot parked/moving, 15 fps color+depth in):
+        /vo/odom publishes only ~4.4 Hz  (interval 0.20-0.33 s)
+        odom_info timeEstimation = 0.19-0.30 s  (this is the bottleneck, CPU 79%)
+        localBundleTime ~0.09 s, localMapSize=2000, localKeyFrames~1787
+        quality EXCELLENT: features ~866, matches ~483, inliers ~318,
+        pose cov ~3.9e-5, lost=False.
+      ROOT CAUSE of 4.4 Hz: NOT the TF wait (reset path not entered in daylight,
+        0 resets this session). It is pure per-frame compute in feature
+        detect+describe+PnP+local bundle adjustment over a 2000-word local map.
+      LEVER (one, conservative): Vis/MaxFeatures 1000 to 600.
+        Fewer keypoints to detect/describe (GFTT/ORB), match, RANSAC-PnP and
+        bundle-adjust. With inliers currently ~318 (far above MinInliers=15)
+        there is huge headroom; ~40% fewer features should still leave over 150
+        inliers while cutting the dominant detect/match/BA cost. Expected:
+        timeEstimation toward ~0.13-0.16 s giving ~6-8 Hz; combined with wait=0.0
+        removing the night 0.2 s/frame reset stall, target 10 Hz or more is
+        plausible.
+      NOT CHANGED (documented follow-up levers if 600 is not enough, change ONE
+        at a time and re-measure): OdomF2M/MaxSize 2000 to 1000 (smaller local
+        map = less BA, mild drift risk), Odom/ImageDecimation 1 to 2 (halves
+        detect cost, coarser depth), OdomF2M/BundleAdjustmentMaxFrames 10 to 5.
+      KEEP (do not touch): publish_tf=false, Odom/ResetCountdown=1,
+        Reg/Force3DoF=true, Odom/Holonomic=false, Vis/EstimationType=1.
+      RE-MEASURE CHECKLIST after restart:
+        1) rostopic echo -n5 /vo/odom_info | grep -E 'timeEstimation|inliers|features'
+           expect timeEstimation below 0.16 s, inliers still above ~120.
+        2) rostopic hz /vo/odom  target 10 Hz or more.
+        3) grep current node log for 'Could not get transform from vo_odom'
+           and 'automatically reset': expect none in daylight; at night the
+           reset may still occur but must no longer add 0.2 s (wait=0.0).
+        4) parked twist noise sanity: vyaw std ~0.0014 rad/s (see plan note).
+    ===== -->
+    <param name="Vis/MaxFeatures"     type="string" value="600"/>
+    <!-- 2026-07-11 second lever: smaller F2M local map (bundle time ~0.09s over
+         2000 words was the other half of the compute cost). -->
+    <param name="OdomF2M/MaxSize"     type="string" value="1000"/>
   </node>
 </launch>

@@ -753,9 +753,30 @@ class NavTfNode:
         self._bridge_max_accum_div = float(rospy.get_param('~bridge/max_accum_div_m', 1.0))  # m
         self._bridge_reset_blackout_s = float(rospy.get_param('~bridge/reset_blackout_s', 3.0))
         self._bridge_reset_jump_m = float(rospy.get_param('~bridge/reset_jump_m', 2.0))  # m
+        # BLACKOUT CAP (2026-07-11, review finding): the original blackout
+        # RE-TRIGGERED on every reset-signature message, so a licp episode with
+        # repeated resets renewed the blackout indefinitely (bag: licp blacked
+        # out 17% of runtime, longest contiguous 25.9 s at t=605-628) —
+        # degrading the bridge to wheel-DR, its primary source (licp = 80% of
+        # denied time) gone. Make the blackout EDGE-TRIGGERED with a cap: a
+        # reset signature starts/extends the blackout only up to
+        # ~bridge/reset_blackout_max_s within a rolling episode; past the cap the
+        # source becomes usable again (its per-cycle clamps + the accum-div guard
+        # still contain it), and a NEW blackout may only start after the source
+        # has been reset-free for ~bridge/reset_clear_s.
+        self._bridge_reset_blackout_max_s = float(rospy.get_param('~bridge/reset_blackout_max_s', 6.0))
+        self._bridge_reset_clear_s = float(rospy.get_param('~bridge/reset_clear_s', 5.0))
         # per-source frame-reset blackout expiry (wall time); anchor at the moment
         # the bridge last (re)anchored, for the accumulated-divergence measure.
         self._src_reset_until = {'vo': 0.0, 'licp': 0.0}
+        # BLACKOUT-CAP episode state (per source): _ep_start = wall time the
+        # current reset episode began (None between episodes); _ep_capped = the
+        # cap has already been hit this episode (blackout no longer extends);
+        # _last_reset_t = wall time of the last reset signature (episode ends,
+        # and a fresh one may start, once this is >_bridge_reset_clear_s old).
+        self._src_reset_ep_start = {'vo': None, 'licp': None}
+        self._src_reset_ep_capped = {'vo': False, 'licp': False}
+        self._src_last_reset_t = {'vo': 0.0, 'licp': 0.0}
         self._bridge_wheel_anchor = None   # (bx,by,byaw, wheel_x,wheel_y, theta) at (re)anchor
         # Phase 1 go-live: when True and GPS is denied, drive the LIVE pose from
         # the bridge (VO/lidar dead-reckon) instead of letting the EKF drift on
@@ -788,18 +809,45 @@ class NavTfNode:
             # pose (VO/licp teleport their odom frame origin on re-init). Force
             # the source unusable for ~reset_blackout_s so the teleport delta
             # never enters the bridge integration.
+            # BLACKOUT CAP (2026-07-11): edge-triggered episode. Each reset
+            # signature extends the blackout only while the episode's total span
+            # is under ~reset_blackout_max_s; once capped the source becomes
+            # usable again (clamps + accum-div guard contain it). A reset-free
+            # gap of ~reset_clear_s ends the episode so a genuinely NEW reset
+            # burst can arm a fresh blackout.
             if key in self._src_reset_until and s.get('have'):
                 jump = math.hypot(x - s['x'], y - s['y'])
                 near_origin = (math.hypot(x, y) < 0.05
                                and math.hypot(s['x'], s['y']) > 0.5)
                 if jump > self._bridge_reset_jump_m or near_origin:
-                    self._src_reset_until[key] = (rospy.Time.now().to_sec()
-                                                  + self._bridge_reset_blackout_s)
-                    rospy.logwarn_throttle(
-                        3.0, "[bridge] source '%s' frame-reset (jump=%.2fm%s) — "
-                        "blackout %.1fs", key, jump,
-                        ", origin" if near_origin else "",
-                        self._bridge_reset_blackout_s)
+                    now_r = rospy.Time.now().to_sec()
+                    # end a stale episode: reset-free for longer than clear_s
+                    if (self._src_reset_ep_start[key] is None
+                            or now_r - self._src_last_reset_t[key]
+                            > self._bridge_reset_clear_s):
+                        self._src_reset_ep_start[key] = now_r
+                        self._src_reset_ep_capped[key] = False
+                    self._src_last_reset_t[key] = now_r
+                    ep_span = now_r - self._src_reset_ep_start[key]
+                    if ep_span < self._bridge_reset_blackout_max_s:
+                        # still within the cap — (re)arm/extend the blackout, but
+                        # never let it push the source unusable past the cap end.
+                        cap_end = (self._src_reset_ep_start[key]
+                                   + self._bridge_reset_blackout_max_s)
+                        self._src_reset_until[key] = min(
+                            now_r + self._bridge_reset_blackout_s, cap_end)
+                        rospy.logwarn_throttle(
+                            3.0, "[bridge] source '%s' frame-reset (jump=%.2fm%s) — "
+                            "blackout (episode %.1f/%.1fs cap)", key, jump,
+                            ", origin" if near_origin else "",
+                            ep_span, self._bridge_reset_blackout_max_s)
+                    elif not self._src_reset_ep_capped[key]:
+                        self._src_reset_ep_capped[key] = True
+                        rospy.logwarn_throttle(
+                            3.0, "[bridge] source '%s' frame-reset blackout CAP "
+                            "%.1fs reached (episode still resetting) — source "
+                            "usable again, accum-div guard now containing",
+                            key, self._bridge_reset_blackout_max_s)
             s['x'], s['y'], s['yaw'] = x, y, yaw
             s['cov'] = msg.pose.covariance[0]
             s['t'] = rospy.Time.now().to_sec()

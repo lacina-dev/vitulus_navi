@@ -159,7 +159,29 @@ class NavTfNode:
         # outage is the intent:
         self._rewind_cooldown_s = float(rospy.get_param('~rewind_cooldown_s', 20.0))
         self._last_rewind_t = -1e9
-        self._pose_buffer = deque(maxlen=200)   # (t, rtk_xy, wheel_xy) @ ~10 Hz
+        # REWIND v2 (2026-07-11, user field diagnosis, verified on bag
+        # mapfree_drive_2026-07-11_17-23-32): two defects in the v1 splice.
+        # (A) The wheel-EKF (ekf_wheel_odom) free-runs from boot and is NEVER
+        #     GPS-anchored — its position offset cancels in the delta, but its
+        #     HEADING drift vs the map frame does NOT: the raw wheel delta is
+        #     rotated by the accumulated wheel-EKF-frame-vs-map misalignment
+        #     (bag: 9-14 deg over 1-4 m of motion -> 0.4-1.0 m splice error).
+        #     FIX: rotate the wheel delta by theta = nav_yaw(Ta) - wheel_yaw(Ta)
+        #     into the map frame before adding to the RTK anchor. Buffer now
+        #     ALSO stores per tick the wheel-EKF yaw and the live nav-pose yaw.
+        # (B) The fixed anchor (bad_since - rewind_s) trusts the GPS tail; but
+        #     GPS quality CANNOT be judged from covariance (multipath keeps
+        #     tight cov while position walks). Only odometry motion agreement
+        #     is a valid referee. FIX: walk BACKWARDS from the outage and take
+        #     the NEWEST buffer sample whose |Dgps| ~ |Dwheel| held over a
+        #     trailing sub-window (probation tolerance) -> the corrupted tail is
+        #     genuinely cut; if the tail was consistent, anchor ~ live -> ~no jump.
+        self._rewind_verify_s = float(rospy.get_param('~rewind_verify_s', 5.0))
+        self._rewind_verify_step_s = float(rospy.get_param('~rewind_verify_step_s', 0.5))
+        # trailing sub-window (s) for the |Dgps| vs |Dwheel| agreement test
+        self._rewind_verify_subwin_s = float(rospy.get_param('~rewind_verify_subwin_s', 1.5))
+        # buffer tuple: (t, rtk_xy, wheel_xy, wheel_yaw, nav_yaw) @ ~10 Hz
+        self._pose_buffer = deque(maxlen=200)
         # Georef (map->odom) slew: rate-limit corrections from the utm georef
         # path; only a kidnap-size mismatch snaps.
         self._georef_slew_mps = float(rospy.get_param('~georef_slew_mps', 0.10))
@@ -943,38 +965,94 @@ class NavTfNode:
 
 
 
+    def _buffer_newest_before(self, t):
+        """Newest buffered (t, rtk_xy, wheel_xy, wheel_yaw, nav_yaw) with
+        entry time <= t, or None. Buffer is time-ordered (appended by loop3sec)."""
+        found = None
+        for entry in self._pose_buffer:
+            if entry[0] <= t:
+                found = entry
+            else:
+                break
+        return found
+
+    def _rewind_verify_anchor(self, t_out):
+        """Motion-verified anchor (REWIND v2, defect B): the GPS tail's quality
+        cannot be judged from covariance (multipath keeps tight cov while the
+        position walks) — only odometry motion agreement is a valid referee.
+        Walk BACKWARDS from the outage in ~rewind_verify_step_s steps over the
+        last ~rewind_verify_s, and return the NEWEST buffered sample whose GPS
+        motion |Dgps| agrees with wheel-EKF motion |Dwheel| over a trailing
+        sub-window (reusing the probation tolerance abs+frac*d). Returns
+        (anchor_entry, verified_bool):
+          - agreement held right up to the outage -> anchor ~ last good sample
+            -> splice ~ live pose (tiny/no jump);
+          - the tail diverged (multipath) -> anchor lands where GPS was last
+            motion-consistent -> the corrupted tail is genuinely cut;
+          - NO sample verifies -> (fixed bad_since-rewind_s anchor, False)
+            = fall back to v1 behavior (caller warns)."""
+        n_steps = int(self._rewind_verify_s / max(self._rewind_verify_step_s, 1e-3)) + 1
+        for i in range(n_steps):     # newest -> oldest: first agreeing = newest
+            t_c = t_out - i * self._rewind_verify_step_s
+            cand = self._buffer_newest_before(t_c)
+            if cand is None:
+                continue
+            prev = self._buffer_newest_before(cand[0] - self._rewind_verify_subwin_s)
+            if prev is None:
+                continue
+            d_gps = math.hypot(cand[1][0] - prev[1][0], cand[1][1] - prev[1][1])
+            d_wheel = math.hypot(cand[2][0] - prev[2][0], cand[2][1] - prev[2][1])
+            tol = self._probation_tol_abs_m + self._probation_tol_frac * d_wheel
+            if abs(d_gps - d_wheel) <= tol:
+                return cand, True
+        # nothing verified -> fixed fallback anchor
+        return self._buffer_newest_before(t_out - self._rewind_s), False
+
     def _do_rewind_handoff(self, now_t):
-        """REWIND handoff (POSE_DATUM_PLAN phase 2): quality metrics admit a
-        GPS degradation late, so the pose at the moment an outage is
-        CONFIRMED already carries a corrupted tail. Re-anchor:
-            pose := rtk(T_a) + (wheel_now - wheel(T_a)),
-        T_a = outage_start - rewind_s, taken from the correction-time buffer;
-        the wheel EKF is never set_pose'd so its delta is correction-free.
-        One ~10 Hz-slewed EKF target does the rest (set_wheel_base_nav_pose
-        caps steps, so even this splice applies smoothly)."""
+        """REWIND handoff (POSE_DATUM_PLAN phase 2 + v2, 2026-07-11): quality
+        metrics admit a GPS degradation late, so the pose at the moment an
+        outage is CONFIRMED already carries a corrupted tail. Re-anchor:
+            pose := rtk(T_a) + R(theta) . (wheel_now - wheel(T_a)),
+        where T_a is a MOTION-VERIFIED anchor (last sample where GPS motion
+        still agreed with wheel motion; see _rewind_verify_anchor) instead of a
+        blind bad_since-rewind_s, and theta = nav_yaw(T_a) - wheel_yaw(T_a)
+        rotates the correction-free wheel delta into the map frame (the wheel
+        EKF free-runs from boot: its position cancels in the delta but its
+        heading drift vs map does not). The wheel EKF is never set_pose'd so its
+        delta is correction-free. One ~10 Hz-slewed EKF target does the rest
+        (set_wheel_base_nav_pose caps steps, so even this splice applies
+        smoothly)."""
         if not self._rewind_enable or not self._pose_buffer:
             return
         if now_t - self._last_rewind_t < self._rewind_cooldown_s:
             rospy.loginfo('[rewind] suppressed (cooldown %.0fs — RTK flapping)',
                           self._rewind_cooldown_s)
             return
-        t_anchor = (self._gps_bad_since or now_t) - self._rewind_s
-        anchor = None
-        for entry in self._pose_buffer:
-            if entry[0] <= t_anchor:
-                anchor = entry
-            else:
-                break
+        t_out = self._gps_bad_since or now_t
+        anchor, verified = self._rewind_verify_anchor(t_out)
         if anchor is None:
-            rospy.logwarn('[rewind] no buffered sample older than %.1fs before '
-                          'the outage — skipping', self._rewind_s)
+            rospy.logwarn('[rewind] no buffered sample to anchor from '
+                          '(verify window %.1fs) — skipping', self._rewind_verify_s)
             return
-        ta, (rx, ry), (wx, wy) = anchor
+        if not verified:
+            rospy.logwarn('[rewind] NO motion-verified anchor in last %.1fs — '
+                          'falling back to fixed T-%.1fs anchor',
+                          self._rewind_verify_s, self._rewind_s)
+        ta, (rx, ry), (wx, wy), wyaw, nyaw = anchor
+        # Delta rotation into map frame (defect A): theta = nav_yaw - wheel_yaw.
+        theta = math.atan2(math.sin(nyaw - wyaw), math.cos(nyaw - wyaw))
         o = self.ekf_wheel_odom_msg.pose.pose.position
-        sx = rx + (o.x - wx)
-        sy = ry + (o.y - wy)
+        ddx = o.x - wx
+        ddy = o.y - wy
+        ct, st = math.cos(theta), math.sin(theta)
+        sx = rx + (ct * ddx - st * ddy)
+        sy = ry + (st * ddx + ct * ddy)
         c = self.ekf_wheel_nav_odom_msg.pose.pose.position
         d = math.hypot(sx - c.x, sy - c.y)
+        rospy.logwarn('[rewind] GPS outage confirmed — anchor age %.1fs (%s), '
+                      'theta %.1fdeg, splice %.2f m',
+                      now_t - ta, 'verified' if verified else 'FALLBACK',
+                      math.degrees(theta), d)
         if d < 0.05:
             rospy.loginfo('[rewind] corrupted tail negligible (%.3f m) — '
                           'no splice needed', d)
@@ -989,9 +1067,6 @@ class NavTfNode:
         pose.position.y = sy
         pose.position.z = self.ekf_wheel_nav_odom_msg.pose.pose.position.z
         pose.orientation = self.fused_msg.orientation
-        rospy.logwarn('[rewind] GPS outage confirmed — re-anchoring pose from '
-                      'T-%.1fs (%.1fs old sample), correcting %.2f m of '
-                      'corrupted tail', now_t - ta, self._rewind_s, d)
         self._last_rewind_t = now_t
         self.set_wheel_base_nav_pose(pose, frame='odom')
 
@@ -1762,13 +1837,26 @@ class NavTfNode:
                     self.fix_last_fused_time = rospy.Time.now()
                     self.set_wheel_base_nav_pose()
                     # rewind buffer: pair the GPS pose with the never-set_pose'd
-                    # wheel-EKF pose at correction time (see _do_rewind_handoff)
+                    # wheel-EKF pose at correction time (see _do_rewind_handoff).
+                    # REWIND v2: also store the wheel-EKF yaw and the live
+                    # nav-pose (map-frame) yaw so the wheel delta can be rotated
+                    # into the map frame at splice time (theta = nav_yaw-wheel_yaw).
                     self._pose_buffer.append((
                         rospy.get_time(),
                         (self.rtk_odom_msg.pose.pose.position.x,
                          self.rtk_odom_msg.pose.pose.position.y),
                         (self.ekf_wheel_odom_msg.pose.pose.position.x,
-                         self.ekf_wheel_odom_msg.pose.pose.position.y)))
+                         self.ekf_wheel_odom_msg.pose.pose.position.y),
+                        euler_from_quaternion([
+                            self.ekf_wheel_odom_msg.pose.pose.orientation.x,
+                            self.ekf_wheel_odom_msg.pose.pose.orientation.y,
+                            self.ekf_wheel_odom_msg.pose.pose.orientation.z,
+                            self.ekf_wheel_odom_msg.pose.pose.orientation.w])[2],
+                        euler_from_quaternion([
+                            self.ekf_wheel_nav_odom_msg.pose.pose.orientation.x,
+                            self.ekf_wheel_nav_odom_msg.pose.pose.orientation.y,
+                            self.ekf_wheel_nav_odom_msg.pose.pose.orientation.z,
+                            self.ekf_wheel_nav_odom_msg.pose.pose.orientation.w])[2]))
                 elif not rtk_fresh:
                     # keep init_navsat's launch condition alive without moving
                     # the robot from a zero/stale gps_odom

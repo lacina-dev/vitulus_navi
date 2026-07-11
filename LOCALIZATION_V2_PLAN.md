@@ -191,6 +191,49 @@ VERDIKT: drift 0.4–0.9 m/průjezd je HEADING-dominantní (cross-track), ne pro
 (v klidu jen 0.025°/min — bag 22-17 + still bag), cross-track 15 m × 3° ≈ 0.8 m.
 Ty viditelné 0.4–0.6 m „skoky" = splice korekce při RTK reacquisition (symptom).
 
+**REWIND v2 — motion-verified anchor + rotace delty do map frame (2026-07-11,
+nasazeno).** Uživatelská polní diagnóza symptomu „skoků" výše, ověřená na bagu
+`~/rosbags/loc_eval/mapfree_drive_2026-07-11_17-23-32.bag`. Dvě vady starého
+splice `pose = rtk(T_a) + [wheelEKF(now)−wheelEKF(T_a)]`:
+- **(A) rotace delty:** `ekf_wheel_odometry` free-runuje od bootu a nikdy se
+  GPS-nekotví; delta ruší jeho pozdíl pozice, ale NE jeho heading drift vůči map
+  frame → wheel delta je pootočená o naakumulovaný nesoulad wheel-EKF-vs-map
+  (bag: 9–14° na 1–4 m pohybu → 0.4–1.0 m chyba splice). FIX: buffer nově ukládá
+  per tick wheel-EKF yaw a live nav-pose (map) yaw; při splice se delta pootočí
+  o `theta = nav_yaw(T_a) − wheel_yaw(T_a)`.
+- **(B) motion-verified anchor:** kvalita GPS ocasu NELZE soudit z kovariance
+  (multipath drží těsnou cov, přitom pozice utíká) — jediný platný rozhodčí je
+  shoda pohybu odometrie. FIX: místo pevného `bad_since − rewind_s` se jde
+  ZPĚTNĚ od výpadku (krok `~rewind_verify_step_s`=0.5 s přes `~rewind_verify_s`=5 s)
+  a anchor = NEJNOVĚJŠÍ vzorek, kde `|Δgps| ≈ |Δwheel|` na trailing sub-okně
+  (probation tolerance 0.1+0.2·d). Držela-li shoda až k výpadku → anchor ≈ live →
+  ~žádný skok; utekl-li ocas (multipath) → anchor tam, kde byl GPS naposledy
+  motion-konzistentní → zkažený ocas se opravdu ustřihne; nic neverifikuje →
+  fallback na staré chování (warn).
+Nové ~params (defaulty bezpečné): `~rewind_verify_s`=5.0, `~rewind_verify_step_s`
+=0.5, `~rewind_verify_subwin_s`=1.5; reuse `~probation_tol_abs_m/frac`. Všechny
+staré guardy (min ocas, max 2 m, cooldown 20 s, grace 8 s, slew) zachovány. Log:
+`anchor age, verified/fallback, theta deg, splice distance`.
+
+Rekonstrukce na mapfree bagu (5 událostí, časy sedí na 17:27:11.6 / 28:43.8 /
+30:27.2 / 30:51.8 / 32:03.2 — přesná shoda s forenzikou):
+
+| # | čas | OLD splice | NEW splice | theta | anchor |
+|---|-----|-----------|-----------|-------|--------|
+| 1 | 17:27:11.6 | 0.37 m | 0.05 m | −11.8° | verified |
+| 2 | 17:28:43.8 | 0.57 m | 0.10 m |  −8.8° | verified |
+| 3 | 17:30:27.2 | 0.75 m | 0.08 m | −14.0° | verified |
+| 4 | 17:30:51.8 | 1.04 m | 0.07 m | −13.2° | verified |
+| 5 | 17:32:03.2 | 0.50 m | 0.17 m | −10.6° | verified |
+
+Všech 5 motion-verified (ocasy byly motion-konzistentní → skutečný skok patřil
+téměř celý rotaci delty, ne ustřižení ocasu). Multipath případ (bag
+`gnss_2026-07-06_22-17-24`, jiná sada topiců, bez `/gnss/fix` → plná replay
+trigger neproveditelná): GPS-vs-wheel motion shoda drží 201/202 sub-oken S
+POHYBEM — walk zůstane na dobrém vzorku; degradovaný ocas u multipath je typicky
+při MALÉM pohybu (těsná cov, pozice utíká) → sub-okno s pohybem tam neverifikuje
+a anchor se nezvolí uvnitř zkaženého ocasu (referee = pohyb, ne self-report).
+
 Nálezy s čísly:
 1. HEADING (hlavní): cross-track >> along-track ve všech RTK segmentech
    (head-eq 6–17°); scale/prokluz jen ~3 % (|v|/gSpeed medián 1.03).

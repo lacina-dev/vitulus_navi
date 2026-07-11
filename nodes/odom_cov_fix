@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""odom_cov_fix - covariance-honesty relay for /licp/odom (rtabmap icp_odometry).
+
+WHY (2026-07-11, LOCALIZATION_V2_PLAN "Vyseterovani driftu pod strechou",
+finding 3): rtabmap 0.21.10 icp_odometry publishes a TWIST covariance that is
+~3-10x too optimistic. Measured at-rest noise: vx std 16.7 mm/s (var 2.8e-4),
+vyaw std 0.70 deg/s (var 1.5e-4 rad^2/s^2); PUBLISHED median vx var 7.26e-5
+(std 8.5 mm/s) and vyaw var 7.26e-6 (std 0.15 deg/s). The over-confident twist
+covariance makes the robot_localization Mahalanobis gate (thr 2.45) reject licp
+almost constantly, so licp contributes nothing to the EKF. rtabmap 0.21.10 has
+NO twist-covariance scaling param (verified against the installed binary), so
+we correct it on the consumer side here.
+
+WHAT: subscribe /licp/odom, republish /licp/odom_cov with the twist covariance
+DIAGONAL for vx (index 0) and vyaw (index 35) FLOORED at measured reality
+(params, defaults below). FLOOR, not overwrite: max(published, floor). This
+PRESERVES rtabmap's cov inflation on tracking loss (it emits 9999 / huge), so
+loss is still signalled to the EKF and the source self-attenuates. Pose
+covariance and every other field are copied verbatim.
+
+Params (private):
+  ~in_topic       (str,   /licp/odom)      source odometry
+  ~out_topic      (str,   /licp/odom_cov)  republished odometry
+  ~vx_var_floor   (float, 2.8e-4)          floor for twist cov[0]  (vx var)
+  ~vyaw_var_floor (float, 1.5e-4)          floor for twist cov[35] (vyaw var)
+"""
+import rospy
+from nav_msgs.msg import Odometry
+
+# twist covariance is row-major 6x6 [vx,vy,vz,vroll,vpitch,vyaw]; diag indices:
+IDX_VX = 0     # 0*6 + 0
+IDX_VYAW = 35  # 5*6 + 5
+
+
+class OdomCovFix(object):
+    def __init__(self):
+        self.in_topic = rospy.get_param('~in_topic', '/licp/odom')
+        self.out_topic = rospy.get_param('~out_topic', '/licp/odom_cov')
+        self.vx_floor = float(rospy.get_param('~vx_var_floor', 2.8e-4))
+        self.vyaw_floor = float(rospy.get_param('~vyaw_var_floor', 1.5e-4))
+        self.pub = rospy.Publisher(self.out_topic, Odometry, queue_size=10)
+        self.sub = rospy.Subscriber(self.in_topic, Odometry, self.cb,
+                                    queue_size=20)
+        rospy.loginfo('odom_cov_fix: %s -> %s  (floor vx=%.3e vyaw=%.3e)',
+                      self.in_topic, self.out_topic,
+                      self.vx_floor, self.vyaw_floor)
+
+    def cb(self, msg):
+        # Copy is implicit: we only mutate the two twist-cov diagonal entries.
+        # tuple->list so it is assignable; everything else passes through.
+        cov = list(msg.twist.covariance)
+        # FLOOR (never lower): preserves rtabmap's tracking-loss inflation (9999).
+        if cov[IDX_VX] < self.vx_floor:
+            cov[IDX_VX] = self.vx_floor
+        if cov[IDX_VYAW] < self.vyaw_floor:
+            cov[IDX_VYAW] = self.vyaw_floor
+        msg.twist.covariance = cov
+        self.pub.publish(msg)
+
+
+if __name__ == '__main__':
+    rospy.init_node('odom_cov_fix')
+    OdomCovFix()
+    rospy.spin()

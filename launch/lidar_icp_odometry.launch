@@ -89,11 +89,27 @@
          scaling/multiplier param (Odom/Kalman* only apply when
          Odom/FilteringStrategy>0, which we leave at 0). The published twist
          cov underestimates reality ~3-10x (vx 8.4 vs 28.5 mm/s measured).
-         There is no launch-side knob to inflate it. This is compensated on
-         the CONSUMER side: the robot_localization Mahalanobis gate
-         (ekf_base_outdoor.yaml odomN_twist_rejection_threshold, being fixed
-         in parallel) rejects toward safety. If honest cov is required later,
-         post-process /licp/odom twist cov in navi_transform before feeding
-         the EKF, or enable Odom/FilteringStrategy for smoothed output. -->
+         There is no launch-side knob to inflate it. Compensated on the
+         CONSUMER side by the odom_cov_fix relay below (2026-07-11), which
+         floors the vx/vyaw twist cov at measured reality before the EKF. -->
+  </node>
+
+  <!-- Covariance-honesty relay (2026-07-11, LOCALIZATION_V2_PLAN drift finding
+       3). icp_odometry's published twist cov is ~3-10x too optimistic (vx std
+       8.5 vs measured 16.7 mm/s; vyaw std 0.15 vs measured 0.70 deg/s), so the
+       EKF Mahalanobis gate (thr 2.45) rejected licp constantly (offline eval
+       2026-07-11: wheel_licp was BIT-IDENTICAL to wheel; licp contributed
+       nothing). This node republishes /licp/odom -> /licp/odom_cov with the
+       vx/vyaw twist-cov diagonal FLOORED at measured variance. FLOOR not
+       overwrite: rtabmap's tracking-loss inflation (9999) is preserved so loss
+       still signals to the EKF. It lives/dies with icp_odometry (same launch),
+       and the EKF (ekf_base_outdoor.yaml) consumes /licp/odom_cov. -->
+  <node pkg="vitulus_navi" type="odom_cov_fix" name="licp_odom_cov_fix" output="screen">
+    <param name="in_topic"       type="string" value="/licp/odom"/>
+    <param name="out_topic"      type="string" value="/licp/odom_cov"/>
+    <!-- measured at-rest: vx std 16.7 mm/s -> var 2.8e-4; vyaw std 0.70 deg/s
+         -> var 1.5e-4 rad^2/s^2. -->
+    <param name="vx_var_floor"   type="double" value="0.00028"/>
+    <param name="vyaw_var_floor" type="double" value="0.00015"/>
   </node>
 </launch>

@@ -210,6 +210,7 @@ catkin_install_python(PROGRAMS
   nodes/smach_exe_goal
   nodes/navi_transform
   nodes/gloc_server
+  nodes/odom_cov_fix
 
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

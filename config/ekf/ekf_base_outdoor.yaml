@@ -155,14 +155,21 @@ ekf_wheel_nav_odometry:
   # fused here (previously left to IMU/RTK heading because licp yaw was noisy
   # ~2.8 deg/s peak-to-peak at rest) now that the licp deskewing/PointToPlane
   # fix (parallel effort, same investigation) is landing — this stabilizes
-  # heading under the roof without RTK. RISK: licp's published twist yaw
-  # covariance still understates real yaw-rate noise (~1.4 deg/s std vs
-  # 7.76e-6 rad^2 declared, ~10x), so the Mahalanobis gate will see inflated
-  # distances for vyaw and reject more than a well-calibrated source would —
-  # that errs toward rejecting bad data, which is safe. Do NOT raise the
-  # threshold further to compensate; fix the source covariance instead.
+  # heading under the roof without RTK.
+  #
+  # 2026-07-11 COVARIANCE-HONESTY FIX: this now consumes /licp/odom_cov (the
+  # odom_cov_fix relay in lidar_icp_odometry.launch) instead of raw /licp/odom.
+  # icp_odometry 0.21.10 published twist cov ~3-10x too optimistic: vx var
+  # 7.26e-5 (std 8.5 mm/s) vs MEASURED 2.8e-4 (16.7 mm/s); vyaw var 7.26e-6
+  # (std 0.15 deg/s) vs MEASURED 1.5e-4 (0.70 deg/s). The over-confident cov
+  # made this 2.45 Mahalanobis gate reject licp constantly — in the 2026-07-11
+  # GPS-free replay eval, wheel_licp_rawimu was BIT-IDENTICAL to wheel_rawimu
+  # (licp contributed nothing). The relay FLOORS vx/vyaw twist cov at measured
+  # reality (preserving rtabmap's 9999 loss-inflation), so the gate now sees
+  # an honest distance and admits good licp. Do NOT raise the threshold to
+  # compensate; the source cov was the liar, and it is now floored honestly.
   # threshold = chi2(2,0.95) for the 2 fused DOF (vx, vyaw) = 2.45.
-  odom2: /licp/odom
+  odom2: /licp/odom_cov
   odom2_config: [ false, false, false,
                   false, false, false,
                   true, false, false,

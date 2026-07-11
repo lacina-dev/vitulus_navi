@@ -16,6 +16,41 @@ tam, kde není signál. Dock = absolutní kotva bez GPS.
 
 ## Ověřený současný stav (souhrn auditu)
 
+> **STAV PO 2026-07-11 (deploy WP1–WP4 + review).** Níže popsaný „audit" stav
+> je z velké části PŘED-WP2; tento odstavec shrnuje živě ověřenou realitu po
+> nasazení a review 2026-07-11 (nepřepisuje historii níže). Ověřeno živě
+> proti běžícímu robotu (v doku, idle):
+> - **EKF (nav):** odom0=/mobile_base_controller/odom (thr **50**),
+>   odom1=/vo/odom (thr **2.45**, fúzuje vx+vyaw), odom2=**/licp/odom_cov**
+>   (thr **2.45**, vx+vyaw) — souvislé, bez děr; imu0=/gnss_heading/nav_fused.
+>   Práh 1.0σ z auditu je NAHRAZEN 2.45 (chi2 0.95, 2 DOF). Živé rosparamy =
+>   soubor. odom2 má PRÁVĚ JEDEN živý publisher (`licp_odom_cov_fix` relay);
+>   cov floored: twist cov[0]=2.8e-4, cov[35]=1.5e-4 (ověřeno na zprávě).
+> - **Arbitr (navi_transform):** JE zaveden — source-tagged set_map_pose
+>   (dock/tracker/rtabmap/legacy) s prioritou v callbacku (NE last-writer-wins),
+>   `_map_pose_hold_s`=5 s; pořadí DOCKED > GPS(_gps_stable) > tracker > rtabmap
+>   > DR. `/nav_tf/loc_status` (JSON, ~1 Hz), `/nav_tf/bridge_status.gps_good`
+>   = `_gps_stable()` + `fix_usable`. G1/G2 z auditu = VYŘEŠENO.
+>   rtabmap_confident = jen observability (mimo pózovou cestu).
+> - **site_map (WP1):** `/mapping_manager/site_map` EXISTUJE, latched
+>   OccupancyGrid (garden2_v1, 384×512 @ 0.05 m); gloc jej konzumuje
+>   (map_topic v navi_man.launch). G3 z auditu (site_map neexistuje) = NEPLATÍ.
+> - **gloc tracker:** track_defer_to_rtabmap=True → gated OFF (živě
+>   applied=false, state=poor_match); NEZAPISUJE set_map_pose_tracker.
+> - **Dock:** rtabmap→póza bridge VYPNUT (bridge_enable=false default + log
+>   „BRIDGE DISABLED"); guard cross-check /dock_manager/is_in_dock_confirmed
+>   (confirm_fresh_s=15, confirm_timeout_s=10); waypoint „docked" přítomen.
+> - **Datum symlink:** `~/.vitulus/saves/site_datum.yaml` → garden2/datum.yaml
+>   (= servírovaná mapa), navi_transform jej aplikuje jen bez živého map_coords.
+>   REVIEW FIX 2026-07-11: `link_site_datum` se nyní volá i ze serve cesty
+>   (`_publish_site_map`), ne jen z mapping start — servírování jiného site už
+>   nenechá datum ukazovat na dřív mapovaný site (garden vs garden2 = 0.23 m/0.9°).
+> - **Úklid:** živě odregistrovány mrtvé zombie uzly (`odom_cov_fix` starý
+>   název relaye, `ekf_navigation_node`, stray tf_echo) přes `rosnode cleanup`.
+> - **respawn:** kritické uzly (navi_man, navi_transform, gloc_server, dock_*,
+>   mapping_manager, webnode) = respawn=true. licp/VO/relay = BEZ respawn
+>   (EKF se ale sám odtlumí na staleness — degradace, ne pád) — doporučení.
+
 **Vrstva 1 (odom→base, spojitá):** `ekf_wheel_nav_odometry`
 (config/ekf/ekf_base_outdoor.yaml:84) fúzuje wheel twist (Mahalanobis 50σ)
 + VO twist (/vo/odom, ~5 Hz) + licp twist (/licp/odom, ~10 Hz; oba práh 1.0σ)

@@ -151,6 +151,45 @@ class GlocServer(object):
         self._reject_reason = None     # last non-ok state string
         self._reject_streak = 0        # consecutive ticks with the same reject reason
 
+        # AUTO-RELOCALIZATION (2026-07-12, field report: after smoothing the
+        # tracker stabilised but eventually LOST SYNC with the map and NEVER
+        # re-found — unacceptable). The tracker's reject paths (poor_match when
+        # rms>track_max_rms_m, degenerate when eig collapses, or corr_too_big
+        # that the big-corr recovery can NOT catch because recovery itself needs
+        # rms_ok+eig_ok) all just `return` — once lost far off the map the local
+        # GN alignment can no longer pull back and rejects FOREVER. Recovery: when
+        # GPS is denied AND the tracker has been rejecting continuously for
+        # >track_lost_after_s, run the EXISTING global kidnap scorer (compute())
+        # against the current site_map + a fresh scan; if the margin gate passes
+        # AND the found yaw is sane vs the current heading (gyro stays valid when
+        # only position is lost), publish the found pose to
+        # /nav_tf/set_map_pose_tracker — its distance from the drifted-wrong pose
+        # is >0.6 m so navi_transform SNAPS (instant re-lock). Rate-limited so a
+        # persistently-hard spot does not thrash. The scorer is synchronous
+        # (~0.5-1 s); it runs INSIDE the tracker tick thread (skipping the normal
+        # tick that cycle) — fine at 1 Hz.
+        self.relock_enable = bool(rospy.get_param('~relock_enable', True))
+        self.track_lost_after_s = float(rospy.get_param('~track_lost_after_s', 15.0))
+        self.relock_min_interval_s = float(rospy.get_param('~relock_min_interval_s', 30.0))
+        # reject states that count as "lost" (drift/aliasing far off the map).
+        # 'no_scan'/'no_tf'/'few_rays'/'few_points_in_map'/'no_map' are sensor/
+        # bootstrap gaps, NOT a localization loss — excluded so a momentary scan
+        # dropout can not trigger a global relock.
+        self._lost_states = ('poor_match', 'degenerate', 'corr_too_big')
+        self._lost_since = None        # wall time the lost-streak started (None = healthy)
+        self._last_relock_t = 0.0      # wall time of the last relock attempt
+        # URGENT-CORR bypass (2026-07-12, prevention): the smoothing gates (2-tick
+        # persistence + EMA + deadband) must not STARVE corrections during motion.
+        # When the smoothed correction is large (|corr| > track_urgent_corr_m) that
+        # is real drift, not near-minima jitter — bypass persistence/deadband and
+        # publish immediately (EMA still applied so one aliased tick can not yank).
+        self.track_urgent_corr_m = float(rospy.get_param('~track_urgent_corr_m', 0.12))
+        # stale-EMA reset: if no correction was applied for >track_ema_reset_gap_s
+        # the EMA target is stale (it can pull the pose toward an old alignment) —
+        # drop it so the next applied tick re-seeds from the live measurement.
+        self.track_ema_reset_gap_s = float(rospy.get_param('~track_ema_reset_gap_s', 5.0))
+        self._last_apply_t = None      # wall time of the last published correction
+
         self._grid = None          # (occ, free, res, ox, oy, h, w)
         self._edt = None
         self._edt_gx = None        # d(EDT)/dx [m/m], same shape as grid
@@ -389,9 +428,89 @@ class GlocServer(object):
               ratio < self.track_bigcorr_consist_ratio)
         return ok, spread_deg, ratio
 
+    def _try_relock(self, info):
+        """Run the global kidnap scorer and, if it passes the margin + yaw-sanity
+        gates, publish the found pose to /nav_tf/set_map_pose_tracker (navi_transform
+        SNAPS it when >0.6 m from the drifted pose = instant re-lock). Returns True
+        if a pose was published. Loud logging either way. Called synchronously from
+        the tick thread — the scorer is ~0.5-1 s, acceptable at 1 Hz."""
+        self._last_relock_t = time.time()
+        rospy.logwarn('[gloc-track] LOST for %.0fs (%s) — running AUTO-RELOCK '
+                      '(global scorer)...', info.get('lost_held_s', 0.0),
+                      info.get('reject_reason', '?'))
+        self._set_status('relocalizing (auto)...')
+        try:
+            # no_heatmap: cheaper, we do not need the PNG for an auto-relock
+            r = self.compute(with_heatmap=False)
+        except Exception as e:
+            rospy.logwarn('[gloc-track] auto-relock compute failed: %s', e)
+            info['state'] = 'relock_failed'
+            info['relock_err'] = str(e)
+            return False
+        info['relock_margin'] = r['margin']
+        info['relock_yaw_sane'] = r.get('yaw_sane', True)
+        if not r.get('apply_ok', r['margin_ok']):
+            why = ('margin %.0f%% < gate %.0f%%' % (r['margin'] * 100,
+                   self.apply_min_margin * 100) if not r['margin_ok']
+                   else 'yaw deviates from current heading (mirror alias?)')
+            rospy.logwarn('[gloc-track] AUTO-RELOCK REJECTED: %s — staying lost, '
+                          'will retry in %.0fs', why, self.relock_min_interval_s)
+            info['state'] = 'relock_failed'
+            self._set_status('relock rejected: %s' % why)
+            return False
+        b = r['best']
+        ps = PoseStamped()
+        ps.header.stamp = rospy.Time.now()
+        ps.header.frame_id = self.map_frame
+        ps.pose.position.x = b['x']
+        ps.pose.position.y = b['y']
+        q = quaternion_from_euler(0, 0, math.radians(b['yaw_deg']))
+        ps.pose.orientation.x = q[0]
+        ps.pose.orientation.y = q[1]
+        ps.pose.orientation.z = q[2]
+        ps.pose.orientation.w = q[3]
+        self.pub_track_pose.publish(ps)
+        # fresh lock — clear all reject/smoothing state so the tracker resumes
+        # clean from the snapped pose next tick.
+        self._lost_since = None
+        self._bigcorr_reset()
+        self._persist_dirs = []
+        self._ema_pose = None
+        self._reject_reason = None
+        self._reject_streak = 0
+        dcur = r.get('delta_to_current') or {}
+        rospy.logwarn('[gloc-track] AUTO-RELOCK APPLIED -> /nav_tf/set_map_pose_tracker '
+                      '(%.2f, %.2f, %.1fdeg) margin %.0f%% delta %.2fm '
+                      '(navi_transform snaps if >0.6m)', b['x'], b['y'],
+                      b['yaw_deg'], r['margin'] * 100, dcur.get('dist_m', -1))
+        self._set_status('RELOCK APPLIED (%.2f, %.2f, %.1fdeg) margin %.0f%%'
+                         % (b['x'], b['y'], b['yaw_deg'], r['margin'] * 100))
+        info['state'] = 'relock'
+        info['relock_x'] = b['x']
+        info['relock_y'] = b['y']
+        info['relock_yaw_deg'] = b['yaw_deg']
+        info['relock_delta_m'] = dcur.get('dist_m')
+        return True
+
     def _track_tick(self, _evt):
         info = {'applied': False}
         try:
+            # AUTO-RELOCK gate: if we are lost (a real localization-loss reject
+            # streak, GPS denied) beyond track_lost_after_s and the rate limit has
+            # elapsed, hijack this tick to run the global scorer instead of the
+            # normal local alignment (which can no longer pull us back).
+            if (self.relock_enable and self._lost_since is not None
+                    and not self._gps_good):
+                held = time.time() - self._lost_since
+                info['lost_held_s'] = round(held, 1)
+                info['reject_reason'] = self._reject_reason
+                if (held >= self.track_lost_after_s and
+                        time.time() - self._last_relock_t >= self.relock_min_interval_s):
+                    self._try_relock(info)
+                    # publish status for this hijacked tick and stop; the normal
+                    # alignment resumes next tick (finally-block still runs).
+                    return
+
             scan = self._last_scan
             now = rospy.Time.now()
             if scan is None or (now - scan.header.stamp).to_sec() > 1.5:
@@ -505,6 +624,16 @@ class GlocServer(object):
                 self._ema_pose = (x, y, th)   # keep EMA anchored to the live pose
                 self._persist_dirs = []
             else:
+                # STALE-EMA RESET (2026-07-12 prevention 2b): if no correction was
+                # applied for > track_ema_reset_gap_s, the smoothed target is stale
+                # — while lost/rejecting the EMA kept decaying toward an old
+                # alignment and would now pull the pose the WRONG way. Drop it so
+                # this tick re-seeds the EMA from the live measurement.
+                if (self._ema_pose is not None and self._last_apply_t is not None
+                        and time.time() - self._last_apply_t > self.track_ema_reset_gap_s):
+                    self._ema_pose = None
+                    self._persist_dirs = []
+                    info['ema_reset'] = True
                 # 1) EMA the target pose (yaw via angle-wrap on the delta)
                 if self._ema_pose is None:
                     self._ema_pose = (x, y, th)
@@ -522,27 +651,37 @@ class GlocServer(object):
                                                    math.cos(th - pose0[2]))))
                 info['corr_m_sm'] = round(dx, 3)
                 info['corr_yaw_deg_sm'] = round(dyaw, 2)
-                # 2) raised deadband — drop sub-4 cm / sub-0.4 deg ping-pong
-                if dx < self.track_min_corr_m and dyaw < self.track_min_corr_yaw_deg:
-                    info['state'] = 'aligned'
-                    self._persist_dirs = []
-                    return
-                # 3) persistence gate — the smoothed correction must point the
-                # same way for >= N ticks (real drift holds; ping-pong reverses)
-                self._persist_dirs.append(math.atan2(y - pose0[1], x - pose0[0]))
-                n = max(1, self.track_persist_n)
-                self._persist_dirs = self._persist_dirs[-n:]
-                if len(self._persist_dirs) >= n:
-                    cs = sum(math.cos(a) for a in self._persist_dirs)
-                    sn = sum(math.sin(a) for a in self._persist_dirs)
-                    rlen = min(1.0, math.hypot(cs, sn) / len(self._persist_dirs))
-                    spread = math.degrees(math.acos(rlen))
-                    info['persist_spread_deg'] = round(spread, 1)
+                # URGENT-CORR BYPASS (2026-07-12 prevention 2a): a smoothed
+                # correction over track_urgent_corr_m is real drift, not near-minima
+                # jitter — the deadband/persistence gates must NOT starve it while
+                # driving. Skip both gates and publish now (EMA already applied, so a
+                # single aliased tick still can not yank the pose). Below the
+                # threshold, keep the ping-pong suppression (deadband + persistence).
+                urgent = dx > self.track_urgent_corr_m
+                if urgent:
+                    info['urgent'] = True
                 else:
-                    spread = None
-                if spread is None or spread > self.track_persist_deg:
-                    info['state'] = 'settling'
-                    return
+                    # 2) raised deadband — drop sub-4 cm / sub-0.4 deg ping-pong
+                    if dx < self.track_min_corr_m and dyaw < self.track_min_corr_yaw_deg:
+                        info['state'] = 'aligned'
+                        self._persist_dirs = []
+                        return
+                    # 3) persistence gate — the smoothed correction must point the
+                    # same way for >= N ticks (real drift holds; ping-pong reverses)
+                    self._persist_dirs.append(math.atan2(y - pose0[1], x - pose0[0]))
+                    n = max(1, self.track_persist_n)
+                    self._persist_dirs = self._persist_dirs[-n:]
+                    if len(self._persist_dirs) >= n:
+                        cs = sum(math.cos(a) for a in self._persist_dirs)
+                        sn = sum(math.sin(a) for a in self._persist_dirs)
+                        rlen = min(1.0, math.hypot(cs, sn) / len(self._persist_dirs))
+                        spread = math.degrees(math.acos(rlen))
+                        info['persist_spread_deg'] = round(spread, 1)
+                    else:
+                        spread = None
+                    if spread is None or spread > self.track_persist_deg:
+                        info['state'] = 'settling'
+                        return
             ps = PoseStamped()
             ps.header.stamp = now
             ps.header.frame_id = self.map_frame
@@ -556,6 +695,7 @@ class GlocServer(object):
             self.pub_track_pose.publish(ps)
             info['applied'] = True
             self._applied_count += 1
+            self._last_apply_t = time.time()
             # finding 3: on a slew, dx is the FULL offset to the target but only
             # slew_step m is actually applied this tick — print both (step/total).
             if slewed:
@@ -582,6 +722,23 @@ class GlocServer(object):
                 else:
                     self._reject_reason = st
                     self._reject_streak = 1
+            # AUTO-RELOCK lost-streak tracking: arm _lost_since on the FIRST tick
+            # of a genuine localization-loss reject (poor_match/degenerate/
+            # corr_too_big), clear it on any applied correction or a healthy/owned
+            # state. Sensor gaps (no_scan/no_tf/few_*) and the relock states
+            # themselves do NOT arm/clear the timer here — _try_relock manages its
+            # own reset, and a relock in progress must not keep re-arming.
+            if info.get('applied') or st in ('gps_owns', 'rtabmap_owns', 'aligned'):
+                self._lost_since = None
+            elif st in self._lost_states:
+                if self._lost_since is None:
+                    self._lost_since = time.time()
+            # (relock / relock_failed / no_scan / no_tf / etc.: leave _lost_since
+            #  as-is — a transient sensor gap must not reset an accumulating loss,
+            #  and relock states are handled inside _try_relock)
+            info['lost'] = self._lost_since is not None
+            if self._lost_since is not None:
+                info['lost_held_s'] = round(time.time() - self._lost_since, 1)
             info['applied_count'] = self._applied_count
             info['reject_reason'] = self._reject_reason
             info['reject_streak'] = self._reject_streak

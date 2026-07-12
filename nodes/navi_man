@@ -321,6 +321,33 @@ class Node:
         # Octomap (mapping_v3) site raster from mapping_manager. Cache it and, if we
         # are currently serving the octomap source, mark for republish so the served
         # /navi_manager/map refreshes (e.g. mapping_manager serves a newer raster).
+        #
+        # servesync (2026-07-12): mapping_manager publishes an explicit EMPTY /
+        # header-only OccupancyGrid on site_map when a FRESH site (no rasters) starts
+        # mapping — serving must stay consistent with the active session, not keep the
+        # previous site's raster latched. Treat an empty/tiny grid as NO raster: drop
+        # the cached site_map so publish_map falls back to the truthful bootstrap map
+        # (bootstrap mode) instead of republishing a stale raster or an empty grid.
+        n_cells = msg.info.width * msg.info.height
+        if n_cells == 0:
+            if self.site_map_msg is not None:
+                rospy.logwarn("navi_man: site_map cleared (empty grid from "
+                              "mapping_manager — fresh site being mapped); dropping "
+                              "cached raster, falling back to bootstrap map.")
+            self.site_map_msg = None
+            if self.map_show == "octomap":
+                # Rebuild bootstrap fresh (robot pose / scan may have moved) and
+                # re-arm the republish so publish_map serves it this tick.
+                self._bootstrap_map_msg = None
+                self._bootstrap_build_attempts = 0
+                self._octomap_fallback_active = False
+                # Cancel any pending serve_site retry: an empty grid is the
+                # INTENDED "no map" state of a fresh session, not a boot race, so
+                # octomap_serve_tick must NOT keep re-requesting serve_site (which
+                # would re-pull some OTHER site's newest raster mid-session).
+                self._octomap_serve_deadline = None
+                self.is_map_to_publish = True
+            return
         first = self.site_map_msg is None
         self.site_map_msg = msg
         if self.map_show == "octomap":

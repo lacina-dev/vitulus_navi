@@ -343,6 +343,25 @@ class GlocServer(object):
     # ---- map ------------------------------------------------------------------
 
     def cb_grid(self, msg):
+        # servesync (2026-07-12): an explicitly EMPTY (0x0, header-only) grid from
+        # mapping_manager means "no map is being served" (a FRESH site is being
+        # mapped) — CLEAR the in-memory map so the tracker goes no_map instead of
+        # silently keeping the previous site's grid/EDT latched (it would keep
+        # matching the OLD map under the NEW site's datum). A merely sparse grid
+        # (<20 occupied but nonzero cells) keeps the old skip-and-retain semantics.
+        if msg.info.width * msg.info.height == 0:
+            with self._lock:
+                had = self._grid is not None
+                self._grid = None
+                self._edt = None
+                self._edt_gx = None
+                self._edt_gy = None
+                self._grid_stamp = None
+            if had:
+                rospy.logwarn('[gloc] served map cleared (empty grid — fresh site '
+                              'being mapped); tracker -> no_map until a map is '
+                              'served again')
+            return
         if abs(euler_from_quaternion([msg.info.origin.orientation.x,
                                       msg.info.origin.orientation.y,
                                       msg.info.origin.orientation.z,

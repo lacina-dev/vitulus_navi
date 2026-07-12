@@ -205,6 +205,24 @@ class GlocServer(object):
         self.track_ema_reset_gap_s = float(rospy.get_param('~track_ema_reset_gap_s', 5.0))
         self._last_apply_t = None      # wall time of the last published correction
 
+        # PROBATION-WINDOW JERK FIX (2026-07-12, live field report while driving
+        # outdoors WITH usable GPS): 5f589ff made the tracker active whenever
+        # fix_usable==0 OR gps_good==0 (gps_good == _gps_stable, i.e. OWNERSHIP
+        # proven). That includes the PROBATION window — fix_usable=1 (raw fix
+        # is back) but gps_good=0 (ownership not yet re-proven, e.g. right after
+        # a reacquire or during the arbiter's confidence build-up). In that
+        # window the tracker kept correcting at 5 Hz / up to 0.7 m per tick
+        # while GPS was already perfectly usable outdoors -> visible jerk.
+        # Field verdict: outdoors with a usable fix, GPS should simply own it,
+        # probation or not. ~track_active_mode selects the gate:
+        #   'fix_lost' (NEW DEFAULT) — tracker idles whenever fix_usable==1,
+        #       regardless of gps_good/ownership probation. Only a genuinely
+        #       unusable raw fix (denial: roof/canyon/no-sat) wakes the tracker.
+        #   'not_owned' — the 5f589ff behaviour (idle only when BOTH gps_good
+        #       and fix_usable are 1); kept for rollback if 'fix_lost' turns out
+        #       to reopen the ~8 s dead-reckoning gap the 5f589ff fix targeted.
+        self.track_active_mode = rospy.get_param('~track_active_mode', 'fix_lost')
+
         self._grid = None          # (occ, free, res, ox, oy, h, w)
         self._edt = None
         self._edt_gx = None        # d(EDT)/dx [m/m], same shape as grid
@@ -244,14 +262,14 @@ class GlocServer(object):
         rospy.Subscriber(self.scan_topic, LaserScan,
                          lambda m: setattr(self, '_last_scan', m), queue_size=1)
         # ENGAGE FAST (2026-07-12, correctness-first): the tracker must take over
-        # the moment the RAW fix goes unusable, NOT only after ownership
-        # (_gps_stable) drops. bridge_status carries TWO fields: gps_good=int
-        # (_gps_stable — pose OWNERSHIP, stays TRUE through the ~8 s outage grace)
-        # and fix_usable=int (RAW position_fix_usable — drops immediately on
-        # denial). The tracker gate _gps_good is TRUE (tracker idles) ONLY when
-        # BOTH are set, i.e. GPS is genuinely owning the pose with a live fix.
-        # As soon as fix_usable==0 OR gps_good==0 the tracker activates — this
-        # removes the ~8 s dead-reckoning gap at the START of every denial.
+        # the moment the RAW fix goes unusable — see _tracker_should_idle().
+        # bridge_status carries TWO fields: gps_good=int (_gps_stable — pose
+        # OWNERSHIP, stays TRUE through the ~8 s outage grace) and
+        # fix_usable=int (RAW position_fix_usable — drops immediately on
+        # denial). self._gps_good = gps_stable and fix_usable is kept as a raw
+        # telemetry field (reported in track_status) but is NO LONGER the
+        # tracker gate directly — see the PROBATION-WINDOW JERK FIX note below
+        # and _tracker_should_idle() for the actual gate used by the tick.
         # SAFETY: activating during the grace window can NOT fight GPS — the
         # arbiter in navi_transform ranks dock > tracker > rtabmap, and while
         # _gps_stable() is TRUE the RTK set_pose path owns map->odom; a tracker
@@ -380,6 +398,17 @@ class GlocServer(object):
         self._gps_stable = gps_stable
         self._fix_usable = fix_usable
         self._gps_good = gps_stable and fix_usable
+
+    def _tracker_should_idle(self):
+        """PROBATION-WINDOW FIX (2026-07-12): the actual tracker gate, decoupled
+        from the raw self._gps_good telemetry field (kept as-is for status/
+        observability). 'fix_lost' (default): idle whenever the raw fix is
+        usable, ownership probation or not — outdoors with a usable fix, leave
+        it to GPS. 'not_owned': idle only with full ownership (5f589ff,
+        pre-2026-07-12 behaviour) — rollback path."""
+        if self.track_active_mode == 'not_owned':
+            return self._gps_good
+        return self._fix_usable
 
     def _track_align(self, pts_base, pose0):
         """Gauss-Newton scan-to-EDT: minimize sum EDT(R(yaw) p + t)^2 over
@@ -547,7 +576,7 @@ class GlocServer(object):
             # elapsed, hijack this tick to run the global scorer instead of the
             # normal local alignment (which can no longer pull us back).
             if (self.relock_enable and self._lost_since is not None
-                    and not self._gps_good):
+                    and not self._tracker_should_idle()):
                 held = time.time() - self._lost_since
                 info['lost_held_s'] = round(held, 1)
                 info['reject_reason'] = self._reject_reason
@@ -586,6 +615,7 @@ class GlocServer(object):
                          'gps_good': self._gps_good,
                          'gps_stable': self._gps_stable,
                          'fix_usable': self._fix_usable,
+                         'track_active_mode': self.track_active_mode,
                          'rtabmap_confident': self._rtab_conf})
             rms_ok = out['rms'] <= self.track_max_rms_m
             eig_ok = out['eig_min'] >= self.track_min_eig_frac * out['n']
@@ -654,7 +684,7 @@ class GlocServer(object):
             # correction is healthy (or slewed) — apply only when GPS is denied
             # (the GPS arbiter owns the pose otherwise) and rtabmap does not have
             # priority (defer default OFF 2026-07-11; ~track_defer_to_rtabmap).
-            if self._gps_good:
+            if self._tracker_should_idle():
                 info['state'] = 'gps_owns'
                 # freshness (finding 2): GPS owns the pose, so any big-corr
                 # evidence is stale — after GPS loss recovery must earn a fresh

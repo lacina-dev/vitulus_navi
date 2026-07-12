@@ -203,6 +203,17 @@ class Node:
         self.rtabmap_grid_map_msg = None
         self.planner_map_msg = None
         self.site_map_msg = None
+        # Octomap-source boot robustness (bootfix2, 2026-07-12). In "octomap" mode
+        # /navi_manager/map must NEVER go silent, or the global costmap static layer
+        # never gets a map -> MBF actions absent -> smach crash-loop, footprint gone.
+        # mapping_manager's latched site_map can be absent at boot (its 'serving'
+        # state is reset on restart). So: keep re-requesting serve_site until a
+        # site_map arrives, and meanwhile serve the planner map as a fallback.
+        self._octomap_serve_deadline = None   # rospy.Time; stop retrying after it
+        self._octomap_last_serve_req = None    # rospy.Time of last serve_site request
+        self._octomap_serve_period = 5.0       # seconds between serve_site requests
+        self._octomap_serve_window = 60.0      # total retry window (s)
+        self._octomap_fallback_active = False  # currently serving planner as stand-in
         self.point_pose_srvs = rospy.Service("navi_manager/get_point_pose", Point_pose, self.srv_cb_map_point_pose)
 
 
@@ -298,8 +309,18 @@ class Node:
         # Octomap (mapping_v3) site raster from mapping_manager. Cache it and, if we
         # are currently serving the octomap source, mark for republish so the served
         # /navi_manager/map refreshes (e.g. mapping_manager serves a newer raster).
+        first = self.site_map_msg is None
         self.site_map_msg = msg
         if self.map_show == "octomap":
+            # First raster arrival: stop the serve_site retry and switch the
+            # republished /navi_manager/map from the planner fallback to the raster.
+            if first:
+                rospy.loginfo("navi_man: octomap site_map received (%dx%d @ %.3f m) "
+                              "— switching /navi_manager/map to the raster",
+                              msg.info.width, msg.info.height, msg.info.resolution)
+                if self._octomap_fallback_active:
+                    self._octomap_fallback_active = False
+                self._octomap_serve_deadline = None
             self.is_map_to_publish = True
 
     def callback_web_plan_map(self, msg):
@@ -329,9 +350,18 @@ class Node:
         if msg.data == "octomap":
             # Octomap (mapping_v3) source: no docker container to start. If we do not
             # yet have a cached site_map, ask mapping_manager to (re)serve it (latched
-            # publish reaches us on connect). rtabmap is NOT started for this source.
+            # publish reaches us on connect) and ARM a bounded retry (octomap_serve_tick
+            # on the slow loop) — mapping_manager may not have served yet at boot.
+            # rtabmap is NOT started for this source.
             if self.site_map_msg is None:
                 self.pub_serve_site.publish(String(""))
+                now = rospy.Time.now()
+                self._octomap_last_serve_req = now
+                self._octomap_serve_deadline = now + rospy.Duration(self._octomap_serve_window)
+                rospy.loginfo("navi_man: octomap source selected, no site_map yet — "
+                              "requesting serve_site and retrying up to %.0fs; "
+                              "serving planner map as fallback meanwhile.",
+                              self._octomap_serve_window)
             self.is_rtabmap_pub.publish(Bool(False))
         self.map_show = msg.data
         self.is_map_to_publish = True
@@ -355,7 +385,50 @@ class Node:
                 if self.site_map_msg is not None:
                     self.nm_map_pub.publish(self.site_map_msg)
                     self.pub_map_source.publish(String("octomap"))
+                elif self.planner_map_msg is not None:
+                    # No raster yet: NEVER leave /navi_manager/map silent — serve the
+                    # planner map as a fallback so the global costmap/MBF/footprint
+                    # still come up. octomap_serve_tick keeps retrying serve_site;
+                    # callback_site_map switches back to the raster on first arrival.
+                    self.nm_map_pub.publish(self.planner_map_msg)
+                    self.pub_map_source.publish(String("planner"))
+                    if not self._octomap_fallback_active:
+                        self._octomap_fallback_active = True
+                        rospy.logwarn("navi_man: octomap source has no raster yet — "
+                                      "serving PLANNER map on /navi_manager/map as fallback.")
+                else:
+                    # Neither raster nor planner map available yet (very early boot):
+                    # keep the publish pending so the next tick retries — do not
+                    # clear the flag, otherwise /navi_manager/map stays silent until
+                    # some other event re-arms it.
+                    return
             self.is_map_to_publish = False
+
+    def octomap_serve_tick(self):
+        # Bounded retry of /mapping_manager/serve_site while in octomap mode with no
+        # raster yet (mapping_manager may have started after us, or not served at
+        # boot). Called from the slow loop. Re-requests every _octomap_serve_period
+        # until a site_map arrives (callback_site_map clears the deadline) or the
+        # _octomap_serve_window elapses. Meanwhile publish_map serves the planner
+        # fallback so /navi_manager/map is never silent.
+        if self.map_show != "octomap":
+            return
+        if self.site_map_msg is not None:
+            return
+        if self._octomap_serve_deadline is None:
+            return
+        now = rospy.Time.now()
+        if now > self._octomap_serve_deadline:
+            rospy.logwarn_throttle(60.0, "navi_man: octomap serve_site retry window "
+                                   "elapsed, still no site_map — staying on planner "
+                                   "fallback for /navi_manager/map.")
+            self._octomap_serve_deadline = None
+            return
+        if (self._octomap_last_serve_req is None or
+                (now - self._octomap_last_serve_req).to_sec() >= self._octomap_serve_period):
+            self._octomap_last_serve_req = now
+            self.pub_serve_site.publish(String(""))
+            rospy.loginfo("navi_man: octomap serve_site retry (no site_map yet)...")
 
     def callback_odometry_odom(self, msg):
         self.msg_odometry_odom = msg
@@ -1409,6 +1482,7 @@ if __name__ == '__main__':
                 node.is_indoor_pub.publish(Bool(node.indoor))
                 node.pub_map_status.publish(String(node.map_status))
                 node.set_map_status()
+                node.octomap_serve_tick()
                 node.publish_map()
                 node.rtabmap_settings_publish()
                 node.container_watchdog()

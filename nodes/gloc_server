@@ -93,7 +93,27 @@ class GlocServer(object):
         # least this fraction of the point count (a single hedge/wall line
         # constrains only ACROSS itself — sliding along stays free)
         self.track_min_eig_frac = float(rospy.get_param('~track_min_eig_frac', 0.05))
-        self.track_defer_to_rtabmap = bool(rospy.get_param('~track_defer_to_rtabmap', True))
+        # 2026-07-11: rtabmap is OUT of the pose path (loc_status.rtabmap_confident
+        # is observability-only, stays false). Deferring to it is dead logic, so
+        # default OFF. Flag kept for rollback (set True to re-instate the defer).
+        self.track_defer_to_rtabmap = bool(rospy.get_param('~track_defer_to_rtabmap', False))
+        # BIG-CORR RECOVERY (2026-07-11): with the tracker OWNING the pose while
+        # driving blind (gps_good=0), per-tick drift is ~cm and corr cap 0.7 m is
+        # fine. But after a LONG blind stretch the accumulated offset can exceed
+        # the cap (seen 0.81 m 2026-07-10) — then every tick is corr_too_big and
+        # the tracker rejects FOREVER (deadlock), never converging back. Recovery:
+        # if corr_too_big persists > track_bigcorr_recover_s AND the match is
+        # otherwise healthy (rms good, eig healthy), apply the correction SLEWED
+        # in steps (<= track_bigcorr_step_m per tick toward the target) instead of
+        # rejecting — walks the pose back in bounded increments, logged.
+        self.track_bigcorr_recover_s = float(rospy.get_param('~track_bigcorr_recover_s', 20.0))
+        self.track_bigcorr_step_m = float(rospy.get_param('~track_bigcorr_step_m', 0.30))
+        self.track_bigcorr_step_yaw_deg = float(rospy.get_param('~track_bigcorr_step_yaw_deg', 3.0))
+        # streak / count state for the recovery path + status observability (2c)
+        self._bigcorr_since = None     # wall time corr_too_big started (None = not)
+        self._applied_count = 0        # total corrections published this session
+        self._reject_reason = None     # last non-ok state string
+        self._reject_streak = 0        # consecutive ticks with the same reject reason
 
         self._grid = None          # (occ, free, res, ox, oy, h, w)
         self._edt = None
@@ -332,25 +352,58 @@ class GlocServer(object):
                          'eig_min_frac': round(out['eig_min'] / out['n'], 3),
                          'gps_good': self._gps_good,
                          'rtabmap_confident': self._rtab_conf})
-            if out['rms'] > self.track_max_rms_m:
+            rms_ok = out['rms'] <= self.track_max_rms_m
+            eig_ok = out['eig_min'] >= self.track_min_eig_frac * out['n']
+            corr_ok = (dx <= self.track_max_corr_m and
+                       dyaw <= self.track_max_corr_yaw_deg)
+            if not rms_ok:
                 info['state'] = 'poor_match'
+                self._bigcorr_since = None
                 return
-            if out['eig_min'] < self.track_min_eig_frac * out['n']:
+            if not eig_ok:
                 info['state'] = 'degenerate'
+                self._bigcorr_since = None
                 return
-            if dx > self.track_max_corr_m or dyaw > self.track_max_corr_yaw_deg:
-                info['state'] = 'corr_too_big'
-                return
-            # correction is healthy — apply only when GPS is denied (the GPS
-            # arbiter owns the pose otherwise) and rtabmap does not have
-            # priority (transition period; disable via ~track_defer_to_rtabmap)
+            # BIG-CORR RECOVERY: normally reject an over-cap correction, but if it
+            # persists (match otherwise healthy: rms + eig already passed) the
+            # tracker would deadlock — after track_bigcorr_recover_s, SLEW toward
+            # the target in bounded steps instead of rejecting outright.
+            slewed = False
+            if not corr_ok:
+                if self._bigcorr_since is None:
+                    self._bigcorr_since = time.time()
+                held = time.time() - self._bigcorr_since
+                if held < self.track_bigcorr_recover_s:
+                    info['state'] = 'corr_too_big'
+                    info['bigcorr_held_s'] = round(held, 1)
+                    return
+                # recover: clamp the correction to a bounded per-tick step toward
+                # (x, y, th), publish the intermediate pose (GPS/rtabmap ownership
+                # is enforced by the shared gate below).
+                if dx > self.track_bigcorr_step_m and dx > 1e-6:
+                    f = self.track_bigcorr_step_m / dx
+                    x = pose0[0] + (x - pose0[0]) * f
+                    y = pose0[1] + (y - pose0[1]) * f
+                dyaw_signed = math.atan2(math.sin(th - pose0[2]),
+                                         math.cos(th - pose0[2]))
+                step_yaw = math.radians(self.track_bigcorr_step_yaw_deg)
+                if abs(dyaw_signed) > step_yaw:
+                    th = pose0[2] + math.copysign(step_yaw, dyaw_signed)
+                slewed = True
+                info['state'] = 'recover_slew'
+                info['bigcorr_held_s'] = round(held, 1)
+            else:
+                self._bigcorr_since = None
+            # correction is healthy (or slewed) — apply only when GPS is denied
+            # (the GPS arbiter owns the pose otherwise) and rtabmap does not have
+            # priority (defer default OFF 2026-07-11; ~track_defer_to_rtabmap).
             if self._gps_good:
                 info['state'] = 'gps_owns'
                 return
             if self.track_defer_to_rtabmap and self._rtab_conf:
                 info['state'] = 'rtabmap_owns'
                 return
-            if dx < self.track_min_corr_m and dyaw < 0.2:
+            if not slewed and dx < self.track_min_corr_m and dyaw < 0.2:
                 info['state'] = 'aligned'
                 return
             ps = PoseStamped()
@@ -365,12 +418,29 @@ class GlocServer(object):
             ps.pose.orientation.w = q[3]
             self.pub_track_pose.publish(ps)
             info['applied'] = True
+            self._applied_count += 1
             rospy.loginfo_throttle(
-                10.0, '[gloc-track] correcting %.2f m / %.1f deg '
-                '(rms %.2f, n=%d)', dx, dyaw, out['rms'], out['n'])
+                10.0, '[gloc-track] %s %.2f m / %.1f deg '
+                '(rms %.2f, n=%d)',
+                'RECOVER-slew' if slewed else 'correcting',
+                dx, dyaw, out['rms'], out['n'])
         except Exception as e:
             info['state'] = 'error: %s' % e
         finally:
+            # (2c) observability: applied total + reject-reason streak counter
+            st = info.get('state', 'ok')
+            if info.get('applied'):
+                self._reject_reason = None
+                self._reject_streak = 0
+            else:
+                if st == self._reject_reason:
+                    self._reject_streak += 1
+                else:
+                    self._reject_reason = st
+                    self._reject_streak = 1
+            info['applied_count'] = self._applied_count
+            info['reject_reason'] = self._reject_reason
+            info['reject_streak'] = self._reject_streak
             self.pub_track_status.publish(String(json.dumps(info)))
 
     def _current_pose(self):

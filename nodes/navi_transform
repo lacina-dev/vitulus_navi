@@ -276,6 +276,31 @@ class NavTfNode:
         self._map_pose_priority = ('dock', 'tracker', 'rtabmap', 'legacy')
         # last accept time per source (for arbitration + loc_status observability)
         self._map_pose_last_accept = {s: 0.0 for s in self._map_pose_priority}
+        # --- SMOOTH map-pose corrections (2026-07-12) ---------------------------
+        # Field feedback: map localization works but the pose JUMPS — it "skips
+        # between solutions it considers good" (tracker aliasing between near-equal
+        # EDT minima). Bag maploc_test_2026-07-12: per-tick tracker corrections
+        # median 0.03 m, p90 0.08 m, occasional 0.16-0.32 m, yaw p90 2.7deg, at
+        # 1 Hz, applied EVERY tick (87% >=0.02 m, only 13% <0.02 m 'aligned') —
+        # a non-converging cm-scale jitter, not monotone drift. Instead of
+        # snapping map->odom to each tracker correction (visible cm-jumps every
+        # second), SLEW the live transform toward the LAST tracker target,
+        # bounded per-dt (mirrors the georef slew, POSE_DATUM_PLAN phase 3). Big
+        # kidnap-size mismatches still snap so recovery is not blocked.
+        self._map_pose_slew_mps = float(rospy.get_param('~map_pose_slew_mps', 0.15))
+        self._map_pose_slew_dps = float(rospy.get_param('~map_pose_slew_dps', 5.0))
+        # sources whose corrections are slewed (others apply instantly). 'dock' is
+        # a one-shot precise anchor and MUST land instantly, so it is excluded.
+        self._map_pose_slew_sources = set(
+            rospy.get_param('~map_pose_slew_sources', ['tracker']))
+        # a correction farther than this from the live transform snaps instead of
+        # slewing (genuine relocalisation / kidnap; do not crawl 1 m at 0.15 m/s)
+        self._map_pose_slew_snap_m = float(rospy.get_param('~map_pose_slew_snap_m', 0.6))
+        self._map_pose_slew_snap_deg = float(rospy.get_param('~map_pose_slew_snap_deg', 15.0))
+        # active slew target (tx, ty, target_yaw) or None; set by callback,
+        # consumed by slew_map_pose() in the 30 Hz loop
+        self._map_pose_target = None
+        self._map_pose_slew_last_t = None
         self.fused_nav_time = int(str(rospy.Time.now())) / 1000000000
         self.fused_fix_time = int(str(rospy.Time.now())) / 1000000000
         self.init = True
@@ -515,20 +540,45 @@ class NavTfNode:
         ob_q = odom_base.transform.rotation
         odom_yaw = euler_from_quaternion([ob_q.x, ob_q.y, ob_q.z, ob_q.w])[2]
         m = math.atan2(math.sin(wanted_yaw - odom_yaw), math.cos(wanted_yaw - odom_yaw))
-        self.map_odom_yaw = m
         ob_x = odom_base.transform.translation.x
         ob_y = odom_base.transform.translation.y
-        self.map_odom_transform.transform.translation.x = msg.pose.position.x - (math.cos(m) * ob_x - math.sin(m) * ob_y)
-        self.map_odom_transform.transform.translation.y = msg.pose.position.y - (math.sin(m) * ob_x + math.cos(m) * ob_y)
+        tx = msg.pose.position.x - (math.cos(m) * ob_x - math.sin(m) * ob_y)
+        ty = msg.pose.position.y - (math.sin(m) * ob_x + math.cos(m) * ob_y)
+        # SMOOTH (2026-07-12): a slewed source records the TARGET; slew_map_pose()
+        # in the 30 Hz loop walks the live map->odom toward it at bounded speed so
+        # the pose no longer snaps to each 1 Hz tracker minimum. A big mismatch
+        # (kidnap / relocalisation) snaps to avoid crawling. Non-slew sources
+        # (dock: one-shot precise anchor) apply instantly and clear any target.
+        if source in self._map_pose_slew_sources:
+            cur = self.map_odom_transform.transform.translation
+            dist = math.hypot(tx - cur.x, ty - cur.y)
+            dyaw = abs(math.atan2(math.sin(m - self.map_odom_yaw),
+                                  math.cos(m - self.map_odom_yaw)))
+            if (dist > self._map_pose_slew_snap_m or
+                    dyaw > math.radians(self._map_pose_slew_snap_deg)):
+                self.map_odom_yaw = m
+                cur.x = tx
+                cur.y = ty
+                self._map_pose_target = None
+                rospy.logwarn("[set_map_pose] '%s' mismatch %.2f m / %.1f deg > "
+                              "snap — snapping (relocalisation)",
+                              source, dist, math.degrees(dyaw))
+            else:
+                self._map_pose_target = (tx, ty, m)
+        else:
+            self.map_odom_yaw = m
+            self.map_odom_transform.transform.translation.x = tx
+            self.map_odom_transform.transform.translation.y = ty
+            self._map_pose_target = None   # instant source wins; drop pending slew
         # WP2: correction ACCEPTED and applied — stamp this source for arbitration.
         if source in self._map_pose_last_accept:
             self._map_pose_last_accept[source] = rospy.get_time()
         rospy.loginfo_throttle(5.0,
-            "[set_map_pose] map->odom set from external map pose (%.2f, %.2f, %.1fdeg) -> "
-            "t=(%.2f, %.2f) yaw=%.2fdeg",
+            "[set_map_pose] map->odom target from external map pose (%.2f, %.2f, %.1fdeg) -> "
+            "t=(%.2f, %.2f) yaw=%.2fdeg src=%s%s",
             msg.pose.position.x, msg.pose.position.y, math.degrees(wanted_yaw),
-            self.map_odom_transform.transform.translation.x,
-            self.map_odom_transform.transform.translation.y, math.degrees(m))
+            tx, ty, math.degrees(m), source,
+            " [slew]" if source in self._map_pose_slew_sources else " [instant]")
 
     def callback_navi_indoor(self, msg):
         was_indoor = self.is_indoor
@@ -1581,6 +1631,50 @@ class NavTfNode:
         else:
             return None
 
+    def slew_map_pose(self):
+        """SMOOTH (2026-07-12): walk the live map->odom (translation + map_odom_yaw)
+        toward the last slewed set_map_pose target (tracker) at a bounded rate,
+        integrated in the 30 Hz loop like the georef slew. Stops (clears target)
+        once within one step of the target so a static robot does not creep. Big
+        mismatches were already snapped in callback_set_map_pose."""
+        tgt = self._map_pose_target
+        if tgt is None:
+            self._map_pose_slew_last_t = None
+            return
+        tx, ty, tyaw = tgt
+        now = rospy.get_time()
+        if self._map_pose_slew_last_t is None:
+            dt = 1.0 / 30.0
+        else:
+            dt = min(max(now - self._map_pose_slew_last_t, 1.0 / 60.0), 0.5)
+        self._map_pose_slew_last_t = now
+
+        cur = self.map_odom_transform.transform.translation
+        d_x, d_y = tx - cur.x, ty - cur.y
+        dist = math.hypot(d_x, d_y)
+        max_step = self._map_pose_slew_mps * dt
+        pos_done = True
+        if dist > max_step and dist > 1e-9:
+            s = max_step / dist
+            cur.x += d_x * s
+            cur.y += d_y * s
+            pos_done = False
+        else:
+            cur.x, cur.y = tx, ty
+
+        d_yaw = math.atan2(math.sin(tyaw - self.map_odom_yaw),
+                           math.cos(tyaw - self.map_odom_yaw))
+        max_yaw = math.radians(self._map_pose_slew_dps) * dt
+        yaw_done = True
+        if abs(d_yaw) > max_yaw:
+            self.map_odom_yaw += math.copysign(max_yaw, d_yaw)
+            yaw_done = False
+        else:
+            self.map_odom_yaw = tyaw
+
+        if pos_done and yaw_done:
+            self._map_pose_target = None   # reached target — stop slewing
+
     def transform_map_to_odom(self):
         if not self.is_indoor:
             odom_base_tf = self.get_base_link_transform()
@@ -2319,6 +2413,7 @@ class NavTfNode:
         self.publish_navheading_wheel_odom()
         self.publish_odom_fused()
         self.transform_odom_to_base_link()
+        self.slew_map_pose()
         self.transform_map_to_odom()
         self.fused_nav_time = (int(str(rospy.Time.now())) - int(str(self.nav_last_fused_time))) / 1000000000
         self.fused_fix_time = (int(str(rospy.Time.now())) - int(str(self.fix_last_fused_time))) / 1000000000

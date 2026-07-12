@@ -85,7 +85,29 @@ class GlocServer(object):
         self.track_rate_hz = float(rospy.get_param('~track_rate_hz', 1.0))
         self.track_max_corr_m = float(rospy.get_param('~track_max_corr_m', 0.7))
         self.track_max_corr_yaw_deg = float(rospy.get_param('~track_max_corr_yaw_deg', 6.0))
-        self.track_min_corr_m = float(rospy.get_param('~track_min_corr_m', 0.02))
+        # SMOOTH (2026-07-12): field feedback — pose "skips between solutions it
+        # considers good" (aliasing between near-equal EDT minima). Bag
+        # maploc_test_2026-07-12: per-tick corr median 0.03 m, p90 0.08 m, applied
+        # 87% of 1 Hz ticks (only 13% <0.02 m aligned), yaw p90 2.7deg — a
+        # non-converging cm jitter, NOT drift. Output stabilisation: (1) raise the
+        # publish deadband 0.02->0.04 m (yaw 0.2->0.4 deg) so sub-4 cm ping-pong is
+        # dropped; (2) EMA the alignment TARGET (alpha 0.4) so a single aliased
+        # tick cannot yank the published pose; (3) only publish once the smoothed
+        # correction has PERSISTED in a stable direction for >= N ticks — real
+        # drift holds a direction, ping-pong reverses. navi_transform additionally
+        # slews the application, so the combined effect is a smooth few-second
+        # convergence with no visible snapping.
+        self.track_min_corr_m = float(rospy.get_param('~track_min_corr_m', 0.04))
+        self.track_min_corr_yaw_deg = float(rospy.get_param('~track_min_corr_yaw_deg', 0.4))
+        # EMA smoothing of the alignment target pose (x, y, yaw). alpha = weight of
+        # the NEW measurement (0.4 -> ~63% settle in ~2 ticks, ~95% in ~6 ticks).
+        self.track_ema_alpha = float(rospy.get_param('~track_ema_alpha', 0.4))
+        self._ema_pose = None          # smoothed (x, y, yaw) target, None until 1st
+        # persistence gate: publish only after the smoothed correction has pointed
+        # the same way (spread < deg) for >= N consecutive above-deadband ticks
+        self.track_persist_n = int(rospy.get_param('~track_persist_n', 2))
+        self.track_persist_deg = float(rospy.get_param('~track_persist_deg', 60.0))
+        self._persist_dirs = []        # recent smoothed-corr directions (rad)
         self.track_max_rms_m = float(rospy.get_param('~track_max_rms_m', 0.20))
         self.track_min_points = int(rospy.get_param('~track_min_points', 60))
         self.track_max_iter = int(rospy.get_param('~track_max_iter', 8))
@@ -404,10 +426,14 @@ class GlocServer(object):
             if not rms_ok:
                 info['state'] = 'poor_match'
                 self._bigcorr_reset()
+                self._persist_dirs = []
+                self._ema_pose = None
                 return
             if not eig_ok:
                 info['state'] = 'degenerate'
                 self._bigcorr_reset()
+                self._persist_dirs = []
+                self._ema_pose = None
                 return
             # BIG-CORR RECOVERY: normally reject an over-cap correction, but if it
             # persists (match otherwise healthy: rms + eig already passed) the
@@ -466,13 +492,57 @@ class GlocServer(object):
                 # evidence is stale — after GPS loss recovery must earn a fresh
                 # 20 s + N-tick window from scratch.
                 self._bigcorr_reset()
+                self._persist_dirs = []
+                self._ema_pose = None
                 return
             if self.track_defer_to_rtabmap and self._rtab_conf:
                 info['state'] = 'rtabmap_owns'
                 return
-            if not slewed and dx < self.track_min_corr_m and dyaw < 0.2:
-                info['state'] = 'aligned'
-                return
+            # SMOOTH (2026-07-12): the big-corr RECOVER slew is a deliberate
+            # bounded catch-up and must publish undiluted. Only the NORMAL path
+            # (where the near-minima ping-pong lives) is EMA-smoothed + gated.
+            if slewed:
+                self._ema_pose = (x, y, th)   # keep EMA anchored to the live pose
+                self._persist_dirs = []
+            else:
+                # 1) EMA the target pose (yaw via angle-wrap on the delta)
+                if self._ema_pose is None:
+                    self._ema_pose = (x, y, th)
+                else:
+                    a = self.track_ema_alpha
+                    ex, ey, eth = self._ema_pose
+                    dth = math.atan2(math.sin(th - eth), math.cos(th - eth))
+                    self._ema_pose = (ex + a * (x - ex),
+                                      ey + a * (y - ey),
+                                      eth + a * dth)
+                x, y, th = self._ema_pose
+                # recompute the SMOOTHED correction vs the live pose
+                dx = math.hypot(x - pose0[0], y - pose0[1])
+                dyaw = math.degrees(abs(math.atan2(math.sin(th - pose0[2]),
+                                                   math.cos(th - pose0[2]))))
+                info['corr_m_sm'] = round(dx, 3)
+                info['corr_yaw_deg_sm'] = round(dyaw, 2)
+                # 2) raised deadband — drop sub-4 cm / sub-0.4 deg ping-pong
+                if dx < self.track_min_corr_m and dyaw < self.track_min_corr_yaw_deg:
+                    info['state'] = 'aligned'
+                    self._persist_dirs = []
+                    return
+                # 3) persistence gate — the smoothed correction must point the
+                # same way for >= N ticks (real drift holds; ping-pong reverses)
+                self._persist_dirs.append(math.atan2(y - pose0[1], x - pose0[0]))
+                n = max(1, self.track_persist_n)
+                self._persist_dirs = self._persist_dirs[-n:]
+                if len(self._persist_dirs) >= n:
+                    cs = sum(math.cos(a) for a in self._persist_dirs)
+                    sn = sum(math.sin(a) for a in self._persist_dirs)
+                    rlen = min(1.0, math.hypot(cs, sn) / len(self._persist_dirs))
+                    spread = math.degrees(math.acos(rlen))
+                    info['persist_spread_deg'] = round(spread, 1)
+                else:
+                    spread = None
+                if spread is None or spread > self.track_persist_deg:
+                    info['state'] = 'settling'
+                    return
             ps = PoseStamped()
             ps.header.stamp = now
             ps.header.frame_id = self.map_frame

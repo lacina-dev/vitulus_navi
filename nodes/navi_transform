@@ -134,6 +134,24 @@ class NavTfNode:
         self._gps_proven = False
         self._gps_probation_travel_m = float(rospy.get_param(
             '~gps_probation_travel_m', 1.0))
+        # STATIONARY PROBATION (2026-07-12, field: pose shoved off, robot parked
+        # with perfect RTK FIXED, could NEVER re-prove because motion probation
+        # needs ~1 m of travel). A standing robot proves GPS a different way: if
+        # the fix is usable + heading ok + the robot is genuinely stationary
+        # (wheel twist ~0 sustained) AND the RTK position barely wanders over a
+        # window (genuine FIXED at rest scatters mm-cm; multipath walks), the fix
+        # is trustworthy -> _gps_proven=True. Motion probation is unchanged; this
+        # only ADDS a rest path. Resets on the same SUSTAINED-outage branch as the
+        # motion probe (a real outage invalidates both proofs).
+        self._stationary_probe_s = float(rospy.get_param('~stationary_probe_s', 10.0))
+        self._stationary_probe_max_scatter_m = float(rospy.get_param(
+            '~stationary_probe_max_scatter_m', 0.05))
+        # wheel-twist magnitude (m/s, rad/s) below which we call the robot stationary
+        self._stationary_v_eps = float(rospy.get_param('~stationary_v_eps', 0.02))
+        self._stationary_w_eps = float(rospy.get_param('~stationary_w_eps', 0.02))
+        # rolling (t, rtk_x, rtk_y) samples while stationary; scatter measured over it
+        self._stationary_rtk_samples = deque(maxlen=200)
+        self._stationary_since = None      # wall time the stationary window began
         # Dual-antenna yaw-variance HEALTHY BAND (see offset_navheading_imu).
         # UNITS: variance rad^2; the UI readout the user watches is
         # sigma in DEGREES = degrees(sqrt(var)). Band per user field
@@ -1275,9 +1293,12 @@ class NavTfNode:
                 self._gps_good_since = None
                 self._heading_good_after_acq = False
                 # sustained outage also invalidates the probation proof —
-                # GPS must prove itself in motion again after it returns
+                # GPS must prove itself (in motion OR stationary) again after
+                # it returns
                 self._gps_probe_anchor = None
                 self._gps_proven = False
+                self._stationary_since = None
+                self._stationary_rtk_samples.clear()
         else:
             self._gps_bad_since = None
             if self._gps_good_since is None:
@@ -1570,6 +1591,52 @@ class NavTfNode:
         k = 111320.0
         gx = fix_msg.longitude * k * math.cos(math.radians(fix_msg.latitude))
         gy = fix_msg.latitude * k
+        # STATIONARY PROBATION (2026-07-12): a parked robot with a genuinely
+        # FIXED RTK can prove GPS without the ~1 m motion the arbiter otherwise
+        # requires. Gate: fix usable (already true here) + heading ok + wheels
+        # stopped (twist ~0) + RTK scatter over a rolling window below threshold.
+        # A moving robot or a wandering (multipath) fix clears the window and
+        # falls through to the motion probe below.
+        tw = self.wheel_odom_msg.twist.twist
+        stationary = (abs(tw.linear.x) < self._stationary_v_eps and
+                      abs(tw.linear.y) < self._stationary_v_eps and
+                      abs(tw.angular.z) < self._stationary_w_eps)
+        now_sp = rospy.get_time()
+        if stationary and self._heading_ok():
+            if self._stationary_since is None:
+                self._stationary_since = now_sp
+            self._stationary_rtk_samples.append((now_sp, gx, gy))
+            # drop samples older than the probe window
+            while (self._stationary_rtk_samples and
+                   now_sp - self._stationary_rtk_samples[0][0] > self._stationary_probe_s):
+                self._stationary_rtk_samples.popleft()
+            if (not self._gps_proven and
+                    now_sp - self._stationary_since >= self._stationary_probe_s and
+                    len(self._stationary_rtk_samples) >= 3):
+                xs = [s[1] for s in self._stationary_rtk_samples]
+                ys = [s[2] for s in self._stationary_rtk_samples]
+                # scatter = max radial spread from the window centroid
+                cx = sum(xs) / len(xs)
+                cy = sum(ys) / len(ys)
+                scatter = max(math.hypot(x - cx, y - cy) for x, y in zip(xs, ys))
+                if scatter <= self._stationary_probe_max_scatter_m:
+                    rospy.logwarn('[navi_transform] GPS PROVEN stationary '
+                                  '(RTK scatter %.3f m over %.0fs, %d samp) -> '
+                                  'may take pose ownership', scatter,
+                                  self._stationary_probe_s,
+                                  len(self._stationary_rtk_samples))
+                    self._gps_proven = True
+                    # re-anchor the motion probe here so a subsequent drive-away
+                    # continues verifying from the current spot, not a stale one
+                    self._gps_probe_anchor = (
+                        gx, gy, self.ekf_wheel_odom_msg.pose.pose.position.x,
+                        self.ekf_wheel_odom_msg.pose.pose.position.y)
+                    return
+        else:
+            # started moving (or heading dropped): abandon the rest window, let
+            # the motion probe below take over
+            self._stationary_since = None
+            self._stationary_rtk_samples.clear()
         o = self.ekf_wheel_odom_msg.pose.pose.position
         if self._gps_probe_anchor is None:
             self._gps_probe_anchor = (gx, gy, o.x, o.y)

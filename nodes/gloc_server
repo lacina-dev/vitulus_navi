@@ -56,6 +56,21 @@ class GlocServer(object):
         # margin 95% on open grass -> 50% was not safe there. 100% + the IMU-yaw
         # sanity check below killed every observed false-confident case.
         self.apply_min_margin = rospy.get_param('~apply_min_margin', 1.0)  # 100 %
+        # SOFT-MAP RELOCK GUARD (2026-07-12, forensic: garage session shove).
+        # Log evidence (gloc_server-34.log, 17:1x): the pose was shoved by an
+        # AUTO-RELOCK APPLIED on the soft garage map — 17:18:14 relock to
+        # (0.83, -5.67, 260deg) margin 112% delta 1.47m, jumping ~1.5 m into a
+        # -6 m aisle alias that the 100% margin gate had (correctly) rejected 8x
+        # at margin 45-75% until one sample crept to 112%. A relock that MOVES
+        # the pose far (delta_m) is high-consequence: on a soft/aliased map the
+        # runner-up margin barely clearing 100% is not enough proof. So a relock
+        # whose delta exceeds ~relock_big_delta_m must clear a HIGHER margin
+        # (~relock_big_delta_margin) — small-delta relocks (confirming roughly
+        # the current pose) keep the normal gate. This does NOT slow legitimate
+        # recovery from a genuine large offset (that produces a decisive margin,
+        # like the 280% relock at 17:03); it only blocks a MARGINAL far jump.
+        self.relock_big_delta_m = float(rospy.get_param('~relock_big_delta_m', 0.6))
+        self.relock_big_delta_margin = float(rospy.get_param('~relock_big_delta_margin', 2.0))  # 200 %
         # The gyro tracks rotation even when the robot is carried (kidnap), so the
         # current heading stays roughly valid when position is lost — a candidate
         # whose yaw disagrees wildly is a mirror alias, not the robot.
@@ -616,6 +631,26 @@ class GlocServer(object):
                           'will retry in %.0fs', why, self.relock_min_interval_s)
             info['state'] = 'relock_failed'
             self._set_status('relock rejected: %s' % why)
+            return False
+        # SOFT-MAP RELOCK GUARD (2026-07-12): a FAR relock (moves the pose more
+        # than relock_big_delta_m) is high-consequence on a soft/aliased map —
+        # require a stronger-than-normal margin. The garage shove (delta 1.47 m,
+        # margin 112%) is rejected here; a decisive far relock (e.g. margin 280%)
+        # still passes, so genuine recovery from a real large offset is unaffected.
+        _dcur = r.get('delta_to_current') or {}
+        _delta_m = _dcur.get('dist_m')
+        if (_delta_m is not None and _delta_m > self.relock_big_delta_m and
+                r['margin'] < self.relock_big_delta_margin):
+            rospy.logwarn('[gloc-track] AUTO-RELOCK REJECTED: far jump %.2f m '
+                          '(> %.2f m) at margin %.0f%% < soft-map gate %.0f%% — '
+                          'staying lost, will retry in %.0fs', _delta_m,
+                          self.relock_big_delta_m, r['margin'] * 100,
+                          self.relock_big_delta_margin * 100,
+                          self.relock_min_interval_s)
+            info['state'] = 'relock_failed'
+            info['relock_far_reject'] = True
+            self._set_status('relock rejected: far %.2fm at margin %.0f%%'
+                             % (_delta_m, r['margin'] * 100))
             return False
         b = r['best']
         ps = PoseStamped()

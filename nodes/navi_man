@@ -15,6 +15,9 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import LaserScan
+import math
+import numpy as np
 from std_msgs.msg import Bool
 from std_srvs.srv import Empty, EmptyResponse
 from interactive_markers.interactive_marker_server import *
@@ -214,6 +217,15 @@ class Node:
         self._octomap_serve_period = 5.0       # seconds between serve_site requests
         self._octomap_serve_window = 60.0      # total retry window (s)
         self._octomap_fallback_active = False  # currently serving planner as stand-in
+        # Truthful bootstrap map for a fresh/mapless robot (bootmap, 2026-07-12).
+        # When octomap is the selected source but no raster exists yet AND no planner
+        # map either (fresh install), we must NOT show a stale legacy map. Instead
+        # publish a minimal HONEST grid: all unknown (-1), FREE (0) under the robot
+        # footprint, plus structure from a one-shot raytrace of the first /scan.
+        #   ~octomap_fallback: "bootstrap" (default) | "planner" (legacy behaviour)
+        self._octomap_fallback_mode = rospy.get_param('~octomap_fallback', 'bootstrap')
+        self._bootstrap_map_msg = None         # cached OccupancyGrid once built
+        self._bootstrap_build_attempts = 0     # so we retry a few times for TF
         self.point_pose_srvs = rospy.Service("navi_manager/get_point_pose", Point_pose, self.srv_cb_map_point_pose)
 
 
@@ -321,6 +333,8 @@ class Node:
                 if self._octomap_fallback_active:
                     self._octomap_fallback_active = False
                 self._octomap_serve_deadline = None
+                # Drop the bootstrap stand-in; the real raster supersedes it.
+                self._bootstrap_map_msg = None
             self.is_map_to_publish = True
 
     def callback_web_plan_map(self, msg):
@@ -353,6 +367,10 @@ class Node:
             # publish reaches us on connect) and ARM a bounded retry (octomap_serve_tick
             # on the slow loop) — mapping_manager may not have served yet at boot.
             # rtabmap is NOT started for this source.
+            # Re-triggering "octomap" rebuilds the bootstrap map on demand so it
+            # reflects the current robot pose / latest scan.
+            self._bootstrap_map_msg = None
+            self._bootstrap_build_attempts = 0
             if self.site_map_msg is None:
                 self.pub_serve_site.publish(String(""))
                 now = rospy.Time.now()
@@ -385,10 +403,32 @@ class Node:
                 if self.site_map_msg is not None:
                     self.nm_map_pub.publish(self.site_map_msg)
                     self.pub_map_source.publish(String("octomap"))
+                elif self._octomap_fallback_mode != "planner":
+                    # No raster yet, and bootstrap mode (default): publish a TRUTHFUL
+                    # minimal grid (unknown everywhere, FREE under the footprint + first
+                    # scan raytrace) instead of a stale legacy map. A fresh install has
+                    # no planner map either; showing one would be untruthful. The map
+                    # existing brings up costmap/MBF/planner/UI honestly. When the
+                    # raster later arrives, callback_site_map switches us back to it.
+                    if self._bootstrap_map_msg is None:
+                        self._bootstrap_map_msg = self._build_bootstrap_map()
+                    if self._bootstrap_map_msg is not None:
+                        self._bootstrap_map_msg.header.stamp = rospy.Time.now()
+                        self.nm_map_pub.publish(self._bootstrap_map_msg)
+                        self.pub_map_source.publish(String("bootstrap"))
+                        if not self._octomap_fallback_active:
+                            self._octomap_fallback_active = True
+                            rospy.logwarn("navi_man: octomap source has no raster yet — "
+                                          "serving TRUTHFUL BOOTSTRAP map on "
+                                          "/navi_manager/map (unknown + footprint + scan).")
+                    else:
+                        # bootstrap build not ready yet (TF warming up): keep the
+                        # publish pending so the next tick retries.
+                        return
                 elif self.planner_map_msg is not None:
-                    # No raster yet: NEVER leave /navi_manager/map silent — serve the
-                    # planner map as a fallback so the global costmap/MBF/footprint
-                    # still come up. octomap_serve_tick keeps retrying serve_site;
+                    # Legacy behaviour (~octomap_fallback:=planner): serve the planner
+                    # map as a fallback so the global costmap/MBF/footprint still come
+                    # up. octomap_serve_tick keeps retrying serve_site;
                     # callback_site_map switches back to the raster on first arrival.
                     self.nm_map_pub.publish(self.planner_map_msg)
                     self.pub_map_source.publish(String("planner"))
@@ -429,6 +469,184 @@ class Node:
             self._octomap_last_serve_req = now
             self.pub_serve_site.publish(String(""))
             rospy.loginfo("navi_man: octomap serve_site retry (no site_map yet)...")
+
+    def _build_bootstrap_map(self):
+        # Build a TRUTHFUL minimal OccupancyGrid for a fresh/mapless robot. Frame
+        # 'map', 0.05 m resolution, ~30x30 m centred on the robot's current map pose.
+        # Everything starts UNKNOWN (-1). We then mark:
+        #   * FREE (0) every cell under the robot footprint polygon (we are standing
+        #     there, so it is provably clear), and
+        #   * from a one-shot raytrace of the latest /scan: FREE (0) along each beam
+        #     and OBSTACLE (100) at the hit endpoint (when range < range_max - 0.1).
+        # No scan / no TF -> a footprint-only map is still valid and returned.
+        res = 0.05
+        span_m = 30.0
+        size = int(round(span_m / res))          # cells per side (~600)
+        # --- robot map pose (centre of the grid) via TF map->base_link ------------
+        cx = 0.0
+        cy = 0.0
+        try:
+            tr = self.tf2_Buffer.lookup_transform('map', 'base_link', rospy.Time(0),
+                                                  rospy.Duration(1.0))
+            cx = tr.transform.translation.x
+            cy = tr.transform.translation.y
+        except Exception as e:
+            self._bootstrap_build_attempts += 1
+            if self._bootstrap_build_attempts < 4:
+                rospy.logwarn("navi_man: bootstrap map — map->base_link TF not ready "
+                              "(attempt %d): %s; will retry.",
+                              self._bootstrap_build_attempts, e)
+                return None
+            rospy.logwarn("navi_man: bootstrap map — map->base_link TF unavailable, "
+                          "falling back to origin (0,0).")
+
+        grid = np.full((size, size), -1, dtype=np.int8)   # [row=y, col=x]
+        origin_x = cx - (size * res) / 2.0
+        origin_y = cy - (size * res) / 2.0
+
+        def w2c(px, py):
+            # world (map) metres -> (col, row) grid indices
+            col = int((px - origin_x) / res)
+            row = int((py - origin_y) / res)
+            return col, row
+
+        def in_bounds(col, row):
+            return 0 <= col < size and 0 <= row < size
+
+        # --- FREE under the robot footprint --------------------------------------
+        footprint = None
+        try:
+            fp_param = rospy.get_param('/move_base_flex/local_costmap/footprint', None)
+            if isinstance(fp_param, str):
+                fp_param = yaml.safe_load(fp_param)
+            if fp_param:
+                footprint = [(float(p[0]), float(p[1])) for p in fp_param]
+        except Exception as e:
+            rospy.logwarn("navi_man: bootstrap map — could not read footprint param: %s", e)
+        # robot yaw for rotating the footprint into the map frame
+        yaw = 0.0
+        try:
+            q = tr.transform.rotation
+            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                             1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        except Exception:
+            yaw = 0.0
+        cyaw, syaw = math.cos(yaw), math.sin(yaw)
+        if footprint:
+            # bounding radius of the footprint polygon (rotated), fill the disc that
+            # contains it as FREE — conservative and simple, always covers the robot.
+            fp_r = max(math.hypot(px, py) for px, py in footprint)
+        else:
+            fp_r = 0.5   # conservative default disc radius (m)
+        r_cells = int(math.ceil(fp_r / res))
+        ccol, crow = w2c(cx, cy)
+        r2 = r_cells * r_cells
+        for drow in range(-r_cells, r_cells + 1):
+            for dcol in range(-r_cells, r_cells + 1):
+                if dcol * dcol + drow * drow <= r2:
+                    col, row = ccol + dcol, crow + drow
+                    if in_bounds(col, row):
+                        grid[row, col] = 0
+
+        free_from_scan = 0
+        obst_from_scan = 0
+        # --- one-shot raytrace of the latest /scan -------------------------------
+        scan = None
+        try:
+            scan = rospy.wait_for_message('/scan', LaserScan, timeout=3.0)
+        except Exception as e:
+            rospy.logwarn("navi_man: bootstrap map — no /scan within 3s (%s); "
+                          "publishing footprint-only bootstrap map.", e)
+        if scan is not None:
+            # TF laser frame -> map (translation + yaw), applied per-beam endpoint.
+            lx = ly = 0.0
+            lyaw = 0.0
+            have_laser_tf = False
+            try:
+                lt = self.tf2_Buffer.lookup_transform('map', scan.header.frame_id,
+                                                      rospy.Time(0), rospy.Duration(1.0))
+                lx = lt.transform.translation.x
+                ly = lt.transform.translation.y
+                lq = lt.transform.rotation
+                lyaw = math.atan2(2.0 * (lq.w * lq.z + lq.x * lq.y),
+                                  1.0 - 2.0 * (lq.y * lq.y + lq.z * lq.z))
+                have_laser_tf = True
+            except Exception as e:
+                rospy.logwarn("navi_man: bootstrap map — laser TF (%s->map) "
+                              "unavailable (%s); skipping scan raytrace.",
+                              scan.header.frame_id, e)
+            if have_laser_tf:
+                lcol, lrow = w2c(lx, ly)
+                clyaw, slyaw = math.cos(lyaw), math.sin(lyaw)
+                rmax = scan.range_max
+                for i, rng in enumerate(scan.ranges):
+                    if rng != rng or rng < scan.range_min:   # NaN / too close
+                        continue
+                    hit = rng < (rmax - 0.1)
+                    reff = rng if hit else rmax
+                    a = scan.angle_min + i * scan.angle_increment
+                    # endpoint in laser frame -> map frame
+                    ex = lx + reff * (clyaw * math.cos(a) - slyaw * math.sin(a))
+                    ey = ly + reff * (slyaw * math.cos(a) + clyaw * math.sin(a))
+                    ecol, erow = w2c(ex, ey)
+                    # Bresenham from laser origin cell to endpoint cell = FREE
+                    for col, row in self._bresenham(lcol, lrow, ecol, erow):
+                        if in_bounds(col, row) and grid[row, col] != 100:
+                            if grid[row, col] == -1:
+                                free_from_scan += 1
+                            grid[row, col] = 0
+                    if hit and in_bounds(ecol, erow):
+                        if grid[erow, ecol] != 100:
+                            obst_from_scan += 1
+                        grid[erow, ecol] = 100
+
+        # --- assemble OccupancyGrid ----------------------------------------------
+        msg = OccupancyGrid()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = rospy.Time.now()
+        msg.info.resolution = res
+        msg.info.width = size
+        msg.info.height = size
+        msg.info.origin.position.x = origin_x
+        msg.info.origin.position.y = origin_y
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+        msg.data = grid.flatten(order='C').astype(np.int8).tolist()
+
+        free_total = int(np.count_nonzero(grid == 0))
+        obst_total = int(np.count_nonzero(grid == 100))
+        unknown_total = int(np.count_nonzero(grid == -1))
+        rospy.loginfo("navi_man: bootstrap map built %dx%d @ %.3f m centred (%.2f,%.2f) "
+                      "— free=%d (scan+%d) obstacle=%d unknown=%d",
+                      size, size, res, cx, cy,
+                      free_total, free_from_scan, obst_total, unknown_total)
+        self._bootstrap_build_attempts = 0
+        return msg
+
+    @staticmethod
+    def _bresenham(x0, y0, x1, y1):
+        # Integer Bresenham line: yields (col,row) cells from (x0,y0) to (x1,y1)
+        # INCLUSIVE of the start, EXCLUSIVE of the end (endpoint handled separately
+        # so we do not overwrite an obstacle hit with FREE).
+        cells = []
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        x, y = x0, y0
+        while True:
+            if x == x1 and y == y1:
+                break
+            cells.append((x, y))
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+        return cells
 
     def callback_odometry_odom(self, msg):
         self.msg_odometry_odom = msg

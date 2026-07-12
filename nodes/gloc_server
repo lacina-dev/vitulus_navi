@@ -82,7 +82,15 @@ class GlocServer(object):
         # stretches (roofed area) where the
         # lidar has structure and GPS has nothing.
         self.track_enable = bool(rospy.get_param('~track_enable', True))
-        self.track_rate_hz = float(rospy.get_param('~track_rate_hz', 1.0))
+        # CORRECTNESS-FIRST (2026-07-12, field verdict "radsi at poza cuka a
+        # neni to hladke — naimplementuj to tak, aby to fungovalo"): priority
+        # flips from SMOOTH to CONTINUOUS AGGRESSIVE correction. Rate 1->5 Hz so
+        # the pose is pulled to the map every 0.2 s (GN over ~140 pts is cheap;
+        # if a tick exceeds ~100 ms in the log, back this off to 3). EMA is OFF
+        # by default (~track_ema_alpha 1.0) and small corrections publish
+        # immediately (no 2-tick persistence) — the tracker twitches but never
+        # lets an offset build.
+        self.track_rate_hz = float(rospy.get_param('~track_rate_hz', 5.0))
         self.track_max_corr_m = float(rospy.get_param('~track_max_corr_m', 0.7))
         self.track_max_corr_yaw_deg = float(rospy.get_param('~track_max_corr_yaw_deg', 6.0))
         # SMOOTH (2026-07-12): field feedback — pose "skips between solutions it
@@ -97,15 +105,22 @@ class GlocServer(object):
         # drift holds a direction, ping-pong reverses. navi_transform additionally
         # slews the application, so the combined effect is a smooth few-second
         # convergence with no visible snapping.
-        self.track_min_corr_m = float(rospy.get_param('~track_min_corr_m', 0.04))
-        self.track_min_corr_yaw_deg = float(rospy.get_param('~track_min_corr_yaw_deg', 0.4))
+        # deadband back to 0.02 m / 0.2 deg (2026-07-12): drop only genuine
+        # sub-2 cm ping-pong; every real correction publishes.
+        self.track_min_corr_m = float(rospy.get_param('~track_min_corr_m', 0.02))
+        self.track_min_corr_yaw_deg = float(rospy.get_param('~track_min_corr_yaw_deg', 0.2))
         # EMA smoothing of the alignment target pose (x, y, yaw). alpha = weight of
-        # the NEW measurement (0.4 -> ~63% settle in ~2 ticks, ~95% in ~6 ticks).
-        self.track_ema_alpha = float(rospy.get_param('~track_ema_alpha', 0.4))
+        # the NEW measurement. DEFAULT 1.0 (2026-07-12) = EMA OFF: the published
+        # target IS the live measurement, no lag. Kept as a param for rollback
+        # (lower alpha re-enables smoothing).
+        self.track_ema_alpha = float(rospy.get_param('~track_ema_alpha', 1.0))
         self._ema_pose = None          # smoothed (x, y, yaw) target, None until 1st
         # persistence gate: publish only after the smoothed correction has pointed
-        # the same way (spread < deg) for >= N consecutive above-deadband ticks
-        self.track_persist_n = int(rospy.get_param('~track_persist_n', 2))
+        # the same way (spread < deg) for >= N consecutive above-deadband ticks.
+        # DEFAULT 1 (2026-07-12) = gate OFF: a single above-deadband tick
+        # publishes. Correctness-first — small corrections apply immediately, the
+        # pose may twitch but never dead-reckons. (>=2 re-enables persistence.)
+        self.track_persist_n = int(rospy.get_param('~track_persist_n', 1))
         self.track_persist_deg = float(rospy.get_param('~track_persist_deg', 60.0))
         self._persist_dirs = []        # recent smoothed-corr directions (rad)
         self.track_max_rms_m = float(rospy.get_param('~track_max_rms_m', 0.20))
@@ -197,7 +212,9 @@ class GlocServer(object):
         self._grid_stamp = None
         self._last_result = None
         self._last_scan = None
-        self._gps_good = False
+        self._gps_good = False   # gate: TRUE only when GPS OWNS with a live fix
+        self._fix_usable = False
+        self._gps_stable = False
         self._rtab_conf = False
         self._lock = threading.Lock()
 
@@ -226,10 +243,22 @@ class GlocServer(object):
                                                 queue_size=1, latch=True)
         rospy.Subscriber(self.scan_topic, LaserScan,
                          lambda m: setattr(self, '_last_scan', m), queue_size=1)
+        # ENGAGE FAST (2026-07-12, correctness-first): the tracker must take over
+        # the moment the RAW fix goes unusable, NOT only after ownership
+        # (_gps_stable) drops. bridge_status carries TWO fields: gps_good=int
+        # (_gps_stable — pose OWNERSHIP, stays TRUE through the ~8 s outage grace)
+        # and fix_usable=int (RAW position_fix_usable — drops immediately on
+        # denial). The tracker gate _gps_good is TRUE (tracker idles) ONLY when
+        # BOTH are set, i.e. GPS is genuinely owning the pose with a live fix.
+        # As soon as fix_usable==0 OR gps_good==0 the tracker activates — this
+        # removes the ~8 s dead-reckoning gap at the START of every denial.
+        # SAFETY: activating during the grace window can NOT fight GPS — the
+        # arbiter in navi_transform ranks dock > tracker > rtabmap, and while
+        # _gps_stable() is TRUE the RTK set_pose path owns map->odom; a tracker
+        # correction published then still routes through set_map_pose_tracker but
+        # the slew loop yields to the GPS anchor (see callback_set_map_pose gate).
         rospy.Subscriber('/nav_tf/bridge_status', String,
-                         lambda m: setattr(self, '_gps_good',
-                                           'gps_good=1' in (m.data or '')),
-                         queue_size=1)
+                         self._cb_bridge_status, queue_size=1)
         rospy.Subscriber('/nav_tf/rtabmap_confident', Bool,
                          lambda m: setattr(self, '_rtab_conf', bool(m.data)),
                          queue_size=1)
@@ -334,6 +363,23 @@ class GlocServer(object):
         v = (arr[r0, c0] * (1 - fc) * (1 - fr) + arr[r0, c0 + 1] * fc * (1 - fr)
              + arr[r0 + 1, c0] * (1 - fc) * fr + arr[r0 + 1, c0 + 1] * fc * fr)
         return v, ok
+
+    def _cb_bridge_status(self, m):
+        """ENGAGE FAST (2026-07-12): parse BOTH gps_good (=_gps_stable, pose
+        ownership incl. the ~8 s outage grace) and fix_usable (=raw
+        position_fix_usable, drops immediately on denial) from the human-readable
+        bridge_status string. The tracker gate self._gps_good is TRUE (tracker
+        idles, GPS owns) ONLY when BOTH are 1. As soon as fix_usable==0 OR
+        gps_good==0 the tracker becomes active — it corrects during the grace
+        window instead of dead-reckoning through the first ~8 s of every denial.
+        navi_transform's callback_map_coords now also yields the georef the
+        moment fix_usable==0, so the two never write map->odom at the same time."""
+        d = m.data or ''
+        gps_stable = 'gps_good=1' in d
+        fix_usable = 'fix_usable=1' in d
+        self._gps_stable = gps_stable
+        self._fix_usable = fix_usable
+        self._gps_good = gps_stable and fix_usable
 
     def _track_align(self, pts_base, pose0):
         """Gauss-Newton scan-to-EDT: minimize sum EDT(R(yaw) p + t)^2 over
@@ -494,6 +540,7 @@ class GlocServer(object):
 
     def _track_tick(self, _evt):
         info = {'applied': False}
+        _t0 = time.time()
         try:
             # AUTO-RELOCK gate: if we are lost (a real localization-loss reject
             # streak, GPS denied) beyond track_lost_after_s and the rate limit has
@@ -537,6 +584,8 @@ class GlocServer(object):
                          'corr_yaw_deg': round(dyaw, 2),
                          'eig_min_frac': round(out['eig_min'] / out['n'], 3),
                          'gps_good': self._gps_good,
+                         'gps_stable': self._gps_stable,
+                         'fix_usable': self._fix_usable,
                          'rtabmap_confident': self._rtab_conf})
             rms_ok = out['rms'] <= self.track_max_rms_m
             eig_ok = out['eig_min'] >= self.track_min_eig_frac * out['n']
@@ -742,6 +791,10 @@ class GlocServer(object):
             info['applied_count'] = self._applied_count
             info['reject_reason'] = self._reject_reason
             info['reject_streak'] = self._reject_streak
+            # tick duration (ms) — verify GN cost at 5 Hz; back ~track_rate_hz to 3
+            # if this routinely exceeds ~100 ms (relock ticks are excluded above,
+            # they return early). Exposed in status for the live check.
+            info['tick_ms'] = round((time.time() - _t0) * 1000.0, 1)
             self.pub_track_status.publish(String(json.dumps(info)))
 
     def _current_pose(self):

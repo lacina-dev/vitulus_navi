@@ -287,8 +287,13 @@ class NavTfNode:
         # second), SLEW the live transform toward the LAST tracker target,
         # bounded per-dt (mirrors the georef slew, POSE_DATUM_PLAN phase 3). Big
         # kidnap-size mismatches still snap so recovery is not blocked.
-        self._map_pose_slew_mps = float(rospy.get_param('~map_pose_slew_mps', 0.15))
-        self._map_pose_slew_dps = float(rospy.get_param('~map_pose_slew_dps', 5.0))
+        # CORRECTNESS-FIRST (2026-07-12, field verdict): apply corrections FAST.
+        # Slew 0.15->0.5 m/s and 5->15 deg/s so the tracker's 5 Hz corrections
+        # land within a few ticks instead of crawling — the pose visibly "cuka"
+        # but tracks the map instead of dead-reckoning. Still bounded (no teleport
+        # through geometry); the >0.6 m / >15 deg kidnap snap is unchanged.
+        self._map_pose_slew_mps = float(rospy.get_param('~map_pose_slew_mps', 0.5))
+        self._map_pose_slew_dps = float(rospy.get_param('~map_pose_slew_dps', 15.0))
         # sources whose corrections are slewed (others apply instantly). 'dock' is
         # a one-shot precise anchor and MUST land instantly, so it is excluded.
         self._map_pose_slew_sources = set(
@@ -665,6 +670,18 @@ class NavTfNode:
             self.map_coords_msg = msg
             return
         if not self._gps_stable():
+            self.map_coords_msg = msg
+            return
+        # ENGAGE-FAST ARBITRATION (2026-07-12, correctness-first): the EDT tracker
+        # now activates the moment the RAW fix is unusable (fix_usable==0), i.e.
+        # during the ~8 s outage grace where _gps_stable() is still TRUE. If the
+        # georef kept re-pinning map->odom here on the STALE/frozen datum during
+        # that window, it would fight the tracker's set_map_pose_tracker slew (both
+        # write self.map_odom_transform + map_odom_yaw). Yield the georef the
+        # instant the fix goes unusable — GPS owns map->odom ONLY with a live fix,
+        # the tracker owns the grace window. Symmetric with the tracker's gate;
+        # this is what makes "GPS set_pose owns when stable" literally true.
+        if not self.position_fix_usable:
             self.map_coords_msg = msg
             return
         trans = None

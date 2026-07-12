@@ -35,7 +35,7 @@ from scipy import ndimage
 
 import rospy
 import tf2_ros
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import LaserScan, CompressedImage
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from std_msgs.msg import Bool
@@ -223,6 +223,36 @@ class GlocServer(object):
         #       to reopen the ~8 s dead-reckoning gap the 5f589ff fix targeted.
         self.track_active_mode = rospy.get_param('~track_active_mode', 'fix_lost')
 
+        # ENGAGE DELAY (2026-07-12, live field report: outdoors RTK FLAPS —
+        # fix_usable drops to 0 for a few seconds at a time while gps ownership
+        # persists through the ~8s grace — and the tracker engaged on those brief
+        # denial windows, applying borderline outdoor matches (rms ~0.21, ~0.3 m
+        # corrections) and JERKING the pose even at a standstill. A momentary
+        # flap is not a real denial: require fix_usable==0 CONTINUOUSLY for
+        # track_engage_after_s before the tracker is allowed to engage/apply/
+        # count toward auto-relock's lost timer. Disengage (re-idle) IMMEDIATELY
+        # the instant the fix returns — no symmetric delay on the way back, GPS
+        # should reclaim ownership at once. Under-roof (genuine, sustained
+        # denial) still engages at ~engage_after_s; the pose only dead-reckons
+        # a few cm in that window (gyro drift ~0.025 deg/min), acceptable.
+        self.track_engage_after_s = float(rospy.get_param('~track_engage_after_s', 5.0))
+        self._fix_lost_since = None    # wall time fix_usable FIRST went to 0 (None = usable)
+
+        # STANDSTILL GATE (2026-07-12): at rest there is no drift to correct —
+        # measured gyro drift is ~0.025 deg/min, so any "correction" the tracker
+        # proposes while stationary is pure alignment noise, not real drift. Gate
+        # on /mobile_base_controller/odom (50 Hz): once |v_lin| and |v_ang| stay
+        # below the thresholds for > track_standstill_hold_s, suppress ALL normal
+        # tracker corrections (state "standstill") — EXCEPT the kidnap-scale
+        # AUTO-RELOCK path, which must stay available even at rest (a robot can be
+        # picked up and set back down without ever registering as "moving").
+        # Resumes normal correction the instant motion is seen again.
+        self.track_standstill_lin_mps = float(rospy.get_param('~track_standstill_lin_mps', 0.05))
+        self.track_standstill_ang_rps = float(rospy.get_param('~track_standstill_ang_rps', 0.05))
+        self.track_standstill_hold_s = float(rospy.get_param('~track_standstill_hold_s', 1.0))
+        self._standstill_since = None  # wall time speed FIRST dropped below thresh (None = moving)
+        self._is_standstill = False    # latched once held >= track_standstill_hold_s
+
         self._grid = None          # (occ, free, res, ox, oy, h, w)
         self._edt = None
         self._edt_gx = None        # d(EDT)/dx [m/m], same shape as grid
@@ -280,6 +310,9 @@ class GlocServer(object):
         rospy.Subscriber('/nav_tf/rtabmap_confident', Bool,
                          lambda m: setattr(self, '_rtab_conf', bool(m.data)),
                          queue_size=1)
+        # STANDSTILL GATE: 50 Hz odom feed, see _cb_odom().
+        rospy.Subscriber('/mobile_base_controller/odom', Odometry,
+                         self._cb_odom, queue_size=1)
         if self.track_enable and self.track_rate_hz > 0:
             rospy.Timer(rospy.Duration(1.0 / self.track_rate_hz),
                         self._track_tick)
@@ -398,17 +431,68 @@ class GlocServer(object):
         self._gps_stable = gps_stable
         self._fix_usable = fix_usable
         self._gps_good = gps_stable and fix_usable
+        # ENGAGE DELAY bookkeeping: track how long fix_usable has been
+        # CONTINUOUSLY 0. Disengage is immediate — the instant the fix comes
+        # back the streak is cleared, no lingering engagement.
+        if fix_usable:
+            self._fix_lost_since = None
+        elif self._fix_lost_since is None:
+            self._fix_lost_since = time.time()
 
     def _tracker_should_idle(self):
-        """PROBATION-WINDOW FIX (2026-07-12): the actual tracker gate, decoupled
-        from the raw self._gps_good telemetry field (kept as-is for status/
+        """PROBATION-WINDOW FIX (2026-07-12): the raw ownership gate, decoupled
+        from the self._gps_good telemetry field (kept as-is for status/
         observability). 'fix_lost' (default): idle whenever the raw fix is
         usable, ownership probation or not — outdoors with a usable fix, leave
         it to GPS. 'not_owned': idle only with full ownership (5f589ff,
-        pre-2026-07-12 behaviour) — rollback path."""
+        pre-2026-07-12 behaviour) — rollback path. This does NOT yet apply the
+        engage delay (see _tracker_engaged()) — it is the instantaneous fix
+        state, used as-is for telemetry and as the "fix is back" edge."""
         if self.track_active_mode == 'not_owned':
             return self._gps_good
         return self._fix_usable
+
+    def _engage_delay_active(self):
+        """RULE 1 — ENGAGE DELAY (2026-07-12, live field report: outdoors RTK
+        FLAPS — fix_usable drops for a few seconds at a time while ownership
+        persists through the grace window — and the tracker engaged on those
+        brief windows, applying borderline outdoor matches and jerking the
+        pose). True while the raw fix is currently lost (per
+        _tracker_should_idle()) but has NOT yet been continuously lost for
+        track_engage_after_s — i.e. we are in the "waiting to see if this is a
+        real denial or just a flap" window. False once the fix is back (no
+        delay on the way back) or once the denial has proven itself real."""
+        if not self._tracker_should_idle():
+            return False   # fix is usable right now -> not even in question
+        if self._fix_lost_since is None:
+            return False   # should not happen (idle implies lost), safe default
+        return (time.time() - self._fix_lost_since) < self.track_engage_after_s
+
+    def _tracker_engaged(self):
+        """Combines the raw gate with the engage delay: the tracker may
+        actually correct/apply/count-as-lost only once the fix has been
+        continuously unusable for >= track_engage_after_s."""
+        return (not self._tracker_should_idle()) and (not self._engage_delay_active())
+
+    def _cb_odom(self, m):
+        """RULE 2 — STANDSTILL GATE (2026-07-12, live field report: measured
+        gyro drift is only ~0.025 deg/min, so at rest there is no drift to
+        correct — any tracker "correction" proposed while stationary is pure
+        alignment noise, not real drift, and it jerked the robot at a
+        standstill). 50 Hz /mobile_base_controller/odom feed: latch
+        self._is_standstill once |v_lin| and |v_ang| have both stayed below
+        threshold for > track_standstill_hold_s; drop it the instant either
+        exceeds threshold (immediate resume on motion, no symmetric delay)."""
+        vx = m.twist.twist.linear.x
+        wz = m.twist.twist.angular.z
+        slow = abs(vx) < self.track_standstill_lin_mps and abs(wz) < self.track_standstill_ang_rps
+        if not slow:
+            self._standstill_since = None
+            self._is_standstill = False
+            return
+        if self._standstill_since is None:
+            self._standstill_since = time.time()
+        self._is_standstill = (time.time() - self._standstill_since) >= self.track_standstill_hold_s
 
     def _track_align(self, pts_base, pose0):
         """Gauss-Newton scan-to-EDT: minimize sum EDT(R(yaw) p + t)^2 over
@@ -574,9 +658,14 @@ class GlocServer(object):
             # AUTO-RELOCK gate: if we are lost (a real localization-loss reject
             # streak, GPS denied) beyond track_lost_after_s and the rate limit has
             # elapsed, hijack this tick to run the global scorer instead of the
-            # normal local alignment (which can no longer pull us back).
+            # normal local alignment (which can no longer pull us back). Gated on
+            # _tracker_engaged() (not just the raw fix state) so a brief RTK flap
+            # can not itself count toward the lost timer — but once engaged this
+            # is the kidnap-scale relock path and stays available EVEN AT A
+            # STANDSTILL (Rule 2's exception: a robot can be picked up and set
+            # back down without ever registering as "moving").
             if (self.relock_enable and self._lost_since is not None
-                    and not self._tracker_should_idle()):
+                    and self._tracker_engaged()):
                 held = time.time() - self._lost_since
                 info['lost_held_s'] = round(held, 1)
                 info['reject_reason'] = self._reject_reason
@@ -616,7 +705,9 @@ class GlocServer(object):
                          'gps_stable': self._gps_stable,
                          'fix_usable': self._fix_usable,
                          'track_active_mode': self.track_active_mode,
-                         'rtabmap_confident': self._rtab_conf})
+                         'rtabmap_confident': self._rtab_conf,
+                         'engage_delay_active': self._engage_delay_active(),
+                         'is_standstill': self._is_standstill})
             rms_ok = out['rms'] <= self.track_max_rms_m
             eig_ok = out['eig_min'] >= self.track_min_eig_frac * out['n']
             corr_ok = (dx <= self.track_max_corr_m and
@@ -685,16 +776,40 @@ class GlocServer(object):
             # (the GPS arbiter owns the pose otherwise) and rtabmap does not have
             # priority (defer default OFF 2026-07-11; ~track_defer_to_rtabmap).
             if self._tracker_should_idle():
-                info['state'] = 'gps_owns'
-                # freshness (finding 2): GPS owns the pose, so any big-corr
-                # evidence is stale — after GPS loss recovery must earn a fresh
-                # 20 s + N-tick window from scratch.
+                # RULE 1 — ENGAGE DELAY: the raw fix is currently unusable, but
+                # distinguish "still waiting to see if this is a real denial"
+                # from "GPS is simply back and owns the pose" so the status is
+                # honest about which gate is holding the tracker off.
+                if self._engage_delay_active():
+                    info['state'] = 'engage_delay'
+                    info['fix_lost_held_s'] = round(
+                        time.time() - self._fix_lost_since, 1)
+                else:
+                    info['state'] = 'gps_owns'
+                # freshness (finding 2): GPS owns the pose (or we are still in
+                # the engage-delay window and must not act on a possible flap),
+                # so any big-corr evidence is stale — after real GPS loss
+                # recovery must earn a fresh 20 s + N-tick window from scratch.
                 self._bigcorr_reset()
                 self._persist_dirs = []
                 self._ema_pose = None
                 return
             if self.track_defer_to_rtabmap and self._rtab_conf:
                 info['state'] = 'rtabmap_owns'
+                return
+            # RULE 2 — STANDSTILL GATE: at rest there is no drift to correct
+            # (gyro drift ~0.025 deg/min) — any correction proposed here is
+            # alignment noise, not real drift. Suppress the publish entirely;
+            # the kidnap-scale relock path above is NOT gated by this (it
+            # already returned earlier in the tick if it fired).
+            if self._is_standstill:
+                info['state'] = 'standstill'
+                # do not let stale big-corr/persist/EMA evidence carry across a
+                # standstill stretch into the next real motion — same freshness
+                # reasoning as the gps_owns/engage_delay reset above.
+                self._bigcorr_reset()
+                self._persist_dirs = []
+                self._ema_pose = None
                 return
             # SMOOTH (2026-07-12): the big-corr RECOVER slew is a deliberate
             # bounded catch-up and must publish undiluted. Only the NORMAL path
@@ -807,7 +922,12 @@ class GlocServer(object):
             # state. Sensor gaps (no_scan/no_tf/few_*) and the relock states
             # themselves do NOT arm/clear the timer here — _try_relock manages its
             # own reset, and a relock in progress must not keep re-arming.
-            if info.get('applied') or st in ('gps_owns', 'rtabmap_owns', 'aligned'):
+            # 'engage_delay' (Rule 1) and 'standstill' (Rule 2) are ALSO excluded
+            # from arming/holding the lost timer: a brief RTK flap must not
+            # accumulate lost-time during the engage-delay window, and sitting
+            # still is not evidence of being lost either.
+            if info.get('applied') or st in ('gps_owns', 'rtabmap_owns', 'aligned',
+                                             'engage_delay', 'standstill'):
                 self._lost_since = None
             elif st in self._lost_states:
                 if self._lost_since is None:

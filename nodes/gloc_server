@@ -109,6 +109,20 @@ class GlocServer(object):
         self.track_bigcorr_recover_s = float(rospy.get_param('~track_bigcorr_recover_s', 20.0))
         self.track_bigcorr_step_m = float(rospy.get_param('~track_bigcorr_step_m', 0.30))
         self.track_bigcorr_step_yaw_deg = float(rospy.get_param('~track_bigcorr_step_yaw_deg', 3.0))
+        # CONSISTENCY GATE (2026-07-12 review finding 1): an aliased row-lock
+        # (scan snapping to the wrong parallel structure line) produces an
+        # over-cap correction whose DIRECTION jitters between ticks and whose
+        # MAGNITUDE fluctuates; a real accumulated blind-drive offset holds both
+        # steady. Before allowing any recovery slew, require the correction
+        # direction atan2(dy,dx) to be stable (circular spread < consist_deg)
+        # across N consecutive corr_too_big ticks AND the magnitude to not swing
+        # wildly (max/min < consist_ratio). The buffer is reset whenever the
+        # gate fails, on corr_ok, or on gps_owns.
+        self.track_bigcorr_consist_n = int(rospy.get_param('~track_bigcorr_consist_n', 3))
+        self.track_bigcorr_consist_deg = float(rospy.get_param('~track_bigcorr_consist_deg', 30.0))
+        self.track_bigcorr_consist_ratio = float(rospy.get_param('~track_bigcorr_consist_ratio', 2.0))
+        self._bigcorr_dirs = []        # recent corr directions (rad) for spread
+        self._bigcorr_mags = []        # recent corr magnitudes (m) for ratio
         # streak / count state for the recovery path + status observability (2c)
         self._bigcorr_since = None     # wall time corr_too_big started (None = not)
         self._applied_count = 0        # total corrections published this session
@@ -322,6 +336,37 @@ class GlocServer(object):
         return {'pose': pose, 'rms': rms, 'n': n_used,
                 'eig_min': float(first_eigs[0]), 'eig_max': float(first_eigs[1])}
 
+    def _bigcorr_reset(self):
+        """Clear the big-corr freshness timer and consistency buffers."""
+        self._bigcorr_since = None
+        self._bigcorr_dirs = []
+        self._bigcorr_mags = []
+
+    def _bigcorr_consistent(self, dx_v, dy_v, mag):
+        """Push this tick's correction (dx, dy vector + magnitude) into the
+        consistency buffers and report whether the last N corr_too_big ticks
+        agree in direction (circular spread < consist_deg) and magnitude
+        (max/min < consist_ratio). Buffers are trimmed to N. Returns
+        (consistent_bool, spread_deg, mag_ratio)."""
+        self._bigcorr_dirs.append(math.atan2(dy_v, dx_v))
+        self._bigcorr_mags.append(mag)
+        n = max(1, self.track_bigcorr_consist_n)
+        self._bigcorr_dirs = self._bigcorr_dirs[-n:]
+        self._bigcorr_mags = self._bigcorr_mags[-n:]
+        if len(self._bigcorr_dirs) < n:
+            return False, None, None
+        # circular spread = 1 - resultant length, mapped to an angular figure
+        cs = sum(math.cos(a) for a in self._bigcorr_dirs)
+        sn = sum(math.sin(a) for a in self._bigcorr_dirs)
+        rlen = math.hypot(cs, sn) / len(self._bigcorr_dirs)
+        rlen = min(1.0, rlen)
+        spread_deg = math.degrees(math.acos(rlen))  # 0 = perfectly aligned
+        mn, mx = min(self._bigcorr_mags), max(self._bigcorr_mags)
+        ratio = (mx / mn) if mn > 1e-6 else float('inf')
+        ok = (spread_deg <= self.track_bigcorr_consist_deg and
+              ratio < self.track_bigcorr_consist_ratio)
+        return ok, spread_deg, ratio
+
     def _track_tick(self, _evt):
         info = {'applied': False}
         try:
@@ -358,32 +403,49 @@ class GlocServer(object):
                        dyaw <= self.track_max_corr_yaw_deg)
             if not rms_ok:
                 info['state'] = 'poor_match'
-                self._bigcorr_since = None
+                self._bigcorr_reset()
                 return
             if not eig_ok:
                 info['state'] = 'degenerate'
-                self._bigcorr_since = None
+                self._bigcorr_reset()
                 return
             # BIG-CORR RECOVERY: normally reject an over-cap correction, but if it
             # persists (match otherwise healthy: rms + eig already passed) the
             # tracker would deadlock — after track_bigcorr_recover_s, SLEW toward
             # the target in bounded steps instead of rejecting outright.
             slewed = False
+            slew_step = 0.0
             if not corr_ok:
                 if self._bigcorr_since is None:
                     self._bigcorr_since = time.time()
                 held = time.time() - self._bigcorr_since
-                if held < self.track_bigcorr_recover_s:
+                # CONSISTENCY GATE (finding 1): direction + magnitude stability
+                # over the last N corr_too_big ticks. An aliased row-lock jitters;
+                # a real accumulated offset holds. Gate failure resets the whole
+                # freshness window so evidence must re-accumulate from scratch.
+                consist_ok, spread_deg, mag_ratio = self._bigcorr_consistent(
+                    x - pose0[0], y - pose0[1], dx)
+                if spread_deg is not None:
+                    info['bigcorr_dir_spread_deg'] = round(spread_deg, 1)
+                    info['bigcorr_mag_ratio'] = round(mag_ratio, 2)
+                if held < self.track_bigcorr_recover_s or not consist_ok:
                     info['state'] = 'corr_too_big'
                     info['bigcorr_held_s'] = round(held, 1)
+                    info['bigcorr_consist_ok'] = bool(consist_ok)
+                    if not consist_ok and held >= self.track_bigcorr_recover_s:
+                        # timer elapsed but direction/magnitude unstable -> alias
+                        # suspicion: drop the window, force a fresh N-tick + 20s.
+                        self._bigcorr_reset()
                     return
                 # recover: clamp the correction to a bounded per-tick step toward
                 # (x, y, th), publish the intermediate pose (GPS/rtabmap ownership
                 # is enforced by the shared gate below).
+                slew_step = dx
                 if dx > self.track_bigcorr_step_m and dx > 1e-6:
                     f = self.track_bigcorr_step_m / dx
                     x = pose0[0] + (x - pose0[0]) * f
                     y = pose0[1] + (y - pose0[1]) * f
+                    slew_step = self.track_bigcorr_step_m
                 dyaw_signed = math.atan2(math.sin(th - pose0[2]),
                                          math.cos(th - pose0[2]))
                 step_yaw = math.radians(self.track_bigcorr_step_yaw_deg)
@@ -392,13 +454,18 @@ class GlocServer(object):
                 slewed = True
                 info['state'] = 'recover_slew'
                 info['bigcorr_held_s'] = round(held, 1)
+                info['bigcorr_consist_ok'] = True
             else:
-                self._bigcorr_since = None
+                self._bigcorr_reset()
             # correction is healthy (or slewed) — apply only when GPS is denied
             # (the GPS arbiter owns the pose otherwise) and rtabmap does not have
             # priority (defer default OFF 2026-07-11; ~track_defer_to_rtabmap).
             if self._gps_good:
                 info['state'] = 'gps_owns'
+                # freshness (finding 2): GPS owns the pose, so any big-corr
+                # evidence is stale — after GPS loss recovery must earn a fresh
+                # 20 s + N-tick window from scratch.
+                self._bigcorr_reset()
                 return
             if self.track_defer_to_rtabmap and self._rtab_conf:
                 info['state'] = 'rtabmap_owns'
@@ -419,11 +486,18 @@ class GlocServer(object):
             self.pub_track_pose.publish(ps)
             info['applied'] = True
             self._applied_count += 1
-            rospy.loginfo_throttle(
-                10.0, '[gloc-track] %s %.2f m / %.1f deg '
-                '(rms %.2f, n=%d)',
-                'RECOVER-slew' if slewed else 'correcting',
-                dx, dyaw, out['rms'], out['n'])
+            # finding 3: on a slew, dx is the FULL offset to the target but only
+            # slew_step m is actually applied this tick — print both (step/total).
+            if slewed:
+                rospy.loginfo_throttle(
+                    10.0, '[gloc-track] RECOVER-slew %.2f m step / %.2f m total '
+                    '/ %.1f deg (rms %.2f, n=%d)',
+                    slew_step, dx, dyaw, out['rms'], out['n'])
+            else:
+                rospy.loginfo_throttle(
+                    10.0, '[gloc-track] correcting %.2f m / %.1f deg '
+                    '(rms %.2f, n=%d)',
+                    dx, dyaw, out['rms'], out['n'])
         except Exception as e:
             info['state'] = 'error: %s' % e
         finally:

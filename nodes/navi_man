@@ -151,6 +151,18 @@ class Node:
         self._bundle_site = None
         self._bundle_site_for = "\x00__unset__"
 
+        # --- site-native mode (flag-gated, DEFAULT OFF) -----------------------
+        # Set for real from navi_manager.yaml right after load_manager_config()
+        # below; defaulted here so the attribute always exists (latched-callback
+        # / load_map(init) races). See _georef_datum_values / callback_load_map.
+        self._site_native = False
+        # georef-datum resolver cache (recomputed on every active_map change):
+        #   None  -> use the map pickle datum (legacy / flag-off, byte-identical)
+        #   tuple -> (utm_x, utm_y, utm_z, ox, oy, oz, ow) from the SITE datum.yaml
+        self._georef_vals_cache = None
+        self._georef_vals_for = "\x00__unset__"
+        self._sitenative_dbskip_logged = False
+
         self.map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
         self.map_coords = rospy.Publisher('navi_manager/map_coords', PoseStamped, queue_size=10)
         self.map_list_str_pub = rospy.Publisher('navi_manager/map_str_list', StringList, queue_size=10)
@@ -275,6 +287,14 @@ class Node:
 
         self.params = None
         self.load_manager_config()
+        # site-native mode: mapping-v3 site bundle is the runtime map authority.
+        # DEFAULT false -> every site_native branch below is a no-op and the
+        # legacy path is byte-for-byte unchanged.
+        self._site_native = bool(self.params.get('site_native', False))
+        if self._site_native:
+            rospy.logwarn("navi_man: site_native=TRUE — mapping-v3 site mode "
+                          "(boot map source forced 'octomap', map->odom georef "
+                          "from site datum.yaml, rtabmap .db copy skipped on load).")
 
         if self.params['load_map_on_start'] == '':
             self.map_name = "INIT"
@@ -293,6 +313,13 @@ class Node:
         # "planner"; override it here so boot serves the configured source (default
         # "octomap"). This does NOT start RTABMAP_MAPPING.
         map_source_on_start = self.params.get('map_source_on_start', 'planner')
+        # site_native (1a): the served site raster IS the map — force the octomap
+        # source at boot regardless of map_source_on_start (reuses the exact same
+        # octomap code path incl. its serve_site retry / bootstrap fallback).
+        if self._site_native and map_source_on_start != 'octomap':
+            rospy.logwarn("navi_man: site_native forcing boot map source "
+                          "'octomap' (was '%s').", map_source_on_start)
+            map_source_on_start = 'octomap'
         if map_source_on_start:
             self.callback_web_plan_show_map(String(map_source_on_start))
             rospy.loginfo("Default map source at boot: %s", map_source_on_start)
@@ -1134,16 +1161,20 @@ class Node:
 
     def publish_map_coords(self):
         if not self.indoor:
+            # Georef datum for map->odom (pickle datum by default; site datum.yaml
+            # under site_native). navi_transform.callback_map_coords differences
+            # utm->odom against this to build the live map->odom transform.
+            gx, gy, gz, gox, goy, goz, gow = self._georef_datum_values()
             msg = PoseStamped()
             msg.header.stamp = rospy.Time.now()
             msg.header.frame_id = "map"
-            msg.pose.position.x = self.running_map_data.utm_x
-            msg.pose.position.y = self.running_map_data.utm_y
-            msg.pose.position.z = self.running_map_data.utm_z
-            msg.pose.orientation.x = self.running_map_data.utm_orientation_x
-            msg.pose.orientation.y = self.running_map_data.utm_orientation_y
-            msg.pose.orientation.z = self.running_map_data.utm_orientation_z
-            msg.pose.orientation.w = self.running_map_data.utm_orientation_w
+            msg.pose.position.x = gx
+            msg.pose.position.y = gy
+            msg.pose.position.z = gz
+            msg.pose.orientation.x = gox
+            msg.pose.orientation.y = goy
+            msg.pose.orientation.z = goz
+            msg.pose.orientation.w = gow
             self.map_coords.publish(msg)
 
 
@@ -1162,16 +1193,22 @@ class Node:
                 m_y = 0
                 m_z = 0
                 if self.running_map_data.is_utm():
-                    m_x = trans.transform.translation.x - self.running_map_data.utm_x
-                    m_y = trans.transform.translation.y - self.running_map_data.utm_y
-                    m_z = trans.transform.translation.z - self.running_map_data.utm_z
+                    # Georef datum source: pickle datum by default, site datum.yaml
+                    # under site_native (1b). NOTE: the sendTransform below is
+                    # commented out (the live map->odom georef is published by
+                    # navi_transform from /navi_manager/map_coords) — this stays
+                    # datum-consistent for if/when the broadcast is re-enabled.
+                    gx, gy, gz, gox, goy, goz, gow = self._georef_datum_values()
+                    m_x = trans.transform.translation.x - gx
+                    m_y = trans.transform.translation.y - gy
+                    m_z = trans.transform.translation.z - gz
                     if not hasattr(self, 'running_map_data.utm_orientation_x'):
                         self.running_map_data.utm_orientation_x = 0
                         self.running_map_data.utm_orientation_y = 0
-                    m_orientation_x = self.running_map_data.utm_orientation_x
-                    m_orientation_y = self.running_map_data.utm_orientation_y
-                    m_orientation_z = self.running_map_data.utm_orientation_z
-                    m_orientation_w = self.running_map_data.utm_orientation_w
+                    m_orientation_x = gox
+                    m_orientation_y = goy
+                    m_orientation_z = goz
+                    m_orientation_w = gow
                 else:
                     m_orientation_x = 0
                     m_orientation_y = 0
@@ -1291,28 +1328,86 @@ class Node:
                           "pickle still saved): %s", site, e)
 
     def _bundle_datum_guard(self, site, pickle_datum):
-        # Informational only (plan §3): if the site datum.yaml disagrees with the
-        # map's pickle datum beyond 0.05 m / 2 mrad, warn ONCE per load. We NEVER
-        # auto-switch datum; the pickle datum drives the conversion.
+        # Informational (plan §3): if the site datum.yaml disagrees with the map's
+        # pickle datum beyond 0.05 m / 2 mrad, WARN. We never SILENTLY switch datum
+        # — for bundle geometry conversion the pickle datum drives it; for the
+        # site-native georef the caller decides, and this guard supplies the delta.
+        # Returns (site_datum_canonical, (dE, dN, dAlt, dYaw)) or (None, None) when
+        # no usable datum.yaml exists. Existing callers may ignore the return.
         try:
             dp = os.path.join(_bundle.site_dir(site), 'datum.yaml')
             if not os.path.exists(dp):
-                return
+                return None, None
             with open(dp) as f:
                 sd = yaml.safe_load(f)
             if not sd:
-                return
+                return None, None
             site_datum = _geo.from_datum_yaml(sd)
             exceeded, (de, dn, dalt, dyaw) = _bsync.datum_exceeds(pickle_datum,
                                                                   site_datum)
             if exceeded:
                 rospy.logwarn("navi_man bundle: DATUM MISMATCH site '%s' vs map "
                               "pickle — dE=%.3fm dN=%.3fm dYaw=%.4frad "
-                              "(thr 0.05m/2mrad). Geometry converted with the "
-                              "PICKLE datum; no auto-switch (plan §3).",
-                              site, de, dn, dyaw)
+                              "(thr 0.05m/2mrad).", site, de, dn, dyaw)
+            return site_datum, (de, dn, dalt, dyaw)
         except Exception as e:
             rospy.logwarn("navi_man bundle: datum guard check failed: %s", e)
+            return None, None
+
+    def _georef_datum_values(self):
+        # Datum used for the map->odom GEOREF that navi_man feeds downstream:
+        # published on /navi_manager/map_coords (consumed by navi_transform's
+        # callback_map_coords — THE live map->odom source) and used by the
+        # (currently broadcast-disabled) set_map_utm_transform. Returns
+        # (utm_x, utm_y, utm_z, ox, oy, oz, ow).
+        #
+        # DEFAULT / flag-off: the map's PICKLE datum (running_map_data.utm_*) —
+        # byte-identical to legacy. site_native (1b): the SERVED site's
+        # datum.yaml when it resolves, with a one-time delta WARN + a one-time
+        # loginfo naming the source (loc-relevant visibility); it PROCEEDS on any
+        # delta (today mm/mrad). No site datum under site_native -> pickle datum +
+        # one-time warn. Cached per active_map so the 30 Hz caller costs nothing
+        # and the logs fire once per map.
+        rmd = self.running_map_data
+        pickle_vals = (rmd.utm_x, rmd.utm_y, rmd.utm_z,
+                       rmd.utm_orientation_x, rmd.utm_orientation_y,
+                       rmd.utm_orientation_z, rmd.utm_orientation_w)
+        if not self._site_native:
+            return pickle_vals
+        if self.active_map == self._georef_vals_for:
+            return self._georef_vals_cache if self._georef_vals_cache is not None \
+                else pickle_vals
+        # (re)resolve for this active_map; on any miss fall back to pickle and
+        # do not re-log (the cache key is set so this branch runs once per map).
+        self._georef_vals_for = self.active_map
+        self._georef_vals_cache = None
+        if not _BUNDLE_OK or not rmd.is_utm():
+            rospy.logwarn("navi_man site_native: bundle libs unavailable or map "
+                          "'%s' has no UTM datum — georef uses the pickle datum.",
+                          self.active_map)
+            return pickle_vals
+        site = self._bundle_site_for_active_map()
+        if not site:
+            rospy.logwarn("navi_man site_native: no site linked to map '%s' — "
+                          "georef uses the pickle datum.", self.active_map)
+            return pickle_vals
+        pickle_datum = _geo.from_pickle_datum(rmd)
+        site_datum, delta = self._bundle_datum_guard(site, pickle_datum)
+        if site_datum is None:
+            rospy.logwarn("navi_man site_native: site '%s' has no datum.yaml — "
+                          "georef uses the pickle datum.", site)
+            return pickle_vals
+        de, dn, dalt, dyaw = delta
+        q = _geo.yaw_to_quat(site_datum['yaw_rad'])   # (x, y, z, w) pure yaw
+        z = site_datum['alt'] if 'alt' in site_datum else rmd.utm_z
+        vals = (site_datum['utm_e'], site_datum['utm_n'], z,
+                q[0], q[1], q[2], q[3])
+        self._georef_vals_cache = vals
+        rospy.loginfo("navi_man site_native: georef datum: site '%s' (delta vs "
+                      "pickle dE=%.3fm dN=%.3fm dYaw=%.4frad dAlt=%s) — map->odom "
+                      "uses the SITE datum.", site, de, dn, dyaw,
+                      ("%.3fm" % dalt) if dalt is not None else "n/a")
+        return vals
 
     def _build_map_point_from_spec(self, spec):
         q = _geo.yaw_to_quat(spec['yaw'])   # (x, y, z, w) pure yaw
@@ -1697,8 +1792,17 @@ class Node:
             # the freshly loaded map -> corrupt db -> rtabmap segfault on next start.
             self.rtabmap_mapping.stop()
             self.status_msg_pub.publish("Loading the map...")
-            shutil.copyfile("/home/vitulus/.vitulus/saves/maps/" + msg.data + ".db",
-                            "/home/vitulus/.ros/rtabmap.db")
+            # site_native (1c): rtabmap is out of the runtime, so skip the (large)
+            # rtabmap .db copy into ~/.ros — nothing consumes it. The mapdata pickle
+            # copy, planner_data swap and launch restart below are UNCHANGED.
+            if self._site_native:
+                if not self._sitenative_dbskip_logged:
+                    rospy.loginfo("navi_man site_native: skipping rtabmap .db copy "
+                                  "on map load (rtabmap out of runtime).")
+                    self._sitenative_dbskip_logged = True
+            else:
+                shutil.copyfile("/home/vitulus/.vitulus/saves/maps/" + msg.data + ".db",
+                                "/home/vitulus/.ros/rtabmap.db")
             shutil.copyfile("/home/vitulus/.vitulus/saves/maps_data/" + msg.data + ".pkl",
                             "/home/vitulus/.ros/mapdata.pkl")
             self.status_msg_pub.publish("Map " + msg.data + " saved.")

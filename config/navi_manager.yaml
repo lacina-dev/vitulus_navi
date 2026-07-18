@@ -28,3 +28,25 @@ rtabmap_on_start: false
 #   "planner" = planner-edited grid (legacy default)
 #   "rtabmap" = rtabmap grid_map (starts RTABMAP_MAPPING on demand)
 map_source_on_start: "octomap"
+
+# ============================================================================
+# SITE-NATIVE MODE  (mapping-v3 site bundles as the runtime map authority)
+# ============================================================================
+# DEFAULT: false. This is the path to RETIRING the legacy rtabmap navi maps.
+# When TRUE it flips three things (all no-ops when false — legacy path byte-for-
+# byte unchanged):
+#   1. navi_man boot map source is FORCED to "octomap" (the served site raster).
+#   2. navi_man map->odom GEOREF datum comes from the served site's datum.yaml
+#      (refined, n-sample datum) instead of the legacy map pickle datum — with a
+#      one-time WARN of the delta (proceeds regardless; today's delta is mm/mrad).
+#   3. navi_man SKIPS the rtabmap .db copy on map load (rtabmap is out of the
+#      runtime), and node_planner REBUILDS its zone-generation workspace raster
+#      from the served /mapping_manager/site_map instead of the legacy raster.
+#
+# !!! DO NOT flip this to true until AFTER a FULL-COVERAGE mapping drive of the
+# !!! garden has produced a served site raster: the planner needs FREE space in
+# !!! that raster to generate zone coverage paths. A partial raster = zones with
+# !!! no coverage. Also assumes rtabmap_on_start: false. Flip procedure + the
+# !!! post-flip verification checklist live in vitulus_navi/SITE_BUNDLE_PLAN.md
+# !!! ("Site-native flip"). Rollback = set back to false (no data migration).
+site_native: false

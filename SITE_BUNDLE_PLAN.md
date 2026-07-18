@@ -75,3 +75,56 @@ Legacy pickle svět zůstává jako runtime cache — žádná změna topic API.
 - Latched cache po restartech (zone_list/program_list) — po importu vždy
   republish.
 - `map_name='new'` v picklech — klíčovat VÝHRADNĚ jmény souborů.
+
+## Site-native flip (2026-07-18)
+
+Přepínač `site_native` v `vitulus_navi/config/navi_manager.yaml` (DEFAULT
+`false`). Je to cesta k odstavení legacy rtabmap navi map: mapping-v3 site
+bundle se stává runtime autoritou mapy. **Když je `false`, VŠECHNY větve jsou
+no-op a legacy chování je byte-for-byte beze změny.** Když je `true`, mění tři
+věci:
+1. **navi_man** boot map source je vynucen na `octomap` (servírovaný site
+   rastr; reuse stávající octomap cesty vč. serve_site retry / bootstrap
+   fallbacku).
+2. **navi_man** map→odom **georef datum** bere z `datum.yaml` servírovaného
+   site (přes `_georef_datum_values`) místo pickle data mapy — publikuje se na
+   `/navi_manager/map_coords` (živý zdroj map→odom v `navi_transform`).
+   Jednorázový WARN s deltou vůči pickle datu (pokračuje bez ohledu na deltu;
+   dnes mm/mrad) + jeden loginfo „georef datum: site '<name>'“.
+3. **navi_man** přeskočí kopii rtabmap `.db` při `load_map` (rtabmap mimo
+   runtime); **node_planner** přestaví workspace rastr (`initial_map` + np
+   vrstvy) ze servírovaného `/mapping_manager/site_map` místo legacy rastru
+   (stejná MapData+assemble cesta jako `callback_map`). Zóny/programy dál
+   z bundlu (dnešní práce).
+
+### Předpoklady PŘED flipem
+- Proběhl **plný pokrývací mapovací průjezd** zahrady → mapping_manager
+  servíruje kompletní site rastr (`/mapping_manager/site_map` nonempty,
+  s FREE prostorem — planner potřebuje volno pro generování drah zón).
+- Bundle migrovaný (`waypoints/paths/zones.geojson`, `programs.yaml`,
+  `manifest.navi_map` == aktivní navi mapa, `datum.yaml` existuje).
+- `rtabmap_on_start: false` (site-native počítá s rtabmapem mimo runtime).
+- Večerní validace: octomap zdroj servíruje rozumný rastr, gloc/tracker sedí.
+
+### Flip = jediná změna
+- V `navi_manager.yaml`: `site_native: false` → `true`. Restart navi_man
+  (a node_planner) — edity se projeví až po restartu.
+
+### Co ověřit PO flipu (živě)
+- **Costmap zdravý** nad site rastrem: `/navi_manager/map` = site rastr
+  (`map_source` == `octomap`/`bootstrap`, ne `planner`), global costmap static
+  layer má mapu, MBF akce naběhly, footprint je.
+- **Regenerace zón dává PLNÉ pokrytí**: po loadu planner přestavěl rastr ze
+  site (log „workspace raster rebuilt from /mapping_manager/site_map“); zóny po
+  bundle importu/regeneraci nedriftují >5 % area/length (guard warny) a dráhy
+  pokrývají celou zónu (porovnat vůči snapshotu před flipem).
+- **Georef delta malá**: log „georef datum: site … (delta vs pickle dE/dN/dYaw)“
+  — dnes dE/dN≈0, dYaw≈3 mrad, dAlt≈0.175 m; žádný skok pózy po startu.
+- **Docking approach funguje**: dock seed/`docked` waypoint sedí, appro k doku
+  bez dislokace (georef změna je mm/mrad, ale ověřit reálně u doku).
+
+### Rollback
+- `site_native: false` + restart. Žádná migrace dat, žádné mazání — pickle svět
+  je netknutý (rtabmap `.db` se při dalším loadu zase zkopíruje, georef zpět na
+  pickle datum, planner rastr zpět z legacy pickle). Když se přeskočená `.db`
+  kopie stane problémem po rollbacku, stačí jeden `load_map` z UI.

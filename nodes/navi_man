@@ -174,6 +174,9 @@ class Node:
         self.map_point_str_list_pub = rospy.Publisher('navi_manager/map_point_str_list', StringList, queue_size=10)
         self.map_path_list_pub = rospy.Publisher('navi_manager/map_path_list', String, queue_size=10)
         self.map_path_str_list_pub = rospy.Publisher('navi_manager/map_path_str_list', StringList, queue_size=10)
+        # WP map editor V3: latched JSON snapshot of waypoints + paths (map frame)
+        # for the editor overlay's toggleable groups (see publish_map_objects).
+        self.map_objects_pub = rospy.Publisher('navi_manager/map_objects', String, queue_size=1, latch=True)
         self.map_path_pub = rospy.Publisher('navi_manager/map_path', Path, queue_size=10)
         self.map_path_goal_arr_pub = rospy.Publisher('/move_base_smach/exe_path', Path, queue_size=10)
         self.map_goal_pub = rospy.Publisher('/move_base_smach/goal', PoseStamped, queue_size=10)
@@ -218,6 +221,7 @@ class Node:
         rospy.Subscriber("/navi_manager/goal_point", String, self.callback_goal_point)
         rospy.Subscriber("/navi_manager/remove_point", String, self.callback_remove_point)
         rospy.Subscriber("/navi_manager/save_path", String, self.callback_save_path)
+        rospy.Subscriber("/navi_manager/save_path_at", String, self.callback_save_path_at)
         rospy.Subscriber("/navi_manager/save_path_point", String, self.callback_save_path_point)
         rospy.Subscriber("/navi_manager/start_new_autopath", String, self.callback_start_new_autopath)
         rospy.Subscriber("/navi_manager/stop_autopath", Bool, self.callback_stop_autopath)
@@ -969,6 +973,86 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
 
+    def callback_save_path_at(self, msg):
+        # WP map editor V2: save/replace a MANUALLY DRAWN path from explicit
+        # map-frame points supplied by the UI, landing in the SAME
+        # running_map_data.paths collection as robot-recorded paths
+        # (callback_save_path / add_autopath_point) so it appears in the Path tab
+        # and can be navigated/executed identically. Add-or-replace by name.
+        # Payload std_msgs/String JSON:
+        #   {"name": str, "points": [[x,y],...], "yaws": [..] optional}
+        # yaw per pose: if yaws absent, heading = direction of the segment to the
+        # NEXT point; the last pose repeats the previous pose's yaw.
+        try:
+            spec = json.loads(msg.data)
+        except Exception as e:
+            self.status_msg_pub.publish("save_path_at: bad JSON ({})".format(e))
+            rospy.logwarn("save_path_at: bad JSON: %s", e)
+            return
+        name = str(spec.get('name', '')).strip()
+        if name == "":
+            self.status_msg_pub.publish("The name is empty!")
+            rospy.loginfo("The name is empty!")
+            return
+        pts = spec.get('points', [])
+        if not isinstance(pts, list) or len(pts) < 2:
+            self.status_msg_pub.publish("save_path_at: need at least 2 points.")
+            rospy.logwarn("save_path_at: need >=2 points (%s given).", len(pts) if isinstance(pts, list) else 'none')
+            return
+        yaws_in = spec.get('yaws', None)
+        have_yaws = isinstance(yaws_in, list) and len(yaws_in) == len(pts)
+        n = len(pts)
+        # per-pose yaw list first, so the last pose can repeat the previous yaw
+        yaw_list = []
+        try:
+            for i in range(n):
+                if have_yaws:
+                    yaw_list.append(float(yaws_in[i]))
+                elif i < n - 1:
+                    dx = float(pts[i + 1][0]) - float(pts[i][0])
+                    dy = float(pts[i + 1][1]) - float(pts[i][1])
+                    yaw_list.append(math.atan2(dy, dx))
+                else:
+                    yaw_list.append(yaw_list[-1] if yaw_list else 0.0)
+        except (IndexError, TypeError, ValueError) as e:
+            self.status_msg_pub.publish("save_path_at: bad point/yaw ({})".format(e))
+            rospy.logwarn("save_path_at: bad point/yaw: %s", e)
+            return
+        poses = []
+        try:
+            for i in range(n):
+                x = float(pts[i][0])
+                y = float(pts[i][1])
+                qz = math.sin(yaw_list[i] / 2.0)
+                qw = math.cos(yaw_list[i] / 2.0)
+                poses.append(Pose(Point(x, y, 0.0), Quaternion(0.0, 0.0, qz, qw)))
+        except (IndexError, TypeError, ValueError) as e:
+            self.status_msg_pub.publish("save_path_at: bad point ({})".format(e))
+            rospy.logwarn("save_path_at: bad point: %s", e)
+            return
+        path_exist = self.running_map_data.get_map_path(name)
+        if not path_exist:
+            path = MapPath(name, 'map')
+            path.poses = poses
+            path.create_path_msg()
+            self.running_map_data.add_map_path(path)
+            self.save_running_map_data()
+            self.status_msg_pub.publish("New path {} added ({} points).".format(name, n))
+            rospy.loginfo("New drawn path %s added (%d points).", name, n)
+        else:
+            path_exist.poses = poses
+            path_exist.tf_frame = 'map'
+            path_exist.create_path_msg()
+            self.save_running_map_data()
+            self.status_msg_pub.publish("{} path changed ({} points).".format(name, n))
+            rospy.loginfo("Drawn path %s changed (%d points).", name, n)
+        # refresh the name lists + map_objects overlay the UI reads (matches the
+        # save_waypoint_at pattern; never let it break the save).
+        try:
+            self._republish_map_lists()
+        except Exception:
+            pass
+
     def callback_publish_point(self, msg):
         if msg.data != "":
             self.point_to_publish = msg.data
@@ -1299,6 +1383,7 @@ class Node:
             self.publish_map_point_list()
             self.publish_map_point_str_list()
             self.publish_map_path_list()
+            self.publish_map_objects()
         except Exception as e:
             rospy.logwarn("navi_man bundle: republish map lists failed: %s", e)
 
@@ -2040,6 +2125,38 @@ class Node:
             msg.string_list.append(path.name)
         self.map_path_str_list_pub.publish(msg)
 
+    def publish_map_objects(self):
+        # WP map editor V3: latched JSON snapshot of waypoints + paths in MAP
+        # frame for the editor overlay (toggleable Waypoints / Paths groups).
+        #   {"waypoints": [{name,x,y,yaw}], "paths": [{name, points:[[x,y]..]}]}
+        # yaw is extracted from the pose quaternion (z-only heading). Latched, so
+        # subscribers get the current snapshot immediately on connect.
+        try:
+            wps = []
+            for p in self.running_map_data.points:
+                try:
+                    q = p.pose.orientation
+                    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                     1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                    wps.append({'name': p.name,
+                                'x': p.pose.position.x,
+                                'y': p.pose.position.y,
+                                'yaw': yaw})
+                except Exception:
+                    continue
+            paths = []
+            for pa in self.running_map_data.paths:
+                pts = []
+                for ps in pa.poses:
+                    try:
+                        pts.append([ps.position.x, ps.position.y])
+                    except Exception:
+                        continue
+                paths.append({'name': pa.name, 'points': pts})
+            self.map_objects_pub.publish(json.dumps({'waypoints': wps, 'paths': paths}))
+        except Exception as e:
+            rospy.logwarn("navi_man: publish_map_objects failed: %s", e)
+
     def publish_map_path(self, name):
         path = self.running_map_data.get_map_path(name)
         if path:
@@ -2082,6 +2199,7 @@ if __name__ == '__main__':
                 node.publish_map_point_list()
                 node.publish_map_point_str_list()
                 node.publish_map_path_list()
+                node.publish_map_objects()
                 node.publish_map_path(node.path_to_publish)
                 node.pub_active_map.publish(String(node.active_map))
                 node.is_indoor_pub.publish(Bool(node.indoor))

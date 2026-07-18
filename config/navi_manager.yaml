@@ -49,4 +49,4 @@ map_source_on_start: "octomap"
 # !!! no coverage. Also assumes rtabmap_on_start: false. Flip procedure + the
 # !!! post-flip verification checklist live in vitulus_navi/SITE_BUNDLE_PLAN.md
 # !!! ("Site-native flip"). Rollback = set back to false (no data migration).
-site_native: false
+site_native: true

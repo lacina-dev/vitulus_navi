@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import threading
 import time
 
 import rospy
@@ -78,6 +79,15 @@ class NavTfNode:
         self.set_pose_yaw = 0
         self.set_pose_pose = 0
         self.is_indoor = True
+        # FIX-8: is_indoor=True suppresses the map->odom TF broadcast
+        # (transform_map_to_odom). Kept True as the initial value because navi_man
+        # drives it (latched navi_manager/is_indoor) and navi_man's own initial
+        # self.indoor selects the indoor-vs-outdoor navi + rtabmap launch on an
+        # empty/INIT boot (start_navi_launch) — flipping it there would change the
+        # boot launch stack. Instead, warn LOUDLY if is_indoor is still True 30 s
+        # after start (nobody flipped it -> no external map->odom TF either =
+        # the silent no-TF trap). See loop1hz watchdog.
+        self._start_time = rospy.get_time()
         self.marker_imu = Marker()
         self.marker_nav = Marker()
         self.marker_fuse = Marker()
@@ -108,6 +118,11 @@ class NavTfNode:
         self.map_coords_msg = PoseStamped()
         self.map_odom_transform = TransformStamped()
         self.map_odom_transform.transform.rotation.w = 1
+        # FIX-7: map_odom_transform + map_odom_yaw are mutated from three threads
+        # (callback_map_coords / callback_set_map_pose in the spinner, slew_map_pose
+        # in loop30hz) and read by the loop30hz TF broadcast. One lock serialises
+        # the read-modify-write sites; the broadcast reads a snapshot under it.
+        self._map_odom_lock = threading.Lock()
         # GPS-denied heading correction carried by map->odom ROTATION (yaw, rad).
         # Normally 0: with GPS the absolute heading is anchored INSIDE odom->base
         # (diff_yaw -> fused -> EKF), so map->odom stays translation-only. External
@@ -186,6 +201,12 @@ class NavTfNode:
         # accumulated-error drift report, logged + exposed in loc_status on GPS
         # ownership RESUME after an outage (dx, dy, dyaw, distance, duration).
         self._drift_report = None
+        # FIX-3: only emit the drift report for MEANINGFUL outages — a sub-second /
+        # sub-metre GPS blip is not a forensic event and just spams the report.
+        # Emit if the outage lasted >= min_outage_s OR the robot drove >= min_dist_m
+        # blind; otherwise suppress (logdebug).
+        self._drift_report_min_outage_s = float(rospy.get_param('~drift_report_min_outage_s', 3.0))
+        self._drift_report_min_dist_m = float(rospy.get_param('~drift_report_min_dist_m', 0.3))
         # last MOTION-VERIFIED continuous anchor buffer entry (frozen when the
         # newest lag-old sample fails motion verification — protects the pose
         # from a lying multipath tail). None until the first verified anchor.
@@ -487,13 +508,18 @@ class NavTfNode:
             rospy.wait_for_service('/navi_manager/get_point_pose')
             try:
                 srv = rospy.ServiceProxy('/navi_manager/get_point_pose', Point_pose)  # Connect to the service
-                response = srv("dock")
+                # FIX-1: fetch "docked" (the pose AT the dock), not "dock" (the
+                # approach point in front of it), and route the correction through
+                # the source-tagged dock-priority channel (same path as messages
+                # on /nav_tf/set_map_pose_dock) instead of snapping the nav EKF.
+                response = srv("docked")
                 if response.result:
-                    rospy.logdebug("Dock point pose: %s" % response.point_pose)
-                    self.set_nav_pose(response.point_pose.pose)
-                    self.set_wheel_base_nav_pose(response.point_pose.pose)
+                    rospy.logdebug("Docked point pose: %s" % response.point_pose)
+                    self.callback_set_map_pose(response.point_pose, source='dock')
                 else:
-                    rospy.logwarn("Dock point pose not found.")
+                    # Never fall back to the "dock" approach point — teleporting
+                    # to the wrong waypoint is worse than doing nothing.
+                    rospy.logwarn("Docked point pose not found — no correction applied.")
             except rospy.ServiceException as e:
                 rospy.logerr("Service /navi_manager/get_point_pose call failed: %s" % e)
 
@@ -591,37 +617,40 @@ class NavTfNode:
         # the pose no longer snaps to each 1 Hz tracker minimum. A big mismatch
         # (kidnap / relocalisation) snaps to avoid crawling. Non-slew sources
         # (dock: one-shot precise anchor) apply instantly and clear any target.
-        if source in self._map_pose_slew_sources:
-            cur = self.map_odom_transform.transform.translation
-            dist = math.hypot(tx - cur.x, ty - cur.y)
-            dyaw = abs(math.atan2(math.sin(m - self.map_odom_yaw),
-                                  math.cos(m - self.map_odom_yaw)))
-            if (dist > self._map_pose_slew_snap_m or
-                    dyaw > math.radians(self._map_pose_slew_snap_deg)):
-                self.map_odom_yaw = m
-                cur.x = tx
-                cur.y = ty
-                self._map_pose_target = None
-                rospy.logwarn("[set_map_pose] '%s' mismatch %.2f m / %.1f deg > "
-                              "snap — snapping (relocalisation)",
-                              source, dist, math.degrees(dyaw))
-            else:
-                # TWO-SPEED SLEW: small, routine corrections (the common tracker
-                # case, <= ~map_pose_gentle_below_m) crawl in gently so they don't
-                # visibly jerk the pose; anything bigger (still under the snap
-                # threshold above) keeps the fast recovery rate.
-                if dist <= self._map_pose_gentle_below_m:
-                    self._map_pose_slew_active_mps = self._map_pose_slew_gentle_mps
-                    self._map_pose_slew_active_dps = self._map_pose_slew_gentle_dps
+        # FIX-7: read-modify-write of map_odom_transform + map_odom_yaw is atomic
+        # w.r.t. the slew loop / georef swap. tx, ty, m are computed above.
+        with self._map_odom_lock:
+            if source in self._map_pose_slew_sources:
+                cur = self.map_odom_transform.transform.translation
+                dist = math.hypot(tx - cur.x, ty - cur.y)
+                dyaw = abs(math.atan2(math.sin(m - self.map_odom_yaw),
+                                      math.cos(m - self.map_odom_yaw)))
+                if (dist > self._map_pose_slew_snap_m or
+                        dyaw > math.radians(self._map_pose_slew_snap_deg)):
+                    self.map_odom_yaw = m
+                    cur.x = tx
+                    cur.y = ty
+                    self._map_pose_target = None
+                    rospy.logwarn("[set_map_pose] '%s' mismatch %.2f m / %.1f deg > "
+                                  "snap — snapping (relocalisation)",
+                                  source, dist, math.degrees(dyaw))
                 else:
-                    self._map_pose_slew_active_mps = self._map_pose_slew_mps
-                    self._map_pose_slew_active_dps = self._map_pose_slew_dps
-                self._map_pose_target = (tx, ty, m)
-        else:
-            self.map_odom_yaw = m
-            self.map_odom_transform.transform.translation.x = tx
-            self.map_odom_transform.transform.translation.y = ty
-            self._map_pose_target = None   # instant source wins; drop pending slew
+                    # TWO-SPEED SLEW: small, routine corrections (the common tracker
+                    # case, <= ~map_pose_gentle_below_m) crawl in gently so they don't
+                    # visibly jerk the pose; anything bigger (still under the snap
+                    # threshold above) keeps the fast recovery rate.
+                    if dist <= self._map_pose_gentle_below_m:
+                        self._map_pose_slew_active_mps = self._map_pose_slew_gentle_mps
+                        self._map_pose_slew_active_dps = self._map_pose_slew_gentle_dps
+                    else:
+                        self._map_pose_slew_active_mps = self._map_pose_slew_mps
+                        self._map_pose_slew_active_dps = self._map_pose_slew_dps
+                    self._map_pose_target = (tx, ty, m)
+            else:
+                self.map_odom_yaw = m
+                self.map_odom_transform.transform.translation.x = tx
+                self.map_odom_transform.transform.translation.y = ty
+                self._map_pose_target = None   # instant source wins; drop pending slew
         # WP2: correction ACCEPTED and applied — stamp this source for arbitration.
         if source in self._map_pose_last_accept:
             self._map_pose_last_accept[source] = rospy.get_time()
@@ -795,10 +824,14 @@ class NavTfNode:
             map_odom_transform.transform.rotation.z = quaternion[2]
             map_odom_transform.transform.rotation.w = quaternion[3]
 
-            self.map_odom_transform = map_odom_transform
-            # GPS georef owns map->odom again -> drop the GPS-denied yaw correction
-            # (its translation math above assumes the identity-rotation broadcast).
-            self.map_odom_yaw = 0.0
+            # FIX-7: tight critical section — the new transform is fully built
+            # above; only the visible swap + yaw reset take the lock.
+            with self._map_odom_lock:
+                self.map_odom_transform = map_odom_transform
+                # GPS georef owns map->odom again -> drop the GPS-denied yaw
+                # correction (its translation math above assumes the
+                # identity-rotation broadcast).
+                self.map_odom_yaw = 0.0
         self.map_coords_msg = msg
 
     def callback_base_odom(self, msg):
@@ -1056,7 +1089,7 @@ class NavTfNode:
         cur = {k: (s['x'], s['y'], s['yaw']) for k, s in self._src.items()}
         # Phase-2 decouple: the live pose now re-anchors on RTK position alone, so
         # the shadow bridge mirrors that (denied = real position dropout, not a
-        # heading flap). Keeps shadow div_from_live meaningful vs the live pose.
+        # heading flap). Keeps shadow shadow_div_m meaningful vs the live pose.
         gps_good = bool(self.position_fix_usable)
 
         if gps_good or not self._bridge['init']:
@@ -1130,7 +1163,7 @@ class NavTfNode:
         # usability is exposed as fix_usable=0/1 for observability. The rest of
         # the string format (incl. live/active/div/vo/licp/wheel) is unchanged.
         gps_stable = self._gps_stable()
-        st = ("gps_good=%d fix_usable=%d live=%d active=%s div_from_live=%.3fm | vo[use=%d cov=%.3g] "
+        st = ("gps_good=%d fix_usable=%d live=%d active=%s shadow_div_m=%.3fm | vo[use=%d cov=%.3g] "
               "licp[use=%d cov=%.3g] wheel[use=%d]" % (
                   int(gps_stable), int(gps_good), int(live), self._bridge_active, div,
                   int(usable['vo']), self._src['vo']['cov'],
@@ -1312,7 +1345,12 @@ class NavTfNode:
         """Newest buffered (t, rtk_xy, wheel_xy, wheel_yaw, nav_yaw) with
         entry time <= t, or None. Buffer is time-ordered (appended by loop3sec)."""
         found = None
-        for entry in self._pose_buffer:
+        # FIX-6: snapshot before iterating — loop3sec appends to _pose_buffer from
+        # another thread; iterating the live deque could raise mid-iteration. All
+        # readers of _pose_buffer funnel through here, so this one snapshot covers
+        # _rewind_verify_anchor / _entry_motion_verified / _apply_continuous_anchor.
+        buf = list(self._pose_buffer)
+        for entry in buf:
             if entry[0] <= t:
                 found = entry
             else:
@@ -1546,6 +1584,21 @@ class NavTfNode:
             dist = math.hypot(ow.x - self._anchor_odom_at_loss[0],
                               ow.y - self._anchor_odom_at_loss[1])
         dur = now_t - self._anchor_lost_t
+        # FIX-3: gate on a meaningful outage — sub-threshold blips are suppressed
+        # (logdebug, not logwarn) but the resume anchors are still cleared so the
+        # next real outage starts clean.
+        if dur < self._drift_report_min_outage_s and dist < self._drift_report_min_dist_m:
+            rospy.logdebug(
+                "[drift_report] suppressed — outage %.1fs / %.2f m blind below "
+                "min (%.1fs / %.2f m)",
+                dur, dist, self._drift_report_min_outage_s, self._drift_report_min_dist_m)
+            self._anchor_lost_pose = None
+            self._anchor_lost_t = None
+            self._anchor_odom_at_loss = None
+            self._resume_live_pose = None
+            self._resume_rtk_pose = None
+            self._resume_rtk_fresh = False
+            return
         report = {
             'dx': round(dx, 3), 'dy': round(dy, 3),
             'dist_m': round(math.hypot(dx, dy), 3),
@@ -1559,13 +1612,13 @@ class NavTfNode:
             dyaw = math.degrees(math.atan2(
                 math.sin(self.fused_yaw - self._anchor_lost_pose[2]),
                 math.cos(self.fused_yaw - self._anchor_lost_pose[2])))
-            report['dyaw_deg'] = round(dyaw, 2)
+            report['dyaw_change_deg'] = round(dyaw, 2)
         self._drift_report = report
         rospy.loginfo(
             "[drift_report] GPS ownership RESUMED after %.1fs / %.2f m driven "
             "blind — accumulated error dx=%.3f dy=%.3f (|%.3f m|)%s [vs rtk_resume]",
             dur, dist, dx, dy, math.hypot(dx, dy),
-            (" dyaw=%.2fdeg" % report['dyaw_deg']) if 'dyaw_deg' in report else "")
+            (" dyaw_change=%.2fdeg" % report['dyaw_change_deg']) if 'dyaw_change_deg' in report else "")
         self._anchor_lost_pose = None
         self._anchor_lost_t = None
         self._anchor_odom_at_loss = None
@@ -1762,49 +1815,62 @@ class NavTfNode:
             dt = min(max(now - self._map_pose_slew_last_t, 1.0 / 60.0), 0.5)
         self._map_pose_slew_last_t = now
 
-        cur = self.map_odom_transform.transform.translation
-        d_x, d_y = tx - cur.x, ty - cur.y
-        dist = math.hypot(d_x, d_y)
-        # TWO-SPEED SLEW: use the rate chosen in callback_set_map_pose for this
-        # target (gentle for small routine corrections, fast for larger ones).
-        max_step = self._map_pose_slew_active_mps * dt
-        pos_done = True
-        if dist > max_step and dist > 1e-9:
-            s = max_step / dist
-            cur.x += d_x * s
-            cur.y += d_y * s
-            pos_done = False
-        else:
-            cur.x, cur.y = tx, ty
+        # FIX-7: integrate the slew step atomically w.r.t. callback_set_map_pose /
+        # the georef swap. dt / tx,ty,tyaw are already local.
+        with self._map_odom_lock:
+            cur = self.map_odom_transform.transform.translation
+            d_x, d_y = tx - cur.x, ty - cur.y
+            dist = math.hypot(d_x, d_y)
+            # TWO-SPEED SLEW: use the rate chosen in callback_set_map_pose for this
+            # target (gentle for small routine corrections, fast for larger ones).
+            max_step = self._map_pose_slew_active_mps * dt
+            pos_done = True
+            if dist > max_step and dist > 1e-9:
+                s = max_step / dist
+                cur.x += d_x * s
+                cur.y += d_y * s
+                pos_done = False
+            else:
+                cur.x, cur.y = tx, ty
 
-        d_yaw = math.atan2(math.sin(tyaw - self.map_odom_yaw),
-                           math.cos(tyaw - self.map_odom_yaw))
-        max_yaw = math.radians(self._map_pose_slew_active_dps) * dt
-        yaw_done = True
-        if abs(d_yaw) > max_yaw:
-            self.map_odom_yaw += math.copysign(max_yaw, d_yaw)
-            yaw_done = False
-        else:
-            self.map_odom_yaw = tyaw
+            d_yaw = math.atan2(math.sin(tyaw - self.map_odom_yaw),
+                               math.cos(tyaw - self.map_odom_yaw))
+            max_yaw = math.radians(self._map_pose_slew_active_dps) * dt
+            yaw_done = True
+            if abs(d_yaw) > max_yaw:
+                self.map_odom_yaw += math.copysign(max_yaw, d_yaw)
+                yaw_done = False
+            else:
+                self.map_odom_yaw = tyaw
 
-        if pos_done and yaw_done:
-            self._map_pose_target = None   # reached target — stop slewing
+            if pos_done and yaw_done:
+                self._map_pose_target = None   # reached target — stop slewing
 
     def transform_map_to_odom(self):
         if not self.is_indoor:
             odom_base_tf = self.get_base_link_transform()
+            # FIX-7: snapshot (x, y, z, yaw) under the lock, then build + broadcast
+            # from locals — the broadcast no longer reads the live shared object
+            # (nor mutates it: the old code aliased translation by reference and
+            # wrote .z back into the shared transform).
+            with self._map_odom_lock:
+                mt = self.map_odom_transform.transform.translation
+                mx, my, mz = mt.x, mt.y, mt.z
+                myaw = self.map_odom_yaw
             map_odom_tf = TransformStamped()
             map_odom_tf.header.stamp = rospy.Time.now()
             map_odom_tf.header.frame_id = "map"
             map_odom_tf.child_frame_id = "odom"
-            map_odom_tf.transform.translation = self.map_odom_transform.transform.translation
+            map_odom_tf.transform.translation.x = mx
+            map_odom_tf.transform.translation.y = my
+            map_odom_tf.transform.translation.z = mz
             if odom_base_tf is not None:
                 map_odom_tf.transform.translation.z = (odom_base_tf.transform.translation.z * -1)
             # Rotation = the explicit GPS-denied yaw correction ONLY (normally 0).
             # NOT the quaternion stored by callback_map_coords — heading is anchored
             # inside odom->base with GPS, so broadcasting that residual would
             # double-count yaw (that is why identity was forced here historically).
-            q = quaternion_from_euler(0.0, 0.0, self.map_odom_yaw)
+            q = quaternion_from_euler(0.0, 0.0, myaw)
             map_odom_tf.transform.rotation.x = q[0]
             map_odom_tf.transform.rotation.y = q[1]
             map_odom_tf.transform.rotation.z = q[2]
@@ -2030,10 +2096,16 @@ class NavTfNode:
     def srv_cb_set_pose(self, srv):
         """
         Service callback to set the initial pose.
-        :param srv: robot_localization/SetPose
+        :param srv: robot_localization/SetPose (SetPoseRequest)
         :return: robot_localization/SetPoseResponse
         """
-        self.set_nav_pose(srv)
+        # FIX-4: SetPoseRequest.pose is a PoseWithCovarianceStamped, so the plain
+        # Pose lives at srv.pose.pose.pose — passing the whole request straight to
+        # set_nav_pose raised AttributeError. Mirror the topic handler
+        # callback_set_pose (set_nav_pose + set_wheel_base_nav_pose) exactly.
+        pose = srv.pose.pose.pose
+        self.set_nav_pose(pose)
+        self.set_wheel_base_nav_pose(pose)
         return SetPoseResponse()
 
     def reset_wheel_odom(self):
@@ -2403,6 +2475,18 @@ class NavTfNode:
         node_gnss.publish_status()
         node_gnss.maybe_apply_site_datum()
         node_gnss.publish_loc_status()
+        # FIX-8: silent no-TF trap watchdog. If is_indoor is still True 30 s after
+        # start, nothing (navi_man map load) flipped us outdoor — transform_map_to_odom
+        # is suppressing the map->odom broadcast. Warn loudly and repeatedly so a
+        # failed/empty map load is not invisible. (In genuine indoor operation
+        # rtabmap supplies map->odom instead; this robot is an outdoor mower.)
+        if node_gnss.is_indoor and \
+                (rospy.get_time() - node_gnss._start_time) > 30.0:
+            rospy.logwarn_throttle(
+                10.0, "[navi_transform] is_indoor=True %.0fs after start — map->odom "
+                "TF broadcast SUPPRESSED; verify a map loaded / rtabmap indoor "
+                "localization is publishing map->odom",
+                rospy.get_time() - node_gnss._start_time)
 
     def loop3sec(self, event=None):
         # NOTE the misleading name: this runs at 10 Hz (registered with

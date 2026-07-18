@@ -32,6 +32,7 @@ from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker
 import os
 import sys, time
+import json
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped
 from tf import TransformListener
 from vitulus_navi.srv import Point_pose, Point_poseResponse
@@ -39,6 +40,28 @@ from vitulus_navi.srv import Point_pose, Point_poseResponse
 from navi_man import mapdata
 sys.modules['mapdata'] = mapdata
 from mapdata import MapPoint, MapData, MapPath
+
+# --- site-bundle (mapping-v3 unification, WP-B) ---------------------------
+# Canonical per-garden waypoint/path store in ~/.vitulus/mapping_v3/<site>/ (UTM).
+# navi_man dual-writes to it on save and imports-if-newer on load; a total import
+# failure of the libs just disables the feature (legacy pickle world untouched).
+try:
+    from vitulus_mapping import bundle as _bundle, geo as _geo
+except Exception:
+    try:
+        sys.path.append('/home/vitulus/catkin_ws/src/vitulus/vitulus_mapping/src')
+        from vitulus_mapping import bundle as _bundle, geo as _geo
+    except Exception as _e:
+        _bundle = _geo = None
+        sys.stderr.write("navi_man: vitulus_mapping bundle/geo unavailable (%s); "
+                         "site-bundle sync disabled.\n" % _e)
+try:
+    from navi_man import bundle_sync as _bsync
+except Exception as _e:
+    _bsync = None
+    sys.stderr.write("navi_man: bundle_sync unavailable (%s); site-bundle sync "
+                     "disabled.\n" % _e)
+_BUNDLE_OK = (_bundle is not None and _geo is not None and _bsync is not None)
 
 
 class DockerConnection:
@@ -123,7 +146,11 @@ class Node:
 
         self.autopath_name = None
         self.autopath_last_pose = None
-        
+
+        # site-bundle link cache (recomputed on every active_map change, WP-B)
+        self._bundle_site = None
+        self._bundle_site_for = "\x00__unset__"
+
         self.map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
         self.map_coords = rospy.Publisher('navi_manager/map_coords', PoseStamped, queue_size=10)
         self.map_list_str_pub = rospy.Publisher('navi_manager/map_str_list', StringList, queue_size=10)
@@ -173,6 +200,7 @@ class Node:
         rospy.Subscriber("/navi_manager/new_map", String, self.callback_new_map)
         rospy.Subscriber("/navi_manager/speed", String, self.callback_speed)
         rospy.Subscriber("/navi_manager/save_waypoint", String, self.callback_save_waypoint)
+        rospy.Subscriber("/navi_manager/save_waypoint_at", String, self.callback_save_waypoint_at)
         rospy.Subscriber("/navi_manager/publish_point", String, self.callback_publish_point)
         rospy.Subscriber("/navi_manager/publish_point_pose", String, self.callback_publish_point_pose)
         rospy.Subscriber("/navi_manager/goal_point", String, self.callback_goal_point)
@@ -976,6 +1004,65 @@ class Node:
             rospy.loginfo("The name is empty!")
             self.nex_log_info_pub.publish("The name is empty!")
 
+    def callback_save_waypoint_at(self, msg):
+        # WP-D2 (map editor): save/update a waypoint at an EXPLICIT map-frame pose
+        # (x, y, yaw) supplied by the UI, instead of the robot's CURRENT pose like
+        # callback_save_waypoint. Same add-or-update + persist + status semantics;
+        # the MapPoint is built exactly like _build_map_point_from_spec (yaw-only
+        # quaternion, 'map' frame). Payload: std_msgs/String JSON
+        #   {"name": str, "x": float, "y": float, "yaw": float}
+        try:
+            spec = json.loads(msg.data)
+        except Exception as e:
+            self.status_msg_pub.publish("save_waypoint_at: bad JSON ({})".format(e))
+            rospy.logwarn("save_waypoint_at: bad JSON: %s", e)
+            return
+        name = str(spec.get('name', '')).strip()
+        if name == "":
+            self.status_msg_pub.publish("The name is empty!")
+            rospy.loginfo("The name is empty!")
+            self.nex_log_info_pub.publish("The name is empty!")
+            return
+        try:
+            x = float(spec['x'])
+            y = float(spec['y'])
+            yaw = float(spec.get('yaw', 0.0))
+        except (KeyError, TypeError, ValueError) as e:
+            self.status_msg_pub.publish("save_waypoint_at: bad pose ({})".format(e))
+            rospy.logwarn("save_waypoint_at: bad pose: %s", e)
+            return
+        # yaw-only quaternion (z = sin(yaw/2), w = cos(yaw/2)); computed inline so
+        # this never depends on the optional vitulus_mapping.geo import (_geo may
+        # be None if the bundle libs are unavailable).
+        qz = math.sin(yaw / 2.0)
+        qw = math.cos(yaw / 2.0)
+        pose = Pose(Point(x, y, 0.0), Quaternion(0.0, 0.0, qz, qw))
+        point = MapPoint(name, pose, 'map')
+        point_exist = self.running_map_data.get_map_point(name)
+        if not point_exist:
+            self.running_map_data.add_map_point(point)
+            self.save_running_map_data()
+            self.status_msg_pub.publish("New point {} added.".format(name))
+            rospy.loginfo("New point {} added.".format(name))
+            self.nex_log_info_pub.publish("Point {} added".format(name))
+        else:
+            point_index = -1
+            for i, point_item in enumerate(self.running_map_data.points):
+                if point_item.name == name:
+                    point_index = i
+            if point_index != -1:
+                self.running_map_data.points[point_index] = point
+            self.save_running_map_data()
+            self.status_msg_pub.publish("{} point changed.".format(name))
+            rospy.loginfo("{} point changed.".format(name))
+            self.nex_log_info_pub.publish("{} changed".format(name))
+        # refresh the name lists the UI reads so the new/moved point shows at once
+        # (matches the bundle-era _republish pattern; never let it break the save).
+        try:
+            self._republish_map_lists()
+        except Exception:
+            pass
+
     def callback_speed(self, msg):
         if msg.data == "SLOW":
             rospy.wait_for_service('/move_base_flex/TebLocalPlannerROS/set_parameters')
@@ -1107,11 +1194,180 @@ class Node:
     def save_running_map_data(self):
         with open('/home/vitulus/.ros/mapdata.pkl', 'wb') as output:
             pickle.dump(self.running_map_data, output, pickle.HIGHEST_PROTOCOL)
+        # site-bundle dual-write (WP-B): mirror waypoints/paths to the linked site
+        # bundle in canonical UTM. NEVER let a bundle failure break the legacy save.
+        self._export_bundle()
 
     def load_running_map_data(self):
         with open('/home/vitulus/.ros/mapdata.pkl', 'rb') as input:
             self.running_map_data = pickle.load(input)
+        # site-bundle import-if-newer (WP-B): if the linked site bundle is newer
+        # than the map's own saved pickle, rebuild points/paths from it (UTM->MAP).
+        # Any failure keeps the pickle contents (never brick a map load).
+        self._import_bundle_if_newer()
         self.set_map_utm_transform()
+
+    # ----------------------------------------------------------------------
+    # site-bundle sync (WP-B). Legacy pickle stays the runtime cache; the site
+    # bundle (~/.vitulus/mapping_v3/<site>/) is the canonical UTM store.
+    # ----------------------------------------------------------------------
+    def _active_map_pickle_path(self):
+        return "/home/vitulus/.vitulus/saves/maps_data/" + self.active_map + ".pkl"
+
+    def _bundle_site_for_active_map(self):
+        """Resolve the site whose manifest.navi_map == self.active_map. ~param
+        ~bundle_site overrides (empty=autodetect). Cached per active_map; logs
+        the resolution once per map. Returns site name or None (features off)."""
+        if not _BUNDLE_OK:
+            return None
+        am = self.active_map
+        if am == self._bundle_site_for:
+            return self._bundle_site
+        site = None
+        try:
+            override = rospy.get_param('~bundle_site', '')
+        except Exception:
+            override = ''
+        if override:
+            if _bundle.site_exists(override):
+                site = override
+            else:
+                rospy.logwarn("navi_man bundle: ~bundle_site='%s' set but no site "
+                              "dir under %s — bundle features off.",
+                              override, _bundle.SITES_ROOT)
+        else:
+            try:
+                for cand in _bundle.list_sites():
+                    m = _bundle.load_manifest(cand)
+                    if m and m.get('navi_map') == am:
+                        site = cand
+                        break
+            except Exception as e:
+                rospy.logwarn("navi_man bundle: site autodetect failed: %s", e)
+                site = None
+        self._bundle_site = site
+        self._bundle_site_for = am
+        if site:
+            rospy.loginfo("navi_man bundle: map '%s' linked to site '%s' (%s).",
+                          am, site, _bundle.site_dir(site))
+        else:
+            rospy.loginfo("navi_man bundle: no site linked to map '%s' — "
+                          "bundle export/import off for this map.", am)
+        return site
+
+    def _republish_map_lists(self):
+        # After a bundle import/export republish the waypoint/path name lists the
+        # UI reads (same publishers the slow loop uses).
+        try:
+            self.publish_map_point_list()
+            self.publish_map_point_str_list()
+            self.publish_map_path_list()
+        except Exception as e:
+            rospy.logwarn("navi_man bundle: republish map lists failed: %s", e)
+
+    def _export_bundle(self):
+        if not _BUNDLE_OK:
+            return
+        site = self._bundle_site_for_active_map()
+        if not site:
+            return
+        rmd = self.running_map_data
+        try:
+            if not rmd.is_utm():
+                rospy.logwarn_throttle(60.0, "navi_man bundle: active map has no UTM "
+                                       "datum yet — skipping bundle export.")
+                return
+            datum = _geo.from_pickle_datum(rmd)
+            wps = _bsync.map_points_to_waypoints(rmd.points, datum)
+            paths = _bsync.map_paths_to_paths(rmd.paths, datum)
+            _bundle.save_waypoints(site, wps)
+            _bundle.save_paths(site, paths)
+            rospy.loginfo_throttle(10.0, "navi_man bundle: exported %d waypoints + "
+                                   "%d paths to site '%s'.",
+                                   len(wps), len(paths), site)
+            self._republish_map_lists()
+        except Exception as e:
+            rospy.logwarn("navi_man bundle: export to site '%s' failed (legacy "
+                          "pickle still saved): %s", site, e)
+
+    def _bundle_datum_guard(self, site, pickle_datum):
+        # Informational only (plan §3): if the site datum.yaml disagrees with the
+        # map's pickle datum beyond 0.05 m / 2 mrad, warn ONCE per load. We NEVER
+        # auto-switch datum; the pickle datum drives the conversion.
+        try:
+            dp = os.path.join(_bundle.site_dir(site), 'datum.yaml')
+            if not os.path.exists(dp):
+                return
+            with open(dp) as f:
+                sd = yaml.safe_load(f)
+            if not sd:
+                return
+            site_datum = _geo.from_datum_yaml(sd)
+            exceeded, (de, dn, dalt, dyaw) = _bsync.datum_exceeds(pickle_datum,
+                                                                  site_datum)
+            if exceeded:
+                rospy.logwarn("navi_man bundle: DATUM MISMATCH site '%s' vs map "
+                              "pickle — dE=%.3fm dN=%.3fm dYaw=%.4frad "
+                              "(thr 0.05m/2mrad). Geometry converted with the "
+                              "PICKLE datum; no auto-switch (plan §3).",
+                              site, de, dn, dyaw)
+        except Exception as e:
+            rospy.logwarn("navi_man bundle: datum guard check failed: %s", e)
+
+    def _build_map_point_from_spec(self, spec):
+        q = _geo.yaw_to_quat(spec['yaw'])   # (x, y, z, w) pure yaw
+        pose = Pose(Point(spec['x'], spec['y'], spec['z']),
+                    Quaternion(0.0, 0.0, q[2], q[3]))
+        return MapPoint(spec['name'], pose, 'map')
+
+    def _build_map_path_from_spec(self, spec):
+        path = MapPath(spec['name'], 'map')
+        for ps in spec['poses']:
+            q = _geo.yaw_to_quat(ps['yaw'])
+            pose = Pose(Point(ps['x'], ps['y'], ps['z']),
+                        Quaternion(0.0, 0.0, q[2], q[3]))
+            path.add_pose(pose)
+        return path
+
+    def _import_bundle_if_newer(self):
+        if not _BUNDLE_OK:
+            return
+        site = self._bundle_site_for_active_map()
+        if not site:
+            return
+        try:
+            pkl_path = self._active_map_pickle_path()
+            pkl_mtime = os.path.getmtime(pkl_path) if os.path.exists(pkl_path) else 0.0
+            times = [t for t in (_bundle.file_mtime(site, 'waypoints'),
+                                 _bundle.file_mtime(site, 'paths')) if t is not None]
+            newest = max(times) if times else None
+            if newest is None or newest <= pkl_mtime:
+                return  # bundle absent or not newer -> keep pickle contents
+            rmd = self.running_map_data
+            if not rmd.is_utm():
+                rospy.logwarn("navi_man bundle: bundle newer than pickle for site "
+                              "'%s' but map has no UTM datum — cannot import; "
+                              "keeping pickle.", site)
+                return
+            datum = _geo.from_pickle_datum(rmd)
+            self._bundle_datum_guard(site, datum)
+            pt_specs = _bsync.waypoints_to_point_specs(
+                _bundle.load_waypoints(site), datum)
+            pa_specs = _bsync.paths_to_path_specs(
+                _bundle.load_paths(site), datum)
+            new_points = [self._build_map_point_from_spec(s) for s in pt_specs]
+            new_paths = [self._build_map_path_from_spec(s) for s in pa_specs]
+            rmd.points = new_points
+            rmd.paths = new_paths
+            rospy.loginfo("navi_man bundle: imported %d waypoints + %d paths from "
+                          "site '%s' (bundle newer than pickle by %.0fs); "
+                          "points: %s", len(new_points), len(new_paths), site,
+                          newest - pkl_mtime,
+                          ', '.join(p.name for p in new_points) or '-')
+            self._republish_map_lists()
+        except Exception as e:
+            rospy.logwarn("navi_man bundle: import from site '%s' failed — keeping "
+                          "pickle contents: %s", site, e)
 
     def save_map_utm_pose(self):
         if not self.running_map_data.is_utm():

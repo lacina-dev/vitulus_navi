@@ -67,6 +67,10 @@ class NavTfNode:
         self._heading_last_good = 0.0      # last time RTK heading was usable
         # tolerate brief heading dropouts (flapping); ~param (WP2), default unchanged
         self._heading_grace_s = float(rospy.get_param('~heading_grace_s', 3.0))
+        # RTK fix acceptance gates (see callback_gnss_fix); old hardcoded
+        # values were 0.000197 / 0.0001.
+        self._fix_cov_xy_max = float(rospy.get_param('~fix_cov_xy_max', 4.0e-4))
+        self._fix_cov_z_max = float(rospy.get_param('~fix_cov_z_max', 1.0e-3))
         self.nav_last_fused_time = 0
         self.fix_last_fused_time = 0
         self.imu_delay = 0
@@ -1279,9 +1283,16 @@ class NavTfNode:
     def callback_gnss_fix(self, msg):
         usable = False
         position_usable = False
-        if msg.position_covariance[8] <= 0.0001 \
-                and msg.position_covariance[0] <= 0.000197 \
-                and msg.position_covariance[4] <= 0.000197:
+        # Fix-acceptance covariance gates (2026-07-19 field fix): the old
+        # hardcoded xy<=0.000197 (hAcc 14.0mm) and z<=0.0001 (vAcc 10mm)
+        # rejected a genuine RTK FIXED evening fix (hAcc 14mm, vAcc 18mm) and
+        # starved GPS ownership entirely (owner=dr while both receivers were
+        # fixed). status==2 already guarantees an RTK fixed solution; the z
+        # accuracy is irrelevant for the XY anchor (and mapping z runs on DR-z
+        # now), so its gate is much looser. Both are ~params for field tuning.
+        if msg.position_covariance[8] <= self._fix_cov_z_max \
+                and msg.position_covariance[0] <= self._fix_cov_xy_max \
+                and msg.position_covariance[4] <= self._fix_cov_xy_max:
             if msg.status.status == 2:
                 # RTK position is ~1.4 cm here regardless of heading quality.
                 position_usable = True

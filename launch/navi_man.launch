@@ -15,6 +15,14 @@
         <node name="gloc_server" pkg="vitulus_navi" type="gloc_server" respawn="true" respawn_delay="2" output="log">
             <!-- EDT tracker localizes against the served mapping-v3 site raster -->
             <param name="map_topic" value="/mapping_manager/site_map"/>
+            <!-- 2026-07-19 INCIDENT: auto-relock teleported the pose 4.68 m on
+                 the new DIRECT raster — its sparse obstacle landscape inflates
+                 relative margins (337% on a false lock) and the baseline rms is
+                 ~3x higher than on band rasters, so the lost->relock chain is
+                 unsafe. DISABLED until the scorer is recalibrated for direct
+                 rasters with an ABSOLUTE quality gate + external corroboration
+                 (RTK/dock) for big-delta applies. -->
+            <param name="relock_enable" value="false"/>
         </node>
     </group>
 

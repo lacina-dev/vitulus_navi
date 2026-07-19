@@ -1444,6 +1444,8 @@ class Node:
             return
         site = self._bundle_site_for_active_map()
         if not site:
+            rospy.logwarn_throttle(60.0, "navi_man bundle: export skipped — no "
+                                   "site resolved (nothing served yet?).")
             return
         rmd = self.running_map_data
         try:
@@ -1713,12 +1715,24 @@ class Node:
             rmd.utm_orientation_y = 0.0
             rmd.utm_orientation_z = q[2]
             rmd.utm_orientation_w = q[3]
-            pt_specs = _bsync.waypoints_to_point_specs(
-                _bundle.load_waypoints(site), datum)
-            pa_specs = _bsync.paths_to_path_specs(
-                _bundle.load_paths(site), datum)
-            rmd.points = [self._build_map_point_from_spec(s) for s in pt_specs]
-            rmd.paths = [self._build_map_path_from_spec(s) for s in pa_specs]
+            # MISSING FILE = NO INFORMATION (2026-07-19 night fix): a fresh
+            # site has no waypoints/paths.geojson yet — wiping the in-memory
+            # points here is what erased the freshly auto-saved 'docked'
+            # waypoint. Replace only when the file actually exists.
+            wp_file = os.path.join(_bundle.site_dir(site), 'waypoints.geojson')
+            pa_file = os.path.join(_bundle.site_dir(site), 'paths.geojson')
+            if os.path.exists(wp_file):
+                pt_specs = _bsync.waypoints_to_point_specs(
+                    _bundle.load_waypoints(site), datum)
+                rmd.points = [self._build_map_point_from_spec(s) for s in pt_specs]
+            else:
+                rospy.loginfo("navi_man site-native: site '%s' has no "
+                              "waypoints.geojson yet — keeping %d in-memory "
+                              "point(s).", site, len(rmd.points))
+            if os.path.exists(pa_file):
+                pa_specs = _bsync.paths_to_path_specs(
+                    _bundle.load_paths(site), datum)
+                rmd.paths = [self._build_map_path_from_spec(s) for s in pa_specs]
             rospy.loginfo("navi_man site-native: imported %d waypoints + %d paths "
                           "from served site '%s' (datum utm=(%.2f, %.2f) yaw=%.4f). "
                           "Waypoints: %s", len(rmd.points), len(rmd.paths), site,

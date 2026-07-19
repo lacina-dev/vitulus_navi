@@ -5,7 +5,12 @@
 # robot in it immediately (no GPS needed). The map MUST contain the "docked"
 # waypoint (be docked + localized, then publish "docked" to /navi_manager/save_waypoint
 # and SAVE the map).
-load_map_on_start: "GARDEN_2026***env*OUTDOOR"
+#
+# RETIRED (delegacy 2026-07-19): legacy navi maps must NOT be USED anywhere — the
+# robot boots purely on the mapping-v3 served-site world (see legacy_maps below).
+# COMMENTED OUT so it is never loaded. To ROLL BACK the retirement: UNCOMMENT this
+# line AND set legacy_maps: true.
+# load_map_on_start: "GARDEN_2026***env*OUTDOOR"
 
 # When loading a map (at boot AND from the UI), also start the rtabmap docker
 # container in LOCALIZATION mode on it.
@@ -50,3 +55,24 @@ map_source_on_start: "octomap"
 # !!! post-flip verification checklist live in vitulus_navi/SITE_BUNDLE_PLAN.md
 # !!! ("Site-native flip"). Rollback = set back to false (no data migration).
 site_native: true
+
+# ============================================================================
+# LEGACY-MAPS RETIREMENT  (delegacy 2026-07-19, user directive)
+# ============================================================================
+# false (DEFAULT + set here per the directive): the robot boots and runs PURELY
+# on the mapping-v3 served-site world. NO legacy navi map is loaded — navi_man
+# SKIPS load_map_on_start entirely, sets active_map='SITE' (OUTDOOR), starts the
+# localization launch directly, and takes waypoints/paths/datum from the
+# CURRENTLY SERVED site's bundle (/mapping_manager/status -> serving.site). If no
+# site is served at boot, running_map_data is EMPTY (a one-line warn) and the
+# dock 'docked' seed retries until a site + its 'docked' waypoint arrive; the
+# robot runs odom-frame (GPS owns map->odom via navi_transform's own
+# site_datum.yaml fallback) until then.
+#
+# true = ROLLBACK to the legacy path: load_map_on_start is honoured again (also
+# UNCOMMENT that line above), bundle site is resolved by manifest.navi_map ==
+# active_map, and the map pickle supplies waypoints + datum. Byte-for-byte the
+# pre-delegacy behaviour.
+#
+# NOTE: assumes site_native: true and rtabmap_on_start: false (both set above).
+legacy_maps: false

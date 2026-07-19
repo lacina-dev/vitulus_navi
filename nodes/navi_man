@@ -151,6 +151,21 @@ class Node:
         self._bundle_site = None
         self._bundle_site_for = "\x00__unset__"
 
+        # --- legacy-maps retirement (site-native boot, delegacy 2026-07-19) ----
+        # legacy_maps=False (default): NO legacy navi map is loaded at boot; the
+        # runtime waypoint/path/datum authority is the currently SERVED mapping-v3
+        # site (from /mapping_manager/status serving.site). active_map is the
+        # constant 'SITE'. legacy_maps=True restores the load_map_on_start path
+        # (rollback). Set for real right after load_manager_config() below; the
+        # attribute is defaulted here so latched-callback races never AttributeError.
+        self._legacy_maps = False
+        # Currently served mapping-v3 site (name) tracked from /mapping_manager/
+        # status. None until a site is served. Drives the bundle site resolution
+        # + waypoint import in site-native mode. Set by callback_mapping_status.
+        self._served_site = None
+        self._served_site_warned = False   # one-time "no site served at boot" warn
+        self._nomap_coords_warned = False  # one-time "no georef -> map_coords muted"
+
         # --- site-native mode (flag-gated, DEFAULT OFF) -----------------------
         # Set for real from navi_manager.yaml right after load_manager_config()
         # below; defaulted here so the attribute always exists (latched-callback
@@ -242,6 +257,12 @@ class Node:
         # /navi_manager/map (same latched semantics the costmap static layer +
         # planner already depend on).
         rospy.Subscriber("/mapping_manager/site_map", OccupancyGrid, self.callback_site_map)
+        # Currently SERVED mapping-v3 site (delegacy 2026-07-19): latched JSON
+        # status from mapping_manager. In site-native mode (legacy_maps=False) the
+        # serving.site field selects the bundle whose waypoints/paths/datum are the
+        # runtime authority. Latched, so a boot-time serving state reaches us on
+        # connect and drives the initial waypoint import.
+        rospy.Subscriber("/mapping_manager/status", String, self.callback_mapping_status)
         rospy.Subscriber("/web_plan/map_edited", OccupancyGrid, self.callback_web_plan_map)
         rospy.Subscriber("/navi_manager/show_map", String, self.callback_web_plan_show_map)
         rospy.Subscriber("/navi_manager/rtabmap_settings_set", Rtabmap_settings, self.callback_rtabmap_settings_set)
@@ -299,8 +320,15 @@ class Node:
             rospy.logwarn("navi_man: site_native=TRUE — mapping-v3 site mode "
                           "(boot map source forced 'octomap', map->odom georef "
                           "from site datum.yaml, rtabmap .db copy skipped on load).")
+        # legacy-maps retirement gate (delegacy 2026-07-19). DEFAULT False ->
+        # site-native boot (no legacy navi map; runtime authority is the served
+        # mapping-v3 site). True -> restore the load_map_on_start path (rollback).
+        self._legacy_maps = bool(self.params.get('legacy_maps', False))
 
-        if self.params['load_map_on_start'] == '':
+        if not self._legacy_maps:
+            # ---- SITE-NATIVE BOOT (no legacy navi map) -----------------------
+            self._site_native_boot()
+        elif self.params.get('load_map_on_start', '') == '':
             self.map_name = "INIT"
             map_msg = String(self.map_name)
             self.callback_new_map(map_msg)
@@ -1245,6 +1273,18 @@ class Node:
 
     def publish_map_coords(self):
         if not self.indoor:
+            # site-native (legacy_maps=False): with NO served site datum there is no
+            # map->odom georef to publish. Stay SILENT (task §5) — navi_transform
+            # then runs odom-frame only: GPS owns map->odom via its own
+            # ~/.vitulus/saves/site_datum.yaml fallback, and the dock seed anchors
+            # locally. Publishing zeros here would be a false "identity georef".
+            if not self._legacy_maps and not self.running_map_data.is_utm():
+                if not self._nomap_coords_warned:
+                    rospy.logwarn("navi_man site-native: no served site datum — "
+                                  "NOT publishing /navi_manager/map_coords "
+                                  "(odom-frame only until a site is served).")
+                    self._nomap_coords_warned = True
+                return
             # Georef datum for map->odom (pickle datum by default; site datum.yaml
             # under site_native). navi_transform.callback_map_coords differences
             # utm->odom against this to build the live map->odom transform.
@@ -1341,6 +1381,18 @@ class Node:
         the resolution once per map. Returns site name or None (features off)."""
         if not _BUNDLE_OK:
             return None
+        # site-native (legacy_maps=False, delegacy 2026-07-19): the bundle site is
+        # the CURRENTLY SERVED mapping-v3 site (from /mapping_manager/status), NOT a
+        # manifest.navi_map match against active_map (which is the constant 'SITE').
+        # ~bundle_site still overrides. No caching needed — _served_site is cheap.
+        if not self._legacy_maps:
+            try:
+                override = rospy.get_param('~bundle_site', '')
+            except Exception:
+                override = ''
+            if override:
+                return override if _bundle.site_exists(override) else None
+            return self._served_site
         am = self.active_map
         if am == self._bundle_site_for:
             return self._bundle_site
@@ -1548,6 +1600,143 @@ class Node:
         except Exception as e:
             rospy.logwarn("navi_man bundle: import from site '%s' failed — keeping "
                           "pickle contents: %s", site, e)
+
+    # ----------------------------------------------------------------------
+    # site-native boot + served-site bundle authority (delegacy 2026-07-19)
+    # ----------------------------------------------------------------------
+    def _site_native_boot(self):
+        """Boot WITHOUT any legacy navi map (legacy_maps=False). Reproduce the
+        one side effect of callback_load_map(init) that must survive — starting
+        the localization launch — then leave running_map_data EMPTY until the
+        served mapping-v3 site's bundle supplies waypoints/paths (see
+        callback_mapping_status / _import_served_site_bundle).
+
+        active_map is the constant 'SITE'; is_indoor defaults OUTDOOR (there is
+        no map name to derive it from). Datum comes from the served site only
+        (publish_map_coords stays muted until then; navi_transform runs odom-frame
+        with its own site_datum.yaml / GPS-owns fallback in the meantime)."""
+        self.active_map = "SITE"
+        self.indoor = False          # OUTDOOR default (no ***env* suffix to split)
+        self.map_name = "SITE"
+        rospy.logwarn("navi_man: legacy_maps=FALSE — SITE-NATIVE boot: no navi map "
+                      "loaded; active_map='SITE', OUTDOOR. Starting localization "
+                      "launch directly; waypoints/paths/datum come from the served "
+                      "mapping-v3 site bundle.")
+        # Start the localization stack (same args callback_load_map(init) uses).
+        if self.params.get('rtabmap_on_start', False):
+            self.start_navi_launch(["localization:=true_rtabmap"])
+        else:
+            self.start_navi_launch(["localization:=true"])
+        # running_map_data is already an empty MapData("new"). If a site is already
+        # being served (latched status delivered on subscribe), import it now;
+        # otherwise callback_mapping_status imports when serving arrives.
+        if self._served_site:
+            self._import_served_site_bundle()
+        else:
+            rospy.logwarn("navi_man: no site served at boot — waypoints unavailable "
+                          "until a site is served (the dock 'docked' seed logs "
+                          "ACTION-NEEDED and retries; it lands once the site + its "
+                          "'docked' waypoint arrive).")
+            self._served_site_warned = True
+
+    def callback_mapping_status(self, msg):
+        """Track the currently SERVED mapping-v3 site from /mapping_manager/status
+        (latched JSON: {... , 'serving': {'site','raster','mtime'} | null}). On a
+        serving-site CHANGE (site-native mode only), swap the bundle authority:
+        invalidate caches and re-import the served site's waypoints/paths + datum,
+        then republish. Legacy_maps=True -> tracked but never drives the map."""
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        serving = data.get('serving') or {}
+        site = serving.get('site') if isinstance(serving, dict) else None
+        if site == self._served_site:
+            return                       # unchanged
+        prev = self._served_site
+        self._served_site = site
+        # Invalidate the per-active_map caches (active_map is the constant 'SITE',
+        # so they would otherwise never refresh across a serving-site change).
+        self._bundle_site_for = "\x00__unset__"
+        self._georef_vals_for = "\x00__unset__"
+        self._georef_vals_cache = None
+        self._nomap_coords_warned = False
+        rospy.logwarn("navi_man: served site changed %r -> %r.", prev, site)
+        if self._legacy_maps:
+            return                       # legacy path owns the map; do not touch
+        if site:
+            self._import_served_site_bundle()
+        else:
+            # site un-served (e.g. fresh site being mapped): drop waypoints so we
+            # never serve a stale dock anchor; running odom-frame until re-served.
+            self.running_map_data.points = []
+            self.running_map_data.paths = []
+            self.running_map_data.utm_x = 0
+            self.running_map_data.utm_y = 0
+            self.running_map_data.utm_z = 0
+            rospy.logwarn("navi_man site-native: no site served now — cleared "
+                          "waypoints/paths + datum (odom-frame only).")
+            self._republish_map_lists()
+
+    def _import_served_site_bundle(self):
+        """Load the served site's waypoints/paths from its bundle into
+        running_map_data (UTM -> MAP via the site datum.yaml), populate the
+        running datum so is_utm()/georef work, and warm-cache the pickle. Fully
+        guarded: any failure leaves running_map_data as-is + a warn (never bricks
+        boot). Site-native only."""
+        if not _BUNDLE_OK:
+            rospy.logwarn("navi_man site-native: vitulus_mapping bundle/geo libs "
+                          "unavailable — cannot import served site waypoints.")
+            return
+        site = self._served_site
+        if not site:
+            return
+        try:
+            dp = os.path.join(_bundle.site_dir(site), 'datum.yaml')
+            if not os.path.exists(dp):
+                rospy.logwarn("navi_man site-native: served site '%s' has no "
+                              "datum.yaml yet — cannot place waypoints; keeping "
+                              "empty (odom-frame). Import retries when it appears.",
+                              site)
+                return
+            with open(dp) as f:
+                sd = yaml.safe_load(f)
+            datum = _geo.from_datum_yaml(sd)
+            rmd = self.running_map_data
+            # Populate the running datum from the SITE datum so is_utm() is True and
+            # _georef_datum_values (site_native branch) resolves consistently.
+            rmd.utm_x = datum['utm_e']
+            rmd.utm_y = datum['utm_n']
+            rmd.utm_z = datum.get('alt', 0.0)
+            q = _geo.yaw_to_quat(datum['yaw_rad'])     # (x, y, z, w) pure yaw
+            rmd.utm_orientation_x = 0.0
+            rmd.utm_orientation_y = 0.0
+            rmd.utm_orientation_z = q[2]
+            rmd.utm_orientation_w = q[3]
+            pt_specs = _bsync.waypoints_to_point_specs(
+                _bundle.load_waypoints(site), datum)
+            pa_specs = _bsync.paths_to_path_specs(
+                _bundle.load_paths(site), datum)
+            rmd.points = [self._build_map_point_from_spec(s) for s in pt_specs]
+            rmd.paths = [self._build_map_path_from_spec(s) for s in pa_specs]
+            rospy.loginfo("navi_man site-native: imported %d waypoints + %d paths "
+                          "from served site '%s' (datum utm=(%.2f, %.2f) yaw=%.4f). "
+                          "Waypoints: %s", len(rmd.points), len(rmd.paths), site,
+                          datum['utm_e'], datum['utm_n'], datum['yaw_rad'],
+                          ', '.join(p.name for p in rmd.points) or '-')
+            # Warm cache: mirror to ~/.ros/mapdata.pkl so a crash BEFORE the next
+            # serving keeps the last state. Bare pickle dump (NOT save_running_map_data
+            # — that would re-export the bundle we just imported).
+            try:
+                with open('/home/vitulus/.ros/mapdata.pkl', 'wb') as out:
+                    pickle.dump(rmd, out, pickle.HIGHEST_PROTOCOL)
+            except Exception as e:
+                rospy.logwarn("navi_man site-native: warm-cache pickle write "
+                              "failed (non-fatal): %s", e)
+            self._republish_map_lists()
+        except Exception as e:
+            rospy.logwarn("navi_man site-native: import from served site '%s' "
+                          "failed — keeping current running_map_data: %s", site, e)
 
     def save_map_utm_pose(self):
         if not self.running_map_data.is_utm():

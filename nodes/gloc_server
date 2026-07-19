@@ -249,6 +249,37 @@ class GlocServer(object):
         self._rms_baseline = None      # measured good-match rms (None = uncalibrated)
         self._grid_key = None          # (h, w, ox, oy) — new key invalidates baseline
         self._docked = False           # /dock_smach/dock_status == 0 (corroboration)
+        # ---- SCAN-OVERLAP GATE ON BASELINE CAPTURE (PROTOCOL 2026-07-19) -------
+        # KNOWN FLAW (pre-protocol): the baseline EMA captured whenever a trusted
+        # anchor (gps_good OR docked) held, INCLUDING when the live scan did NOT
+        # overlap the mapped area (e.g. docked on a fresh map before it covers the
+        # dock, or facing unmapped space) — the align rms then reflects
+        # nothing-to-match (~cap) and contaminated the baseline toward ~0.9. FIX:
+        # only capture the baseline when the scan actually corresponds to mapped
+        # structure — overlap_frac (fraction of aligned scan points whose EDT
+        # distance is below track_overlap_dist_m) must exceed track_overlap_min.
+        # overlap_frac is computed in _track_align and published in track_status.
+        self.track_overlap_dist_m = float(rospy.get_param(
+            '~track_overlap_dist_m', 1.0))
+        self.track_overlap_min = float(rospy.get_param(
+            '~track_overlap_min', 0.5))
+        # ---- PER-MAP BASELINE PERSISTENCE (PROTOCOL 2026-07-19) ---------------
+        # After a fresh baseline stabilises over baseline_publish_after_n DOCKED
+        # captures on the served raster, publish it (latched, JSON) on
+        # /gloc/baseline so mapping_manager can persist it into the serving
+        # site's site_config.json. On serve, mapping_manager republishes it on
+        # /mapping_manager/track_baseline and we SEED self._rms_baseline from it
+        # at map load — every later boot then starts calibrated instead of
+        # re-learning the raster's scale from scratch.
+        self.baseline_publish_after_n = int(rospy.get_param(
+            '~baseline_publish_after_n', 10))
+        self._baseline_dock_captures = 0   # docked captures on the current raster
+        self._baseline_published_key = None  # grid_key already published to avoid spam
+        self._baseline_seed = None         # seed rms from /mapping_manager/track_baseline
+        self._baseline_seed_raster = None  # raster the seed belongs to ('site/raster')
+        self._serving_site = None          # from /mapping_manager/status
+        self._serving_raster = None
+        self._last_overlap_frac = None     # last measured overlap (for baseline pub)
         # URGENT-CORR bypass (2026-07-12, prevention): the smoothing gates (2-tick
         # persistence + EMA + deadband) must not STARVE corrections during motion.
         # When the smoothed correction is large (|corr| > track_urgent_corr_m) that
@@ -345,6 +376,15 @@ class GlocServer(object):
                                               PoseStamped, queue_size=1)
         self.pub_track_status = rospy.Publisher('/gloc/track_status', String,
                                                 queue_size=1, latch=True)
+        # PER-MAP BASELINE PERSISTENCE: publish a stabilised docked baseline for
+        # mapping_manager to persist; subscribe to the seed it republishes on
+        # serve, and to its status to learn the serving site/raster name.
+        self.pub_baseline = rospy.Publisher('/gloc/baseline', String,
+                                            queue_size=1, latch=True)
+        rospy.Subscriber('/mapping_manager/track_baseline', String,
+                         self._cb_track_baseline, queue_size=1)
+        rospy.Subscriber('/mapping_manager/status', String,
+                         self._cb_mm_status, queue_size=1)
         rospy.Subscriber(self.scan_topic, LaserScan,
                          lambda m: setattr(self, '_last_scan', m), queue_size=1)
         # ENGAGE FAST (2026-07-12, correctness-first): the tracker must take over
@@ -387,6 +427,75 @@ class GlocServer(object):
     def _set_status(self, s):
         self.pub_status.publish(String(s))
 
+    # ---- per-map baseline persistence ----------------------------------------
+
+    def _cb_mm_status(self, msg):
+        """Learn the serving site/raster name from mapping_manager so a published
+        baseline can be tagged with the raster it belongs to."""
+        try:
+            d = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        serving = d.get('serving') or {}
+        self._serving_site = serving.get('site')
+        self._serving_raster = serving.get('raster')
+
+    def _cb_track_baseline(self, msg):
+        """SEED the rms baseline from the value mapping_manager persisted for the
+        served raster (republished latched on serve). Applied immediately if a
+        grid is already loaded and no baseline has been measured yet; otherwise
+        cb_grid applies it when the matching grid loads. Empty payload clears the
+        seed (raster with no stored baseline -> self-calibrate from scratch)."""
+        try:
+            d = json.loads(msg.data) if msg.data.strip() else {}
+        except (ValueError, TypeError):
+            return
+        rms = d.get('rms_baseline')
+        if rms is None:
+            self._baseline_seed = None
+            self._baseline_seed_raster = None
+            return
+        try:
+            self._baseline_seed = float(rms)
+        except (TypeError, ValueError):
+            self._baseline_seed = None
+            return
+        self._baseline_seed_raster = d.get('raster')
+        with self._lock:
+            if self._grid is not None and self._rms_baseline is None:
+                self._rms_baseline = self._baseline_seed
+                seeded = True
+            else:
+                seeded = False
+        if seeded:
+            rospy.loginfo('[gloc] rms baseline SEEDED from persisted %.3f '
+                          '(raster %s)', self._baseline_seed,
+                          self._baseline_seed_raster)
+
+    def _maybe_publish_baseline(self):
+        """Publish the stabilised baseline once it has been refined over
+        baseline_publish_after_n DOCKED captures on the served raster, so
+        mapping_manager persists it. Idempotent per grid_key."""
+        if (self._rms_baseline is None or self._serving_raster is None
+                or self._grid_key is None
+                or self._baseline_dock_captures < self.baseline_publish_after_n
+                or self._grid_key == self._baseline_published_key):
+            return
+        payload = {'rms_baseline': round(float(self._rms_baseline), 4),
+                   'overlap_frac': (None if self._last_overlap_frac is None
+                                    else round(self._last_overlap_frac, 3)),
+                   'site': self._serving_site,
+                   'raster': self._serving_raster}
+        self.pub_baseline.publish(String(json.dumps(payload)))
+        self._baseline_published_key = self._grid_key
+        rospy.loginfo('[gloc] baseline PUBLISHED for %s/%s: rms %.3f overlap %s '
+                      '(%d docked captures) -> /gloc/baseline',
+                      self._serving_site, self._serving_raster,
+                      self._rms_baseline,
+                      ('%.2f' % self._last_overlap_frac)
+                      if self._last_overlap_frac is not None else 'n/a',
+                      self._baseline_dock_captures)
+
     # ---- map ------------------------------------------------------------------
 
     def cb_grid(self, msg):
@@ -406,6 +515,8 @@ class GlocServer(object):
                 self._grid_stamp = None
                 self._rms_baseline = None   # raster gone -> baseline invalid
                 self._grid_key = None
+                self._baseline_dock_captures = 0
+                self._baseline_published_key = None
             if had:
                 rospy.logwarn('[gloc] served map cleared (empty grid — fresh site '
                               'being mapped); tracker -> no_map until a map is '
@@ -445,6 +556,16 @@ class GlocServer(object):
             if key != self._grid_key:
                 self._grid_key = key
                 self._rms_baseline = None
+                self._baseline_dock_captures = 0
+                self._baseline_published_key = None
+                # SEED from a persisted baseline (mapping_manager republished it
+                # on serve) so a booted-calibrated map starts with the right
+                # poor_match/lost scale before self-calibration refines it.
+                if self._baseline_seed is not None:
+                    self._rms_baseline = self._baseline_seed
+                    rospy.loginfo('[gloc] rms baseline seeded %.3f on map load '
+                                  '(persisted, raster %s)', self._baseline_seed,
+                                  self._baseline_seed_raster)
         if self._last_result is None:
             self._set_status('idle')
         rospy.loginfo('[gloc] map %dx%d @ %.2f m updated (occ %d, free %d)',
@@ -597,7 +718,7 @@ class GlocServer(object):
             _, _, res, ox, oy, h, w = self._grid
         x, y, th = pose0
         n_used = 0
-        best = None            # (rms, pose) — return the best iterate: near
+        best = None            # (rms, pose, overlap) — return the best iterate: near
         first_eigs = None      # convergence the on-ridge EDT gradients
         #                        collapse and a raw GN step OSCILLATES
         for it in range(self.track_max_iter):
@@ -616,8 +737,13 @@ class GlocServer(object):
             r, gx, gy = r[use], gx[use], gy[use]
             px, py = pts_base[use, 0], pts_base[use, 1]
             rms = float(np.sqrt(np.mean(r ** 2)))
+            # SCAN OVERLAP: fraction of aligned (in-map) scan points that fall
+            # within track_overlap_dist_m of mapped structure. Near 0 = the scan
+            # does not correspond to the map (nothing to match); near 1 = the
+            # scan sits on mapped geometry. Gates the baseline capture.
+            ov = float(np.mean(r < self.track_overlap_dist_m))
             if best is None or rms < best[0]:
-                best = (rms, (x, y, th))
+                best = (rms, (x, y, th), ov)
             dth = gx * (-s * px - c * py) + gy * (c * px - s * py)
             J = np.stack([gx, gy, dth], axis=1)
             H = J.T @ J
@@ -644,8 +770,9 @@ class GlocServer(object):
             th += delta[2]
             if dnorm < 0.002 and abs(delta[2]) < 1e-4:
                 break
-        rms, pose = best
+        rms, pose, overlap_frac = best
         return {'pose': pose, 'rms': rms, 'n': n_used,
+                'overlap_frac': overlap_frac,
                 'eig_min': float(first_eigs[0]), 'eig_max': float(first_eigs[1])}
 
     def _bigcorr_reset(self):
@@ -908,13 +1035,23 @@ class GlocServer(object):
                          'is_standstill': self._is_standstill,
                          'docked': self._docked})
             eig_ok = out['eig_min'] >= self.track_min_eig_frac * out['n']
+            overlap_frac = out.get('overlap_frac')
+            self._last_overlap_frac = overlap_frac
+            info['overlap_frac'] = (None if overlap_frac is None
+                                    else round(overlap_frac, 3))
             # (1) SELF-CALIBRATING RMS BASELINE: while a TRUSTED anchor holds the
             # pose (gps_good OR docked) and the match is healthy (eig ok, the
             # align did NOT run off toward an alias), capture this raster's
             # expected good-match rms into an EMA. This is what recalibrates the
             # poor_match/lost gate for the sparse DIRECT raster without any
             # hardcoding — it is measured live at the actual location.
-            if ((self._gps_good or self._docked) and eig_ok
+            # PROTOCOL 2026-07-19: ALSO require SCAN OVERLAP (overlap_frac >
+            # track_overlap_min) so a trusted anchor holding over UNMAPPED space
+            # (scan does not match the raster) can no longer contaminate the
+            # baseline toward the cap (~0.9) — the tonight contamination fix.
+            overlap_ok = (overlap_frac is not None
+                          and overlap_frac > self.track_overlap_min)
+            if ((self._gps_good or self._docked) and eig_ok and overlap_ok
                     and dx <= self.track_max_corr_m):
                 if self._rms_baseline is None:
                     self._rms_baseline = out['rms']
@@ -922,6 +1059,12 @@ class GlocServer(object):
                     a = self.track_baseline_alpha
                     self._rms_baseline = ((1.0 - a) * self._rms_baseline
                                           + a * out['rms'])
+                # PER-MAP PERSISTENCE: count DOCKED calibration captures on the
+                # served raster; once stabilised, publish for mapping_manager.
+                if self._docked:
+                    self._baseline_dock_captures += 1
+                    self._maybe_publish_baseline()
+            info['baseline_dock_captures'] = self._baseline_dock_captures
             eff_max_rms = self._effective_max_rms()
             info['rms_baseline'] = (None if self._rms_baseline is None
                                     else round(self._rms_baseline, 3))

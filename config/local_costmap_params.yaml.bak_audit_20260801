@@ -1,10 +1,5 @@
 local_costmap:
-  # AUDIT A19 (2026-08-01): rolling window anchored in odom (standard), was
-  # 'map' — every map->odom correction (gloc/dock/GPS re-anchor) shifted the
-  # window against live obstacles; implicated in pose-jump incidents. The
-  # map-framed static sources are TF-transformed by their layers, so content
-  # is unaffected. ROLLBACK: set back to 'map' + restart navi launch.
-  global_frame: odom
+  global_frame: map
   robot_base_frame: base_link
   update_frequency: 10.0
   publish_frequency: 6.0
@@ -51,12 +46,6 @@ local_costmap:
     subscribe_to_updates: true
     track_unknown_space: false
     use_maximum: true
-    # AUDIT A16 (2026-08-01): the source node publishes graded costs (inflation
-    # 1-99 + gradual decay 100->0 in steps of 5). The default trinary_costmap
-    # mapped everything <100 to FREE, so the whole gradient was discarded and
-    # an obstacle vanished after the FIRST decay step. False = pass the
-    # gradient through (linear scaling to costmap costs).
-    trinary_costmap: false
 
   base_static_layer:
     map_topic: /navi_manager/map
@@ -69,6 +58,4 @@ local_costmap:
     subscribe_to_updates: true
     track_unknown_space: false
     use_maximum: true
-    # AUDIT A16: see lidar_costmap_layer.
-    trinary_costmap: false
 

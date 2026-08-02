@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import pickle
-import threading
 import shutil
 import signal
 from os import listdir
@@ -16,9 +15,6 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import NavSatFix
-from sensor_msgs.msg import LaserScan
-import math
-import numpy as np
 from std_msgs.msg import Bool
 from std_srvs.srv import Empty, EmptyResponse
 from interactive_markers.interactive_marker_server import *
@@ -33,7 +29,6 @@ from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker
 import os
 import sys, time
-import json
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped
 from tf import TransformListener
 from vitulus_navi.srv import Point_pose, Point_poseResponse
@@ -41,28 +36,6 @@ from vitulus_navi.srv import Point_pose, Point_poseResponse
 from navi_man import mapdata
 sys.modules['mapdata'] = mapdata
 from mapdata import MapPoint, MapData, MapPath
-
-# --- site-bundle (mapping-v3 unification, WP-B) ---------------------------
-# Canonical per-garden waypoint/path store in ~/.vitulus/mapping_v3/<site>/ (UTM).
-# navi_man dual-writes to it on save and imports-if-newer on load; a total import
-# failure of the libs just disables the feature (legacy pickle world untouched).
-try:
-    from vitulus_mapping import bundle as _bundle, geo as _geo
-except Exception:
-    try:
-        sys.path.append('/home/vitulus/catkin_ws/src/vitulus/vitulus_mapping/src')
-        from vitulus_mapping import bundle as _bundle, geo as _geo
-    except Exception as _e:
-        _bundle = _geo = None
-        sys.stderr.write("navi_man: vitulus_mapping bundle/geo unavailable (%s); "
-                         "site-bundle sync disabled.\n" % _e)
-try:
-    from navi_man import bundle_sync as _bsync
-except Exception as _e:
-    _bsync = None
-    sys.stderr.write("navi_man: bundle_sync unavailable (%s); site-bundle sync "
-                     "disabled.\n" % _e)
-_BUNDLE_OK = (_bundle is not None and _geo is not None and _bsync is not None)
 
 
 class DockerConnection:
@@ -114,11 +87,6 @@ class Node:
         self.save_map_msg = String()
         self.remove_map_msg = String()
         self.edit_map_msg = String()
-        # AUDIT M8 (2026-08-01): serialize running_map_data clear/refill
-        # (callbacks) vs the 30 Hz georef read (publish_map_coords) — a
-        # half-cleared datum must never leave the node as a live georef.
-        self._map_data_lock = threading.Lock()
-
         self.active_map = "New"
         self.map_status = "Loading"
         self.last_odom_gps_stamp = rospy.Time.now()
@@ -152,42 +120,11 @@ class Node:
 
         self.autopath_name = None
         self.autopath_last_pose = None
-
-        # site-bundle link cache (recomputed on every active_map change, WP-B)
-        self._bundle_site = None
-        self._bundle_site_for = "\x00__unset__"
-
-        # --- legacy-maps retirement (site-native boot, delegacy 2026-07-19) ----
-        # legacy_maps=False (default): NO legacy navi map is loaded at boot; the
-        # runtime waypoint/path/datum authority is the currently SERVED mapping-v3
-        # site (from /mapping_manager/status serving.site). active_map is the
-        # constant 'SITE'. legacy_maps=True restores the load_map_on_start path
-        # (rollback). Set for real right after load_manager_config() below; the
-        # attribute is defaulted here so latched-callback races never AttributeError.
-        self._legacy_maps = False
-        # Currently served mapping-v3 site (name) tracked from /mapping_manager/
-        # status. None until a site is served. Drives the bundle site resolution
-        # + waypoint import in site-native mode. Set by callback_mapping_status.
-        self._served_site = None
-        self._served_site_warned = False   # one-time "no site served at boot" warn
-        self._nomap_coords_warned = False  # one-time "no georef -> map_coords muted"
-
-        # --- site-native mode (flag-gated, DEFAULT OFF) -----------------------
-        # Set for real from navi_manager.yaml right after load_manager_config()
-        # below; defaulted here so the attribute always exists (latched-callback
-        # / load_map(init) races). See _georef_datum_values / callback_load_map.
-        self._site_native = False
-        # georef-datum resolver cache (recomputed on every active_map change):
-        #   None  -> use the map pickle datum (legacy / flag-off, byte-identical)
-        #   tuple -> (utm_x, utm_y, utm_z, ox, oy, oz, ow) from the SITE datum.yaml
-        self._georef_vals_cache = None
-        self._georef_vals_for = "\x00__unset__"
-        self._sitenative_dbskip_logged = False
-
+        
         self.map_list_pub = rospy.Publisher('navi_manager/map_list', String, queue_size=10)
         self.map_coords = rospy.Publisher('navi_manager/map_coords', PoseStamped, queue_size=10)
         self.map_list_str_pub = rospy.Publisher('navi_manager/map_str_list', StringList, queue_size=10)
-        # AUDIT M12: waypoint_list_pub removed (never published, no consumer)
+        self.waypoint_list_pub = rospy.Publisher('navi_manager/waypoint_list', Path, queue_size=10)
         self.status_msg_pub = rospy.Publisher('navi_manager/status', String, queue_size=10)
         self.map_point_pub = rospy.Publisher('navi_manager/map_point', Marker, queue_size=10)
         self.map_point_pose_pub = rospy.Publisher('navi_manager/map_point_pose', PoseStamped, queue_size=10)
@@ -195,12 +132,10 @@ class Node:
         self.map_point_str_list_pub = rospy.Publisher('navi_manager/map_point_str_list', StringList, queue_size=10)
         self.map_path_list_pub = rospy.Publisher('navi_manager/map_path_list', String, queue_size=10)
         self.map_path_str_list_pub = rospy.Publisher('navi_manager/map_path_str_list', StringList, queue_size=10)
-        # WP map editor V3: latched JSON snapshot of waypoints + paths (map frame)
-        # for the editor overlay's toggleable groups (see publish_map_objects).
-        self.map_objects_pub = rospy.Publisher('navi_manager/map_objects', String, queue_size=1, latch=True)
         self.map_path_pub = rospy.Publisher('navi_manager/map_path', Path, queue_size=10)
         self.map_path_goal_arr_pub = rospy.Publisher('/move_base_smach/exe_path', Path, queue_size=10)
         self.map_goal_pub = rospy.Publisher('/move_base_smach/goal', PoseStamped, queue_size=10)
+        self.pose_cov_stamped_pub = rospy.Publisher('pose_cov_stamped', PoseWithCovarianceStamped, queue_size=10)
         self.pub_active_map = rospy.Publisher('navi_manager/active_map', String, queue_size=10, latch=False)
         self.pub_map_status = rospy.Publisher('navi_manager/map_status', String, queue_size=10, latch=False)
         self.is_rtabmap_pub = rospy.Publisher('navi_manager/is_rtabmap', Bool, queue_size=1, latch=True)
@@ -235,16 +170,11 @@ class Node:
         rospy.Subscriber("/navi_manager/new_map", String, self.callback_new_map)
         rospy.Subscriber("/navi_manager/speed", String, self.callback_speed)
         rospy.Subscriber("/navi_manager/save_waypoint", String, self.callback_save_waypoint)
-        rospy.Subscriber("/navi_manager/save_waypoint_at", String, self.callback_save_waypoint_at)
         rospy.Subscriber("/navi_manager/publish_point", String, self.callback_publish_point)
-        # AUDIT A8 (2026-08-01): subscriber removed — callback_publish_point_pose
-        # called a method that does not exist (publish_map_point_pose) and no
-        # publisher of this topic exists anywhere; every message would have been
-        # an AttributeError.
+        rospy.Subscriber("/navi_manager/publish_point_pose", String, self.callback_publish_point_pose)
         rospy.Subscriber("/navi_manager/goal_point", String, self.callback_goal_point)
         rospy.Subscriber("/navi_manager/remove_point", String, self.callback_remove_point)
         rospy.Subscriber("/navi_manager/save_path", String, self.callback_save_path)
-        rospy.Subscriber("/navi_manager/save_path_at", String, self.callback_save_path_at)
         rospy.Subscriber("/navi_manager/save_path_point", String, self.callback_save_path_point)
         rospy.Subscriber("/navi_manager/start_new_autopath", String, self.callback_start_new_autopath)
         rospy.Subscriber("/navi_manager/stop_autopath", Bool, self.callback_stop_autopath)
@@ -265,12 +195,6 @@ class Node:
         # /navi_manager/map (same latched semantics the costmap static layer +
         # planner already depend on).
         rospy.Subscriber("/mapping_manager/site_map", OccupancyGrid, self.callback_site_map)
-        # Currently SERVED mapping-v3 site (delegacy 2026-07-19): latched JSON
-        # status from mapping_manager. In site-native mode (legacy_maps=False) the
-        # serving.site field selects the bundle whose waypoints/paths/datum are the
-        # runtime authority. Latched, so a boot-time serving state reaches us on
-        # connect and drives the initial waypoint import.
-        rospy.Subscriber("/mapping_manager/status", String, self.callback_mapping_status)
         rospy.Subscriber("/web_plan/map_edited", OccupancyGrid, self.callback_web_plan_map)
         rospy.Subscriber("/navi_manager/show_map", String, self.callback_web_plan_show_map)
         rospy.Subscriber("/navi_manager/rtabmap_settings_set", Rtabmap_settings, self.callback_rtabmap_settings_set)
@@ -290,15 +214,6 @@ class Node:
         self._octomap_serve_period = 5.0       # seconds between serve_site requests
         self._octomap_serve_window = 60.0      # total retry window (s)
         self._octomap_fallback_active = False  # currently serving planner as stand-in
-        # Truthful bootstrap map for a fresh/mapless robot (bootmap, 2026-07-12).
-        # When octomap is the selected source but no raster exists yet AND no planner
-        # map either (fresh install), we must NOT show a stale legacy map. Instead
-        # publish a minimal HONEST grid: all unknown (-1), FREE (0) under the robot
-        # footprint, plus structure from a one-shot raytrace of the first /scan.
-        #   ~octomap_fallback: "bootstrap" (default) | "planner" (legacy behaviour)
-        self._octomap_fallback_mode = rospy.get_param('~octomap_fallback', 'bootstrap')
-        self._bootstrap_map_msg = None         # cached OccupancyGrid once built
-        self._bootstrap_build_attempts = 0     # so we retry a few times for TF
         self.point_pose_srvs = rospy.Service("navi_manager/get_point_pose", Point_pose, self.srv_cb_map_point_pose)
 
 
@@ -320,23 +235,8 @@ class Node:
 
         self.params = None
         self.load_manager_config()
-        # site-native mode: mapping-v3 site bundle is the runtime map authority.
-        # DEFAULT false -> every site_native branch below is a no-op and the
-        # legacy path is byte-for-byte unchanged.
-        self._site_native = bool(self.params.get('site_native', False))
-        if self._site_native:
-            rospy.logwarn("navi_man: site_native=TRUE — mapping-v3 site mode "
-                          "(boot map source forced 'octomap', map->odom georef "
-                          "from site datum.yaml, rtabmap .db copy skipped on load).")
-        # legacy-maps retirement gate (delegacy 2026-07-19). DEFAULT False ->
-        # site-native boot (no legacy navi map; runtime authority is the served
-        # mapping-v3 site). True -> restore the load_map_on_start path (rollback).
-        self._legacy_maps = bool(self.params.get('legacy_maps', False))
 
-        if not self._legacy_maps:
-            # ---- SITE-NATIVE BOOT (no legacy navi map) -----------------------
-            self._site_native_boot()
-        elif self.params.get('load_map_on_start', '') == '':
+        if self.params['load_map_on_start'] == '':
             self.map_name = "INIT"
             map_msg = String(self.map_name)
             self.callback_new_map(map_msg)
@@ -353,13 +253,6 @@ class Node:
         # "planner"; override it here so boot serves the configured source (default
         # "octomap"). This does NOT start RTABMAP_MAPPING.
         map_source_on_start = self.params.get('map_source_on_start', 'planner')
-        # site_native (1a): the served site raster IS the map — force the octomap
-        # source at boot regardless of map_source_on_start (reuses the exact same
-        # octomap code path incl. its serve_site retry / bootstrap fallback).
-        if self._site_native and map_source_on_start != 'octomap':
-            rospy.logwarn("navi_man: site_native forcing boot map source "
-                          "'octomap' (was '%s').", map_source_on_start)
-            map_source_on_start = 'octomap'
         if map_source_on_start:
             self.callback_web_plan_show_map(String(map_source_on_start))
             rospy.loginfo("Default map source at boot: %s", map_source_on_start)
@@ -416,33 +309,6 @@ class Node:
         # Octomap (mapping_v3) site raster from mapping_manager. Cache it and, if we
         # are currently serving the octomap source, mark for republish so the served
         # /navi_manager/map refreshes (e.g. mapping_manager serves a newer raster).
-        #
-        # servesync (2026-07-12): mapping_manager publishes an explicit EMPTY /
-        # header-only OccupancyGrid on site_map when a FRESH site (no rasters) starts
-        # mapping — serving must stay consistent with the active session, not keep the
-        # previous site's raster latched. Treat an empty/tiny grid as NO raster: drop
-        # the cached site_map so publish_map falls back to the truthful bootstrap map
-        # (bootstrap mode) instead of republishing a stale raster or an empty grid.
-        n_cells = msg.info.width * msg.info.height
-        if n_cells == 0:
-            if self.site_map_msg is not None:
-                rospy.logwarn("navi_man: site_map cleared (empty grid from "
-                              "mapping_manager — fresh site being mapped); dropping "
-                              "cached raster, falling back to bootstrap map.")
-            self.site_map_msg = None
-            if self.map_show == "octomap":
-                # Rebuild bootstrap fresh (robot pose / scan may have moved) and
-                # re-arm the republish so publish_map serves it this tick.
-                self._bootstrap_map_msg = None
-                self._bootstrap_build_attempts = 0
-                self._octomap_fallback_active = False
-                # Cancel any pending serve_site retry: an empty grid is the
-                # INTENDED "no map" state of a fresh session, not a boot race, so
-                # octomap_serve_tick must NOT keep re-requesting serve_site (which
-                # would re-pull some OTHER site's newest raster mid-session).
-                self._octomap_serve_deadline = None
-                self.is_map_to_publish = True
-            return
         first = self.site_map_msg is None
         self.site_map_msg = msg
         if self.map_show == "octomap":
@@ -455,8 +321,6 @@ class Node:
                 if self._octomap_fallback_active:
                     self._octomap_fallback_active = False
                 self._octomap_serve_deadline = None
-                # Drop the bootstrap stand-in; the real raster supersedes it.
-                self._bootstrap_map_msg = None
             self.is_map_to_publish = True
 
     def callback_web_plan_map(self, msg):
@@ -489,10 +353,6 @@ class Node:
             # publish reaches us on connect) and ARM a bounded retry (octomap_serve_tick
             # on the slow loop) — mapping_manager may not have served yet at boot.
             # rtabmap is NOT started for this source.
-            # Re-triggering "octomap" rebuilds the bootstrap map on demand so it
-            # reflects the current robot pose / latest scan.
-            self._bootstrap_map_msg = None
-            self._bootstrap_build_attempts = 0
             if self.site_map_msg is None:
                 self.pub_serve_site.publish(String(""))
                 now = rospy.Time.now()
@@ -525,32 +385,10 @@ class Node:
                 if self.site_map_msg is not None:
                     self.nm_map_pub.publish(self.site_map_msg)
                     self.pub_map_source.publish(String("octomap"))
-                elif self._octomap_fallback_mode != "planner":
-                    # No raster yet, and bootstrap mode (default): publish a TRUTHFUL
-                    # minimal grid (unknown everywhere, FREE under the footprint + first
-                    # scan raytrace) instead of a stale legacy map. A fresh install has
-                    # no planner map either; showing one would be untruthful. The map
-                    # existing brings up costmap/MBF/planner/UI honestly. When the
-                    # raster later arrives, callback_site_map switches us back to it.
-                    if self._bootstrap_map_msg is None:
-                        self._bootstrap_map_msg = self._build_bootstrap_map()
-                    if self._bootstrap_map_msg is not None:
-                        self._bootstrap_map_msg.header.stamp = rospy.Time.now()
-                        self.nm_map_pub.publish(self._bootstrap_map_msg)
-                        self.pub_map_source.publish(String("bootstrap"))
-                        if not self._octomap_fallback_active:
-                            self._octomap_fallback_active = True
-                            rospy.logwarn("navi_man: octomap source has no raster yet — "
-                                          "serving TRUTHFUL BOOTSTRAP map on "
-                                          "/navi_manager/map (unknown + footprint + scan).")
-                    else:
-                        # bootstrap build not ready yet (TF warming up): keep the
-                        # publish pending so the next tick retries.
-                        return
                 elif self.planner_map_msg is not None:
-                    # Legacy behaviour (~octomap_fallback:=planner): serve the planner
-                    # map as a fallback so the global costmap/MBF/footprint still come
-                    # up. octomap_serve_tick keeps retrying serve_site;
+                    # No raster yet: NEVER leave /navi_manager/map silent — serve the
+                    # planner map as a fallback so the global costmap/MBF/footprint
+                    # still come up. octomap_serve_tick keeps retrying serve_site;
                     # callback_site_map switches back to the raster on first arrival.
                     self.nm_map_pub.publish(self.planner_map_msg)
                     self.pub_map_source.publish(String("planner"))
@@ -591,184 +429,6 @@ class Node:
             self._octomap_last_serve_req = now
             self.pub_serve_site.publish(String(""))
             rospy.loginfo("navi_man: octomap serve_site retry (no site_map yet)...")
-
-    def _build_bootstrap_map(self):
-        # Build a TRUTHFUL minimal OccupancyGrid for a fresh/mapless robot. Frame
-        # 'map', 0.05 m resolution, ~30x30 m centred on the robot's current map pose.
-        # Everything starts UNKNOWN (-1). We then mark:
-        #   * FREE (0) every cell under the robot footprint polygon (we are standing
-        #     there, so it is provably clear), and
-        #   * from a one-shot raytrace of the latest /scan: FREE (0) along each beam
-        #     and OBSTACLE (100) at the hit endpoint (when range < range_max - 0.1).
-        # No scan / no TF -> a footprint-only map is still valid and returned.
-        res = 0.05
-        span_m = 30.0
-        size = int(round(span_m / res))          # cells per side (~600)
-        # --- robot map pose (centre of the grid) via TF map->base_link ------------
-        cx = 0.0
-        cy = 0.0
-        try:
-            tr = self.tf2_Buffer.lookup_transform('map', 'base_link', rospy.Time(0),
-                                                  rospy.Duration(1.0))
-            cx = tr.transform.translation.x
-            cy = tr.transform.translation.y
-        except Exception as e:
-            self._bootstrap_build_attempts += 1
-            if self._bootstrap_build_attempts < 4:
-                rospy.logwarn("navi_man: bootstrap map — map->base_link TF not ready "
-                              "(attempt %d): %s; will retry.",
-                              self._bootstrap_build_attempts, e)
-                return None
-            rospy.logwarn("navi_man: bootstrap map — map->base_link TF unavailable, "
-                          "falling back to origin (0,0).")
-
-        grid = np.full((size, size), -1, dtype=np.int8)   # [row=y, col=x]
-        origin_x = cx - (size * res) / 2.0
-        origin_y = cy - (size * res) / 2.0
-
-        def w2c(px, py):
-            # world (map) metres -> (col, row) grid indices
-            col = int((px - origin_x) / res)
-            row = int((py - origin_y) / res)
-            return col, row
-
-        def in_bounds(col, row):
-            return 0 <= col < size and 0 <= row < size
-
-        # --- FREE under the robot footprint --------------------------------------
-        footprint = None
-        try:
-            fp_param = rospy.get_param('/move_base_flex/local_costmap/footprint', None)
-            if isinstance(fp_param, str):
-                fp_param = yaml.safe_load(fp_param)
-            if fp_param:
-                footprint = [(float(p[0]), float(p[1])) for p in fp_param]
-        except Exception as e:
-            rospy.logwarn("navi_man: bootstrap map — could not read footprint param: %s", e)
-        # robot yaw for rotating the footprint into the map frame
-        yaw = 0.0
-        try:
-            q = tr.transform.rotation
-            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                             1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-        except Exception:
-            yaw = 0.0
-        cyaw, syaw = math.cos(yaw), math.sin(yaw)
-        if footprint:
-            # bounding radius of the footprint polygon (rotated), fill the disc that
-            # contains it as FREE — conservative and simple, always covers the robot.
-            fp_r = max(math.hypot(px, py) for px, py in footprint)
-        else:
-            fp_r = 0.5   # conservative default disc radius (m)
-        r_cells = int(math.ceil(fp_r / res))
-        ccol, crow = w2c(cx, cy)
-        r2 = r_cells * r_cells
-        for drow in range(-r_cells, r_cells + 1):
-            for dcol in range(-r_cells, r_cells + 1):
-                if dcol * dcol + drow * drow <= r2:
-                    col, row = ccol + dcol, crow + drow
-                    if in_bounds(col, row):
-                        grid[row, col] = 0
-
-        free_from_scan = 0
-        obst_from_scan = 0
-        # --- one-shot raytrace of the latest /scan -------------------------------
-        scan = None
-        try:
-            scan = rospy.wait_for_message('/scan', LaserScan, timeout=3.0)
-        except Exception as e:
-            rospy.logwarn("navi_man: bootstrap map — no /scan within 3s (%s); "
-                          "publishing footprint-only bootstrap map.", e)
-        if scan is not None:
-            # TF laser frame -> map (translation + yaw), applied per-beam endpoint.
-            lx = ly = 0.0
-            lyaw = 0.0
-            have_laser_tf = False
-            try:
-                lt = self.tf2_Buffer.lookup_transform('map', scan.header.frame_id,
-                                                      rospy.Time(0), rospy.Duration(1.0))
-                lx = lt.transform.translation.x
-                ly = lt.transform.translation.y
-                lq = lt.transform.rotation
-                lyaw = math.atan2(2.0 * (lq.w * lq.z + lq.x * lq.y),
-                                  1.0 - 2.0 * (lq.y * lq.y + lq.z * lq.z))
-                have_laser_tf = True
-            except Exception as e:
-                rospy.logwarn("navi_man: bootstrap map — laser TF (%s->map) "
-                              "unavailable (%s); skipping scan raytrace.",
-                              scan.header.frame_id, e)
-            if have_laser_tf:
-                lcol, lrow = w2c(lx, ly)
-                clyaw, slyaw = math.cos(lyaw), math.sin(lyaw)
-                rmax = scan.range_max
-                for i, rng in enumerate(scan.ranges):
-                    if rng != rng or rng < scan.range_min:   # NaN / too close
-                        continue
-                    hit = rng < (rmax - 0.1)
-                    reff = rng if hit else rmax
-                    a = scan.angle_min + i * scan.angle_increment
-                    # endpoint in laser frame -> map frame
-                    ex = lx + reff * (clyaw * math.cos(a) - slyaw * math.sin(a))
-                    ey = ly + reff * (slyaw * math.cos(a) + clyaw * math.sin(a))
-                    ecol, erow = w2c(ex, ey)
-                    # Bresenham from laser origin cell to endpoint cell = FREE
-                    for col, row in self._bresenham(lcol, lrow, ecol, erow):
-                        if in_bounds(col, row) and grid[row, col] != 100:
-                            if grid[row, col] == -1:
-                                free_from_scan += 1
-                            grid[row, col] = 0
-                    if hit and in_bounds(ecol, erow):
-                        if grid[erow, ecol] != 100:
-                            obst_from_scan += 1
-                        grid[erow, ecol] = 100
-
-        # --- assemble OccupancyGrid ----------------------------------------------
-        msg = OccupancyGrid()
-        msg.header.frame_id = 'map'
-        msg.header.stamp = rospy.Time.now()
-        msg.info.resolution = res
-        msg.info.width = size
-        msg.info.height = size
-        msg.info.origin.position.x = origin_x
-        msg.info.origin.position.y = origin_y
-        msg.info.origin.position.z = 0.0
-        msg.info.origin.orientation.w = 1.0
-        msg.data = grid.flatten(order='C').astype(np.int8).tolist()
-
-        free_total = int(np.count_nonzero(grid == 0))
-        obst_total = int(np.count_nonzero(grid == 100))
-        unknown_total = int(np.count_nonzero(grid == -1))
-        rospy.loginfo("navi_man: bootstrap map built %dx%d @ %.3f m centred (%.2f,%.2f) "
-                      "— free=%d (scan+%d) obstacle=%d unknown=%d",
-                      size, size, res, cx, cy,
-                      free_total, free_from_scan, obst_total, unknown_total)
-        self._bootstrap_build_attempts = 0
-        return msg
-
-    @staticmethod
-    def _bresenham(x0, y0, x1, y1):
-        # Integer Bresenham line: yields (col,row) cells from (x0,y0) to (x1,y1)
-        # INCLUSIVE of the start, EXCLUSIVE of the end (endpoint handled separately
-        # so we do not overwrite an obstacle hit with FREE).
-        cells = []
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        x, y = x0, y0
-        while True:
-            if x == x1 and y == y1:
-                break
-            cells.append((x, y))
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
-        return cells
 
     def callback_odometry_odom(self, msg):
         self.msg_odometry_odom = msg
@@ -868,15 +528,7 @@ class Node:
     def add_autopath_point(self):
         if self.autopath_name is not None and self.autopath_last_pose is not None:
             # if self.autopath.pose is in distance 0.3m or more from current pose, the add point to path
-            # AUDIT A11 (2026-08-01): getCurrentPose raises on a TF outage and
-            # this runs in the 30 Hz main loop — an unhandled raise killed the
-            # whole navi_man. Skip the tick instead.
-            try:
-                pose, tf_frame = self.getCurrentPose()
-            except Exception as e:
-                rospy.logwarn_throttle(10.0, "navi_man: autopath tick skipped "
-                                       "(no current pose: %s)", e)
-                return
+            pose, tf_frame = self.getCurrentPose()           
             distance = ((self.autopath_last_pose.position.x - pose.position.x) ** 2 +
                         (self.autopath_last_pose.position.y - pose.position.y) ** 2 +
                         (self.autopath_last_pose.position.z - pose.position.z) ** 2) ** 0.5
@@ -907,7 +559,16 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
 
-    # AUDIT M12: movebase_client removed (uncalled; no move_base server in the MBF stack)
+    def movebase_client(self, goal):
+        client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+        client.wait_for_server()
+        client.send_goal(goal)
+        wait = client.wait_for_result()
+        if not wait:
+            rospy.logerr("Action server not available!")
+            rospy.signal_shutdown("Action server not available!")
+        else:
+            return client.get_result()
 
     def callback_goal_point(self, msg):
         self.status_msg_pub.publish("{} is new goal".format(msg.data))
@@ -1008,86 +669,6 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
 
-    def callback_save_path_at(self, msg):
-        # WP map editor V2: save/replace a MANUALLY DRAWN path from explicit
-        # map-frame points supplied by the UI, landing in the SAME
-        # running_map_data.paths collection as robot-recorded paths
-        # (callback_save_path / add_autopath_point) so it appears in the Path tab
-        # and can be navigated/executed identically. Add-or-replace by name.
-        # Payload std_msgs/String JSON:
-        #   {"name": str, "points": [[x,y],...], "yaws": [..] optional}
-        # yaw per pose: if yaws absent, heading = direction of the segment to the
-        # NEXT point; the last pose repeats the previous pose's yaw.
-        try:
-            spec = json.loads(msg.data)
-        except Exception as e:
-            self.status_msg_pub.publish("save_path_at: bad JSON ({})".format(e))
-            rospy.logwarn("save_path_at: bad JSON: %s", e)
-            return
-        name = str(spec.get('name', '')).strip()
-        if name == "":
-            self.status_msg_pub.publish("The name is empty!")
-            rospy.loginfo("The name is empty!")
-            return
-        pts = spec.get('points', [])
-        if not isinstance(pts, list) or len(pts) < 2:
-            self.status_msg_pub.publish("save_path_at: need at least 2 points.")
-            rospy.logwarn("save_path_at: need >=2 points (%s given).", len(pts) if isinstance(pts, list) else 'none')
-            return
-        yaws_in = spec.get('yaws', None)
-        have_yaws = isinstance(yaws_in, list) and len(yaws_in) == len(pts)
-        n = len(pts)
-        # per-pose yaw list first, so the last pose can repeat the previous yaw
-        yaw_list = []
-        try:
-            for i in range(n):
-                if have_yaws:
-                    yaw_list.append(float(yaws_in[i]))
-                elif i < n - 1:
-                    dx = float(pts[i + 1][0]) - float(pts[i][0])
-                    dy = float(pts[i + 1][1]) - float(pts[i][1])
-                    yaw_list.append(math.atan2(dy, dx))
-                else:
-                    yaw_list.append(yaw_list[-1] if yaw_list else 0.0)
-        except (IndexError, TypeError, ValueError) as e:
-            self.status_msg_pub.publish("save_path_at: bad point/yaw ({})".format(e))
-            rospy.logwarn("save_path_at: bad point/yaw: %s", e)
-            return
-        poses = []
-        try:
-            for i in range(n):
-                x = float(pts[i][0])
-                y = float(pts[i][1])
-                qz = math.sin(yaw_list[i] / 2.0)
-                qw = math.cos(yaw_list[i] / 2.0)
-                poses.append(Pose(Point(x, y, 0.0), Quaternion(0.0, 0.0, qz, qw)))
-        except (IndexError, TypeError, ValueError) as e:
-            self.status_msg_pub.publish("save_path_at: bad point ({})".format(e))
-            rospy.logwarn("save_path_at: bad point: %s", e)
-            return
-        path_exist = self.running_map_data.get_map_path(name)
-        if not path_exist:
-            path = MapPath(name, 'map')
-            path.poses = poses
-            path.create_path_msg()
-            self.running_map_data.add_map_path(path)
-            self.save_running_map_data()
-            self.status_msg_pub.publish("New path {} added ({} points).".format(name, n))
-            rospy.loginfo("New drawn path %s added (%d points).", name, n)
-        else:
-            path_exist.poses = poses
-            path_exist.tf_frame = 'map'
-            path_exist.create_path_msg()
-            self.save_running_map_data()
-            self.status_msg_pub.publish("{} path changed ({} points).".format(name, n))
-            rospy.loginfo("Drawn path %s changed (%d points).", name, n)
-        # refresh the name lists + map_objects overlay the UI reads (matches the
-        # save_waypoint_at pattern; never let it break the save).
-        try:
-            self._republish_map_lists()
-        except Exception:
-            pass
-
     def callback_publish_point(self, msg):
         if msg.data != "":
             self.point_to_publish = msg.data
@@ -1098,8 +679,15 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
 
-    # AUDIT A8 (2026-08-01): callback_publish_point_pose removed (called a
-    # nonexistent method; topic had no publishers — dead sub+cb pair).
+    def callback_publish_point_pose(self, msg):
+        if msg.data != "":
+            self.point_to_publish = msg.data
+            self.status_msg_pub.publish("{} point is published".format(msg.data))
+            rospy.loginfo("{} point is published".format(msg.data))
+            self.publish_map_point_pose(msg.data)
+        else:
+            self.status_msg_pub.publish("The name is empty!")
+            rospy.loginfo("The name is empty!")
 
     def getCurrentPose(self):
         # print(tf.allFramesAsString())
@@ -1143,72 +731,9 @@ class Node:
             rospy.loginfo("The name is empty!")
             self.nex_log_info_pub.publish("The name is empty!")
 
-    def callback_save_waypoint_at(self, msg):
-        # WP-D2 (map editor): save/update a waypoint at an EXPLICIT map-frame pose
-        # (x, y, yaw) supplied by the UI, instead of the robot's CURRENT pose like
-        # callback_save_waypoint. Same add-or-update + persist + status semantics;
-        # the MapPoint is built exactly like _build_map_point_from_spec (yaw-only
-        # quaternion, 'map' frame). Payload: std_msgs/String JSON
-        #   {"name": str, "x": float, "y": float, "yaw": float}
-        try:
-            spec = json.loads(msg.data)
-        except Exception as e:
-            self.status_msg_pub.publish("save_waypoint_at: bad JSON ({})".format(e))
-            rospy.logwarn("save_waypoint_at: bad JSON: %s", e)
-            return
-        name = str(spec.get('name', '')).strip()
-        if name == "":
-            self.status_msg_pub.publish("The name is empty!")
-            rospy.loginfo("The name is empty!")
-            self.nex_log_info_pub.publish("The name is empty!")
-            return
-        try:
-            x = float(spec['x'])
-            y = float(spec['y'])
-            yaw = float(spec.get('yaw', 0.0))
-        except (KeyError, TypeError, ValueError) as e:
-            self.status_msg_pub.publish("save_waypoint_at: bad pose ({})".format(e))
-            rospy.logwarn("save_waypoint_at: bad pose: %s", e)
-            return
-        # yaw-only quaternion (z = sin(yaw/2), w = cos(yaw/2)); computed inline so
-        # this never depends on the optional vitulus_mapping.geo import (_geo may
-        # be None if the bundle libs are unavailable).
-        qz = math.sin(yaw / 2.0)
-        qw = math.cos(yaw / 2.0)
-        pose = Pose(Point(x, y, 0.0), Quaternion(0.0, 0.0, qz, qw))
-        point = MapPoint(name, pose, 'map')
-        point_exist = self.running_map_data.get_map_point(name)
-        if not point_exist:
-            self.running_map_data.add_map_point(point)
-            self.save_running_map_data()
-            self.status_msg_pub.publish("New point {} added.".format(name))
-            rospy.loginfo("New point {} added.".format(name))
-            self.nex_log_info_pub.publish("Point {} added".format(name))
-        else:
-            point_index = -1
-            for i, point_item in enumerate(self.running_map_data.points):
-                if point_item.name == name:
-                    point_index = i
-            if point_index != -1:
-                self.running_map_data.points[point_index] = point
-            self.save_running_map_data()
-            self.status_msg_pub.publish("{} point changed.".format(name))
-            rospy.loginfo("{} point changed.".format(name))
-            self.nex_log_info_pub.publish("{} changed".format(name))
-        # refresh the name lists the UI reads so the new/moved point shows at once
-        # (matches the bundle-era _republish pattern; never let it break the save).
-        try:
-            self._republish_map_lists()
-        except Exception:
-            pass
-
     def callback_speed(self, msg):
         if msg.data == "SLOW":
-            try:
-                rospy.wait_for_service("/move_base_flex/TebLocalPlannerROS/set_parameters", timeout=5.0)  # AUDIT A12: bounded
-            except rospy.ROSException:
-                rospy.logwarn("navi_man: MBF set_parameters unavailable — speed change skipped.")
-                return
+            rospy.wait_for_service('/move_base_flex/TebLocalPlannerROS/set_parameters')
             srvs_request = ReconfigureRequest()
             dbl_param = DoubleParameter(name="max_vel_x", value=0.25)
             srvs_request.config.doubles.append(dbl_param)
@@ -1229,11 +754,7 @@ class Node:
                 print("Service call failed: %s" % e)
 
         if msg.data == "MEDIUM":
-            try:
-                rospy.wait_for_service("/move_base_flex/TebLocalPlannerROS/set_parameters", timeout=5.0)  # AUDIT A12: bounded
-            except rospy.ROSException:
-                rospy.logwarn("navi_man: MBF set_parameters unavailable — speed change skipped.")
-                return
+            rospy.wait_for_service('/move_base_flex/TebLocalPlannerROS/set_parameters')
             srvs_request = ReconfigureRequest()
             dbl_param = DoubleParameter(name="max_vel_x", value=0.4) # 0.4
             srvs_request.config.doubles.append(dbl_param)
@@ -1253,11 +774,7 @@ class Node:
                 print("Service call failed: %s" % e)
 
         if msg.data == "FAST":
-            try:
-                rospy.wait_for_service("/move_base_flex/TebLocalPlannerROS/set_parameters", timeout=5.0)  # AUDIT A12: bounded
-            except rospy.ROSException:
-                rospy.logwarn("navi_man: MBF set_parameters unavailable — speed change skipped.")
-                return
+            rospy.wait_for_service('/move_base_flex/TebLocalPlannerROS/set_parameters')
             srvs_request = ReconfigureRequest()
             dbl_param = DoubleParameter(name="max_vel_x", value=0.75)
             srvs_request.config.doubles.append(dbl_param)
@@ -1285,449 +802,71 @@ class Node:
 
     def publish_map_coords(self):
         if not self.indoor:
-            # site-native (legacy_maps=False): with NO served site datum there is no
-            # map->odom georef to publish. Stay SILENT (task §5) — navi_transform
-            # then runs odom-frame only: GPS owns map->odom via its own
-            # ~/.vitulus/saves/site_datum.yaml fallback, and the dock seed anchors
-            # locally. Publishing zeros here would be a false "identity georef".
-            if not self._legacy_maps and not self.running_map_data.is_utm():
-                if not self._nomap_coords_warned:
-                    rospy.logwarn("navi_man site-native: no served site datum — "
-                                  "NOT publishing /navi_manager/map_coords "
-                                  "(odom-frame only until a site is served).")
-                    self._nomap_coords_warned = True
-                return
-            # Georef datum for map->odom (pickle datum by default; site datum.yaml
-            # under site_native). navi_transform.callback_map_coords differences
-            # utm->odom against this to build the live map->odom transform.
-            gx, gy, gz, gox, goy, goz, gow = self._georef_datum_values()
             msg = PoseStamped()
             msg.header.stamp = rospy.Time.now()
             msg.header.frame_id = "map"
-            msg.pose.position.x = gx
-            msg.pose.position.y = gy
-            msg.pose.position.z = gz
-            msg.pose.orientation.x = gox
-            msg.pose.orientation.y = goy
-            msg.pose.orientation.z = goz
-            msg.pose.orientation.w = gow
+            msg.pose.position.x = self.running_map_data.utm_x
+            msg.pose.position.y = self.running_map_data.utm_y
+            msg.pose.position.z = self.running_map_data.utm_z
+            msg.pose.orientation.x = self.running_map_data.utm_orientation_x
+            msg.pose.orientation.y = self.running_map_data.utm_orientation_y
+            msg.pose.orientation.z = self.running_map_data.utm_orientation_z
+            msg.pose.orientation.w = self.running_map_data.utm_orientation_w
             self.map_coords.publish(msg)
 
 
     def set_map_utm_transform(self):
-        """AUDIT M3 (2026-08-01): gutted to a no-op. The only effective
-        line (sendTransform) had been commented out — what remained was a
-        30 Hz utm->odom TF lookup whose result was discarded, plus a
-        hasattr('running_map_data.utm_orientation_x') bug (dotted name is
-        never an attribute) that zeroed the datum qx/qy every tick. Call
-        sites kept for minimal diff. Original body in git history.
-        """
-        return
+        # get world odom coords
+        if not self.indoor:
+            try:
+                trans = self.tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
+                available = True
+            except:
+                available = False
+                # self.map_status = "Loading"
+
+            if available:
+                m_x = 0
+                m_y = 0
+                m_z = 0
+                if self.running_map_data.is_utm():
+                    m_x = trans.transform.translation.x - self.running_map_data.utm_x
+                    m_y = trans.transform.translation.y - self.running_map_data.utm_y
+                    m_z = trans.transform.translation.z - self.running_map_data.utm_z
+                    if not hasattr(self, 'running_map_data.utm_orientation_x'):
+                        self.running_map_data.utm_orientation_x = 0
+                        self.running_map_data.utm_orientation_y = 0
+                    m_orientation_x = self.running_map_data.utm_orientation_x
+                    m_orientation_y = self.running_map_data.utm_orientation_y
+                    m_orientation_z = self.running_map_data.utm_orientation_z
+                    m_orientation_w = self.running_map_data.utm_orientation_w
+                else:
+                    m_orientation_x = 0
+                    m_orientation_y = 0
+                    m_orientation_z = 0
+                    m_orientation_w = 1
+
+                static_transformStamped = TransformStamped()
+                static_transformStamped.header.stamp = rospy.Time.now()
+                static_transformStamped.header.frame_id = "map"
+                static_transformStamped.child_frame_id = "odom"
+                static_transformStamped.transform.translation.x = m_x
+                static_transformStamped.transform.translation.y = m_y
+                static_transformStamped.transform.translation.z = m_z
+                static_transformStamped.transform.rotation.x = m_orientation_x
+                static_transformStamped.transform.rotation.y = m_orientation_y
+                static_transformStamped.transform.rotation.z = m_orientation_z
+                static_transformStamped.transform.rotation.w = m_orientation_w
+                # self.tf2_TransformBroadcaster.sendTransform(static_transformStamped)
 
     def save_running_map_data(self):
         with open('/home/vitulus/.ros/mapdata.pkl', 'wb') as output:
             pickle.dump(self.running_map_data, output, pickle.HIGHEST_PROTOCOL)
-        # site-bundle dual-write (WP-B): mirror waypoints/paths to the linked site
-        # bundle in canonical UTM. NEVER let a bundle failure break the legacy save.
-        self._export_bundle()
 
     def load_running_map_data(self):
         with open('/home/vitulus/.ros/mapdata.pkl', 'rb') as input:
-            loaded = pickle.load(input)
-        with self._map_data_lock:   # AUDIT M8
-            self.running_map_data = loaded
-        # site-bundle import-if-newer (WP-B): if the linked site bundle is newer
-        # than the map's own saved pickle, rebuild points/paths from it (UTM->MAP).
-        # Any failure keeps the pickle contents (never brick a map load).
-        self._import_bundle_if_newer()
+            self.running_map_data = pickle.load(input)
         self.set_map_utm_transform()
-
-    # ----------------------------------------------------------------------
-    # site-bundle sync (WP-B). Legacy pickle stays the runtime cache; the site
-    # bundle (~/.vitulus/mapping_v3/<site>/) is the canonical UTM store.
-    # ----------------------------------------------------------------------
-    def _active_map_pickle_path(self):
-        return "/home/vitulus/.vitulus/saves/maps_data/" + self.active_map + ".pkl"
-
-    def _bundle_site_for_active_map(self):
-        """Resolve the site whose manifest.navi_map == self.active_map. ~param
-        ~bundle_site overrides (empty=autodetect). Cached per active_map; logs
-        the resolution once per map. Returns site name or None (features off)."""
-        if not _BUNDLE_OK:
-            return None
-        # site-native (legacy_maps=False, delegacy 2026-07-19): the bundle site is
-        # the CURRENTLY SERVED mapping-v3 site (from /mapping_manager/status), NOT a
-        # manifest.navi_map match against active_map (which is the constant 'SITE').
-        # ~bundle_site still overrides. No caching needed — _served_site is cheap.
-        if not self._legacy_maps:
-            try:
-                override = rospy.get_param('~bundle_site', '')
-            except Exception:
-                override = ''
-            if override:
-                return override if _bundle.site_exists(override) else None
-            return self._served_site
-        am = self.active_map
-        if am == self._bundle_site_for:
-            return self._bundle_site
-        site = None
-        try:
-            override = rospy.get_param('~bundle_site', '')
-        except Exception:
-            override = ''
-        if override:
-            if _bundle.site_exists(override):
-                site = override
-            else:
-                rospy.logwarn("navi_man bundle: ~bundle_site='%s' set but no site "
-                              "dir under %s — bundle features off.",
-                              override, _bundle.SITES_ROOT)
-        else:
-            try:
-                for cand in _bundle.list_sites():
-                    m = _bundle.load_manifest(cand)
-                    if m and m.get('navi_map') == am:
-                        site = cand
-                        break
-            except Exception as e:
-                rospy.logwarn("navi_man bundle: site autodetect failed: %s", e)
-                site = None
-        self._bundle_site = site
-        self._bundle_site_for = am
-        if site:
-            rospy.loginfo("navi_man bundle: map '%s' linked to site '%s' (%s).",
-                          am, site, _bundle.site_dir(site))
-        else:
-            rospy.loginfo("navi_man bundle: no site linked to map '%s' — "
-                          "bundle export/import off for this map.", am)
-        return site
-
-    def _republish_map_lists(self):
-        # After a bundle import/export republish the waypoint/path name lists the
-        # UI reads (same publishers the slow loop uses).
-        try:
-            self.publish_map_point_list()
-            self.publish_map_point_str_list()
-            self.publish_map_path_list()
-            self.publish_map_objects()
-        except Exception as e:
-            rospy.logwarn("navi_man bundle: republish map lists failed: %s", e)
-
-    def _export_bundle(self):
-        if not _BUNDLE_OK:
-            return
-        site = self._bundle_site_for_active_map()
-        if not site:
-            rospy.logwarn_throttle(60.0, "navi_man bundle: export skipped — no "
-                                   "site resolved (nothing served yet?).")
-            return
-        rmd = self.running_map_data
-        try:
-            if not rmd.is_utm():
-                rospy.logwarn_throttle(60.0, "navi_man bundle: active map has no UTM "
-                                       "datum yet — skipping bundle export.")
-                return
-            datum = _geo.from_pickle_datum(rmd)
-            wps = _bsync.map_points_to_waypoints(rmd.points, datum)
-            paths = _bsync.map_paths_to_paths(rmd.paths, datum)
-            _bundle.save_waypoints(site, wps)
-            _bundle.save_paths(site, paths)
-            rospy.loginfo_throttle(10.0, "navi_man bundle: exported %d waypoints + "
-                                   "%d paths to site '%s'.",
-                                   len(wps), len(paths), site)
-            self._republish_map_lists()
-        except Exception as e:
-            rospy.logwarn("navi_man bundle: export to site '%s' failed (legacy "
-                          "pickle still saved): %s", site, e)
-
-    def _bundle_datum_guard(self, site, pickle_datum):
-        # Informational (plan §3): if the site datum.yaml disagrees with the map's
-        # pickle datum beyond 0.05 m / 2 mrad, WARN. We never SILENTLY switch datum
-        # — for bundle geometry conversion the pickle datum drives it; for the
-        # site-native georef the caller decides, and this guard supplies the delta.
-        # Returns (site_datum_canonical, (dE, dN, dAlt, dYaw)) or (None, None) when
-        # no usable datum.yaml exists. Existing callers may ignore the return.
-        try:
-            dp = os.path.join(_bundle.site_dir(site), 'datum.yaml')
-            if not os.path.exists(dp):
-                return None, None
-            with open(dp) as f:
-                sd = yaml.safe_load(f)
-            if not sd:
-                return None, None
-            site_datum = _geo.from_datum_yaml(sd)
-            exceeded, (de, dn, dalt, dyaw) = _bsync.datum_exceeds(pickle_datum,
-                                                                  site_datum)
-            if exceeded:
-                rospy.logwarn("navi_man bundle: DATUM MISMATCH site '%s' vs map "
-                              "pickle — dE=%.3fm dN=%.3fm dYaw=%.4frad "
-                              "(thr 0.05m/2mrad).", site, de, dn, dyaw)
-            return site_datum, (de, dn, dalt, dyaw)
-        except Exception as e:
-            rospy.logwarn("navi_man bundle: datum guard check failed: %s", e)
-            return None, None
-
-    def _georef_datum_values(self):
-        # Datum used for the map->odom GEOREF that navi_man feeds downstream:
-        # published on /navi_manager/map_coords (consumed by navi_transform's
-        # callback_map_coords — THE live map->odom source) and used by the
-        # (currently broadcast-disabled) set_map_utm_transform. Returns
-        # (utm_x, utm_y, utm_z, ox, oy, oz, ow).
-        #
-        # DEFAULT / flag-off: the map's PICKLE datum (running_map_data.utm_*) —
-        # byte-identical to legacy. site_native (1b): the SERVED site's
-        # datum.yaml when it resolves, with a one-time delta WARN + a one-time
-        # loginfo naming the source (loc-relevant visibility); it PROCEEDS on any
-        # delta (today mm/mrad). No site datum under site_native -> pickle datum +
-        # one-time warn. Cached per active_map so the 30 Hz caller costs nothing
-        # and the logs fire once per map.
-        with self._map_data_lock:   # AUDIT M8
-            rmd = self.running_map_data
-            pickle_vals = (rmd.utm_x, rmd.utm_y, rmd.utm_z,
-                           rmd.utm_orientation_x, rmd.utm_orientation_y,
-                           rmd.utm_orientation_z, rmd.utm_orientation_w)
-        if not self._site_native:
-            return pickle_vals
-        if self.active_map == self._georef_vals_for:
-            return self._georef_vals_cache if self._georef_vals_cache is not None \
-                else pickle_vals
-        # (re)resolve for this active_map; on any miss fall back to pickle and
-        # do not re-log (the cache key is set so this branch runs once per map).
-        self._georef_vals_for = self.active_map
-        self._georef_vals_cache = None
-        if not _BUNDLE_OK or not rmd.is_utm():
-            rospy.logwarn("navi_man site_native: bundle libs unavailable or map "
-                          "'%s' has no UTM datum — georef uses the pickle datum.",
-                          self.active_map)
-            return pickle_vals
-        site = self._bundle_site_for_active_map()
-        if not site:
-            rospy.logwarn("navi_man site_native: no site linked to map '%s' — "
-                          "georef uses the pickle datum.", self.active_map)
-            return pickle_vals
-        pickle_datum = _geo.from_pickle_datum(rmd)
-        site_datum, delta = self._bundle_datum_guard(site, pickle_datum)
-        if site_datum is None:
-            rospy.logwarn("navi_man site_native: site '%s' has no datum.yaml — "
-                          "georef uses the pickle datum.", site)
-            return pickle_vals
-        de, dn, dalt, dyaw = delta
-        q = _geo.yaw_to_quat(site_datum['yaw_rad'])   # (x, y, z, w) pure yaw
-        z = site_datum['alt'] if 'alt' in site_datum else rmd.utm_z
-        vals = (site_datum['utm_e'], site_datum['utm_n'], z,
-                q[0], q[1], q[2], q[3])
-        self._georef_vals_cache = vals
-        rospy.loginfo("navi_man site_native: georef datum: site '%s' (delta vs "
-                      "pickle dE=%.3fm dN=%.3fm dYaw=%.4frad dAlt=%s) — map->odom "
-                      "uses the SITE datum.", site, de, dn, dyaw,
-                      ("%.3fm" % dalt) if dalt is not None else "n/a")
-        return vals
-
-    def _build_map_point_from_spec(self, spec):
-        q = _geo.yaw_to_quat(spec['yaw'])   # (x, y, z, w) pure yaw
-        pose = Pose(Point(spec['x'], spec['y'], spec['z']),
-                    Quaternion(0.0, 0.0, q[2], q[3]))
-        return MapPoint(spec['name'], pose, 'map')
-
-    def _build_map_path_from_spec(self, spec):
-        path = MapPath(spec['name'], 'map')
-        for ps in spec['poses']:
-            q = _geo.yaw_to_quat(ps['yaw'])
-            pose = Pose(Point(ps['x'], ps['y'], ps['z']),
-                        Quaternion(0.0, 0.0, q[2], q[3]))
-            path.add_pose(pose)
-        return path
-
-    def _import_bundle_if_newer(self):
-        if not _BUNDLE_OK:
-            return
-        site = self._bundle_site_for_active_map()
-        if not site:
-            return
-        try:
-            pkl_path = self._active_map_pickle_path()
-            pkl_mtime = os.path.getmtime(pkl_path) if os.path.exists(pkl_path) else 0.0
-            times = [t for t in (_bundle.file_mtime(site, 'waypoints'),
-                                 _bundle.file_mtime(site, 'paths')) if t is not None]
-            newest = max(times) if times else None
-            if newest is None or newest <= pkl_mtime:
-                return  # bundle absent or not newer -> keep pickle contents
-            rmd = self.running_map_data
-            if not rmd.is_utm():
-                rospy.logwarn("navi_man bundle: bundle newer than pickle for site "
-                              "'%s' but map has no UTM datum — cannot import; "
-                              "keeping pickle.", site)
-                return
-            datum = _geo.from_pickle_datum(rmd)
-            self._bundle_datum_guard(site, datum)
-            pt_specs = _bsync.waypoints_to_point_specs(
-                _bundle.load_waypoints(site), datum)
-            pa_specs = _bsync.paths_to_path_specs(
-                _bundle.load_paths(site), datum)
-            new_points = [self._build_map_point_from_spec(s) for s in pt_specs]
-            new_paths = [self._build_map_path_from_spec(s) for s in pa_specs]
-            rmd.points = new_points
-            rmd.paths = new_paths
-            rospy.loginfo("navi_man bundle: imported %d waypoints + %d paths from "
-                          "site '%s' (bundle newer than pickle by %.0fs); "
-                          "points: %s", len(new_points), len(new_paths), site,
-                          newest - pkl_mtime,
-                          ', '.join(p.name for p in new_points) or '-')
-            self._republish_map_lists()
-        except Exception as e:
-            rospy.logwarn("navi_man bundle: import from site '%s' failed — keeping "
-                          "pickle contents: %s", site, e)
-
-    # ----------------------------------------------------------------------
-    # site-native boot + served-site bundle authority (delegacy 2026-07-19)
-    # ----------------------------------------------------------------------
-    def _site_native_boot(self):
-        """Boot WITHOUT any legacy navi map (legacy_maps=False). Reproduce the
-        one side effect of callback_load_map(init) that must survive — starting
-        the localization launch — then leave running_map_data EMPTY until the
-        served mapping-v3 site's bundle supplies waypoints/paths (see
-        callback_mapping_status / _import_served_site_bundle).
-
-        active_map is the constant 'SITE'; is_indoor defaults OUTDOOR (there is
-        no map name to derive it from). Datum comes from the served site only
-        (publish_map_coords stays muted until then; navi_transform runs odom-frame
-        with its own site_datum.yaml / GPS-owns fallback in the meantime)."""
-        self.active_map = "SITE"
-        self.indoor = False          # OUTDOOR default (no ***env* suffix to split)
-        self.map_name = "SITE"
-        rospy.logwarn("navi_man: legacy_maps=FALSE — SITE-NATIVE boot: no navi map "
-                      "loaded; active_map='SITE', OUTDOOR. Starting localization "
-                      "launch directly; waypoints/paths/datum come from the served "
-                      "mapping-v3 site bundle.")
-        # Start the localization stack (same args callback_load_map(init) uses).
-        if self.params.get('rtabmap_on_start', False):
-            self.start_navi_launch(["localization:=true_rtabmap"])
-        else:
-            self.start_navi_launch(["localization:=true"])
-        # running_map_data is already an empty MapData("new"). If a site is already
-        # being served (latched status delivered on subscribe), import it now;
-        # otherwise callback_mapping_status imports when serving arrives.
-        if self._served_site:
-            self._import_served_site_bundle()
-        else:
-            rospy.logwarn("navi_man: no site served at boot — waypoints unavailable "
-                          "until a site is served (the dock 'docked' seed logs "
-                          "ACTION-NEEDED and retries; it lands once the site + its "
-                          "'docked' waypoint arrive).")
-            self._served_site_warned = True
-
-    def callback_mapping_status(self, msg):
-        """Track the currently SERVED mapping-v3 site from /mapping_manager/status
-        (latched JSON: {... , 'serving': {'site','raster','mtime'} | null}). On a
-        serving-site CHANGE (site-native mode only), swap the bundle authority:
-        invalidate caches and re-import the served site's waypoints/paths + datum,
-        then republish. Legacy_maps=True -> tracked but never drives the map."""
-        try:
-            data = json.loads(msg.data)
-        except Exception:
-            return
-        serving = data.get('serving') or {}
-        site = serving.get('site') if isinstance(serving, dict) else None
-        if site == self._served_site:
-            return                       # unchanged
-        prev = self._served_site
-        self._served_site = site
-        # Invalidate the per-active_map caches (active_map is the constant 'SITE',
-        # so they would otherwise never refresh across a serving-site change).
-        self._bundle_site_for = "\x00__unset__"
-        self._georef_vals_for = "\x00__unset__"
-        self._georef_vals_cache = None
-        self._nomap_coords_warned = False
-        rospy.logwarn("navi_man: served site changed %r -> %r.", prev, site)
-        if self._legacy_maps:
-            return                       # legacy path owns the map; do not touch
-        if site:
-            self._import_served_site_bundle()
-        else:
-            # site un-served (e.g. fresh site being mapped): drop waypoints so we
-            # never serve a stale dock anchor; running odom-frame until re-served.
-            with self._map_data_lock:   # AUDIT M8
-                self.running_map_data.points = []
-                self.running_map_data.paths = []
-                self.running_map_data.utm_x = 0
-                self.running_map_data.utm_y = 0
-                self.running_map_data.utm_z = 0
-            rospy.logwarn("navi_man site-native: no site served now — cleared "
-                          "waypoints/paths + datum (odom-frame only).")
-            self._republish_map_lists()
-
-    def _import_served_site_bundle(self):
-        """Load the served site's waypoints/paths from its bundle into
-        running_map_data (UTM -> MAP via the site datum.yaml), populate the
-        running datum so is_utm()/georef work, and warm-cache the pickle. Fully
-        guarded: any failure leaves running_map_data as-is + a warn (never bricks
-        boot). Site-native only."""
-        if not _BUNDLE_OK:
-            rospy.logwarn("navi_man site-native: vitulus_mapping bundle/geo libs "
-                          "unavailable — cannot import served site waypoints.")
-            return
-        site = self._served_site
-        if not site:
-            return
-        try:
-            dp = os.path.join(_bundle.site_dir(site), 'datum.yaml')
-            if not os.path.exists(dp):
-                rospy.logwarn("navi_man site-native: served site '%s' has no "
-                              "datum.yaml yet — cannot place waypoints; keeping "
-                              "empty (odom-frame). Import retries when it appears.",
-                              site)
-                return
-            with open(dp) as f:
-                sd = yaml.safe_load(f)
-            datum = _geo.from_datum_yaml(sd)
-            rmd = self.running_map_data
-            # Populate the running datum from the SITE datum so is_utm() is True and
-            # _georef_datum_values (site_native branch) resolves consistently.
-            q = _geo.yaw_to_quat(datum['yaw_rad'])     # (x, y, z, w) pure yaw
-            with self._map_data_lock:   # AUDIT M8: datum refill is atomic vs 30 Hz read
-                rmd.utm_x = datum['utm_e']
-                rmd.utm_y = datum['utm_n']
-                rmd.utm_z = datum.get('alt', 0.0)
-                rmd.utm_orientation_x = 0.0
-                rmd.utm_orientation_y = 0.0
-                rmd.utm_orientation_z = q[2]
-                rmd.utm_orientation_w = q[3]
-            # MISSING FILE = NO INFORMATION (2026-07-19 night fix): a fresh
-            # site has no waypoints/paths.geojson yet — wiping the in-memory
-            # points here is what erased the freshly auto-saved 'docked'
-            # waypoint. Replace only when the file actually exists.
-            wp_file = os.path.join(_bundle.site_dir(site), 'waypoints.geojson')
-            pa_file = os.path.join(_bundle.site_dir(site), 'paths.geojson')
-            if os.path.exists(wp_file):
-                pt_specs = _bsync.waypoints_to_point_specs(
-                    _bundle.load_waypoints(site), datum)
-                rmd.points = [self._build_map_point_from_spec(s) for s in pt_specs]
-            else:
-                rospy.loginfo("navi_man site-native: site '%s' has no "
-                              "waypoints.geojson yet — keeping %d in-memory "
-                              "point(s).", site, len(rmd.points))
-            if os.path.exists(pa_file):
-                pa_specs = _bsync.paths_to_path_specs(
-                    _bundle.load_paths(site), datum)
-                rmd.paths = [self._build_map_path_from_spec(s) for s in pa_specs]
-            rospy.loginfo("navi_man site-native: imported %d waypoints + %d paths "
-                          "from served site '%s' (datum utm=(%.2f, %.2f) yaw=%.4f). "
-                          "Waypoints: %s", len(rmd.points), len(rmd.paths), site,
-                          datum['utm_e'], datum['utm_n'], datum['yaw_rad'],
-                          ', '.join(p.name for p in rmd.points) or '-')
-            # Warm cache: mirror to ~/.ros/mapdata.pkl so a crash BEFORE the next
-            # serving keeps the last state. Bare pickle dump (NOT save_running_map_data
-            # — that would re-export the bundle we just imported).
-            try:
-                with open('/home/vitulus/.ros/mapdata.pkl', 'wb') as out:
-                    pickle.dump(rmd, out, pickle.HIGHEST_PROTOCOL)
-            except Exception as e:
-                rospy.logwarn("navi_man site-native: warm-cache pickle write "
-                              "failed (non-fatal): %s", e)
-            self._republish_map_lists()
-        except Exception as e:
-            rospy.logwarn("navi_man site-native: import from served site '%s' "
-                          "failed — keeping current running_map_data: %s", site, e)
 
     def save_map_utm_pose(self):
         if not self.running_map_data.is_utm():
@@ -1884,11 +1023,7 @@ class Node:
         the service is unavailable so the caller can fall back to the legacy relaunch.
         """
         srv_name = rospy.get_param('~set_mode_mapping_service', '/rtabmap/set_mode_mapping')
-        # AUDIT A12 (2026-08-01): default wait 30->3 s. With rtabmap retired the
-        # service never appears and every UI edit-map stalled the callback for
-        # 30 s + 5 s settle; a genuinely running container has the service up
-        # immediately, so 3 s loses nothing.
-        wait_timeout = float(rospy.get_param('~set_mode_mapping_wait', 3.0))
+        wait_timeout = float(rospy.get_param('~set_mode_mapping_wait', 30.0))
         # Give rtabmap a chance to relocalize (loop closure / dock initialpose seed)
         # before flipping to mapping. We prefer a CONFIRMED relocalization (a message on
         # /rtabmap/localization_pose) over a blind sleep; on timeout we fall back to the
@@ -1931,11 +1066,7 @@ class Node:
 
                     self.save_map_utm_pose()
                     self.planner_new_map_pub.publish(String(msg.data + ind_outd))
-                    try:
-                        rospy.wait_for_service('/web_plan/save_map', timeout=10.0)  # AUDIT A12: bounded
-                    except rospy.ROSException:
-                        rospy.logerr('navi_man: /web_plan/save_map unavailable — map save skipped.')
-                        return
+                    rospy.wait_for_service('/web_plan/save_map')
                     try:
                         srv = rospy.ServiceProxy('/web_plan/save_map', Save_map)  # Connect to the service
                         response = srv(msg.data, "OUTDOOR")
@@ -2015,17 +1146,8 @@ class Node:
         # self.map_status = "Loading"
         self.shutdown_navi_launch()
         self.status_msg_pub.publish("Backuping current map...")
-        # AUDIT A9 (2026-08-01): the old code copied rtabmap.db into BOTH
-        # backup slots — the "pickle" backup was a mislabeled .db (restore
-        # would fail) and a missing rtabmap.db (site-native: rtabmap retired)
-        # threw in the callback. Back up each artifact from its real source,
-        # only when it exists.
-        db_src = "/home/vitulus/.ros/rtabmap.db"
-        pkl_src = "/home/vitulus/.vitulus/saves/maps_data/" + str(self.active_map) + ".pkl"
-        if os.path.exists(db_src):
-            shutil.copyfile(db_src, "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST.db")
-        if os.path.exists(pkl_src):
-            shutil.copyfile(pkl_src, "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST.pkl")
+        shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST.db")
+        shutil.copyfile("/home/vitulus/.ros/rtabmap.db", "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST.pkl")
         
         if self.edit_map_msg == "localize":
             self.status_msg_pub.publish("Current map is in localization mode.")
@@ -2058,29 +1180,13 @@ class Node:
 
     def callback_load_map(self, msg, init=False):
         if msg.data != "":
-            # AUDIT E2 (2026-08-01): site-native gate — a stray legacy load
-            # would overwrite running_map_data (waypoints/datum) with the old
-            # pickle world and restart the navi launch. Reject unless legacy
-            # maps are explicitly enabled.
-            if not self._legacy_maps and not init:
-                rospy.logwarn("navi_man: load_map('%s') REJECTED — "
-                              "legacy_maps=false (site-native).", msg.data)
-                self.status_msg_pub.publish("Legacy map load rejected (site-native).")
-                return
-            # AUDIT A10: name without the ***env* marker used to IndexError.
-            parts = msg.data.split("***env*")
-            if len(parts) < 2:
-                rospy.logerr("navi_man: load_map('%s') — malformed name "
-                             "(missing ***env* marker), ignored.", msg.data)
-                self.status_msg_pub.publish("Map name malformed, not loaded.")
-                return
             # self.map_status = "Loading"
             self.active_map = msg.data
             self.status_msg_pub.publish("Map {} will be loaded...".format(msg.data))
             # self.indoor = False
-            if parts[1] == "INDOOR":
+            if msg.data.split("***env*")[1] == "INDOOR":
                 self.indoor = True
-            else:
+            else: 
                 self.indoor = False
             if not init:
                 self.shutdown_navi_launch()
@@ -2090,17 +1196,8 @@ class Node:
             # the freshly loaded map -> corrupt db -> rtabmap segfault on next start.
             self.rtabmap_mapping.stop()
             self.status_msg_pub.publish("Loading the map...")
-            # site_native (1c): rtabmap is out of the runtime, so skip the (large)
-            # rtabmap .db copy into ~/.ros — nothing consumes it. The mapdata pickle
-            # copy, planner_data swap and launch restart below are UNCHANGED.
-            if self._site_native:
-                if not self._sitenative_dbskip_logged:
-                    rospy.loginfo("navi_man site_native: skipping rtabmap .db copy "
-                                  "on map load (rtabmap out of runtime).")
-                    self._sitenative_dbskip_logged = True
-            else:
-                shutil.copyfile("/home/vitulus/.vitulus/saves/maps/" + msg.data + ".db",
-                                "/home/vitulus/.ros/rtabmap.db")
+            shutil.copyfile("/home/vitulus/.vitulus/saves/maps/" + msg.data + ".db",
+                            "/home/vitulus/.ros/rtabmap.db")
             shutil.copyfile("/home/vitulus/.vitulus/saves/maps_data/" + msg.data + ".pkl",
                             "/home/vitulus/.ros/mapdata.pkl")
             self.status_msg_pub.publish("Map " + msg.data + " saved.")
@@ -2123,25 +1220,11 @@ class Node:
 
     def callback_load_map_rtabmap(self, msg, init=False):
         if msg.data != "":
-            # AUDIT E2 + A10 (2026-08-01): same site-native gate and malformed
-            # name guard as callback_load_map; this path additionally starts the
-            # retired RTABMAP_MAPPING container, so the reject matters more.
-            if not self._legacy_maps and not init:
-                rospy.logwarn("navi_man: load_map_rtabmap('%s') REJECTED — "
-                              "legacy_maps=false (site-native).", msg.data)
-                self.status_msg_pub.publish("Legacy rtabmap load rejected (site-native).")
-                return
-            parts = msg.data.split("***env*")
-            if len(parts) < 2:
-                rospy.logerr("navi_man: load_map_rtabmap('%s') — malformed name "
-                             "(missing ***env* marker), ignored.", msg.data)
-                self.status_msg_pub.publish("Map name malformed, not loaded.")
-                return
             # self.map_status = "Loading"
             self.active_map = msg.data
             rospy.loginfo("Map {} will be loaded...".format(msg.data))
             # self.indoor = False
-            if parts[1] == "INDOOR":
+            if msg.data.split("***env*")[1] == "INDOOR":
                 self.indoor = True
             else:
                 self.indoor = False
@@ -2252,7 +1335,24 @@ class Node:
         self.server.insert(int_marker, self.interactiveMarkerFeedback)
         self.server.applyChanges()
 
-    # AUDIT M12: publish_pose_cov_stamped removed (30 Hz, zero consumers)
+    def publish_pose_cov_stamped(self):
+        pose_cov_stamped = PoseWithCovarianceStamped()
+        pose_cov_stamped.header.stamp = rospy.Time.now()
+        pose_cov_stamped.header.frame_id = "odom"
+        pose_cov_stamped.pose.pose.position.x = self.msg_odometry_odom.pose.pose.position.x
+        pose_cov_stamped.pose.pose.position.y = self.msg_odometry_odom.pose.pose.position.y
+        pose_cov_stamped.pose.pose.position.z = self.msg_odometry_odom.pose.pose.position.z
+        pose_cov_stamped.pose.pose.orientation.x = self.msg_odometry_odom.pose.pose.orientation.x
+        pose_cov_stamped.pose.pose.orientation.y = self.msg_odometry_odom.pose.pose.orientation.y
+        pose_cov_stamped.pose.pose.orientation.z = self.msg_odometry_odom.pose.pose.orientation.z
+        pose_cov_stamped.pose.pose.orientation.w = self.msg_odometry_odom.pose.pose.orientation.w
+        pose_cov_stamped.pose.covariance = [0.1, 0, 0, 0, 0, 0,
+                                            0, 0.1, 0, 0, 0, 0,
+                                            0, 0, 0.1, 0, 0, 0,
+                                            0, 0, 0, 0.1, 0, 0,
+                                            0, 0, 0, 0, 0.1, 0,
+                                            0, 0, 0, 0, 0, 0.1]
+        self.pose_cov_stamped_pub.publish(pose_cov_stamped)
 
     def get_maplist(self):
         mypath = "/home/vitulus/.vitulus/saves/maps/"
@@ -2335,38 +1435,6 @@ class Node:
             msg.string_list.append(path.name)
         self.map_path_str_list_pub.publish(msg)
 
-    def publish_map_objects(self):
-        # WP map editor V3: latched JSON snapshot of waypoints + paths in MAP
-        # frame for the editor overlay (toggleable Waypoints / Paths groups).
-        #   {"waypoints": [{name,x,y,yaw}], "paths": [{name, points:[[x,y]..]}]}
-        # yaw is extracted from the pose quaternion (z-only heading). Latched, so
-        # subscribers get the current snapshot immediately on connect.
-        try:
-            wps = []
-            for p in self.running_map_data.points:
-                try:
-                    q = p.pose.orientation
-                    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                                     1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-                    wps.append({'name': p.name,
-                                'x': p.pose.position.x,
-                                'y': p.pose.position.y,
-                                'yaw': yaw})
-                except Exception:
-                    continue
-            paths = []
-            for pa in self.running_map_data.paths:
-                pts = []
-                for ps in pa.poses:
-                    try:
-                        pts.append([ps.position.x, ps.position.y])
-                    except Exception:
-                        continue
-                paths.append({'name': pa.name, 'points': pts})
-            self.map_objects_pub.publish(json.dumps({'waypoints': wps, 'paths': paths}))
-        except Exception as e:
-            rospy.logwarn("navi_man: publish_map_objects failed: %s", e)
-
     def publish_map_path(self, name):
         path = self.running_map_data.get_map_path(name)
         if path:
@@ -2401,6 +1469,7 @@ if __name__ == '__main__':
 
         while not rospy.is_shutdown():
             node.set_map_utm_transform()
+            node.publish_pose_cov_stamped()
             node.publish_map_coords()
             node.add_autopath_point()
             if (slow_nr == slow_counter):
@@ -2408,7 +1477,6 @@ if __name__ == '__main__':
                 node.publish_map_point_list()
                 node.publish_map_point_str_list()
                 node.publish_map_path_list()
-                node.publish_map_objects()
                 node.publish_map_path(node.path_to_publish)
                 node.pub_active_map.publish(String(node.active_map))
                 node.is_indoor_pub.publish(Bool(node.indoor))

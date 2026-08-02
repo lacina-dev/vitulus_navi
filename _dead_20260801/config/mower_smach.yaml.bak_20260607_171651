@@ -1,0 +1,31 @@
+# ===========================================================================
+# mower_unit_smach configuration
+#
+# Loaded into the private namespace of the node_mower_smach node, so each key
+# below is read as a private param (~key) by helpers.get_weather_config().
+#
+# Read PER CHECK at runtime, so `rosparam set /node_mower_smach/<key> <val>`
+# takes effect without restarting the node.
+# ===========================================================================
+
+# --- Rain gating ------------------------------------------------------------
+# How the mission reacts to the rain forecast (weather_alert/RainAlert).
+
+# true = skip ALL rain checks (pre-start and in-mission). For testing / override.
+weather_rain_bypass: true
+
+# Forecast statuses that count as "rain" and block mowing.
+# The RainAlert nowcast fields carry strings like RAIN / ALERT / WARN / DRY.
+# Was RAIN/ALERT/WARN historically; narrowed to RAIN to avoid false stops.
+weather_reject_statuses: ["RAIN"]
+
+# How far ahead to look, in minutes. The RainAlert message only carries
+# 10/20/30-minute nowcast steps, so this is clamped to 10, 20 or 30.
+# Number of forecast steps checked = horizon // 10 (e.g. 30 -> 3 steps).
+weather_forecast_horizon_min: 30
+
+# In-mission only: how many forecast steps must be a reject status before the
+# robot returns to dock. Pre-start rejects already on a single reject step;
+# during a mission we require this many (default 2 of 3) so one noisy step does
+# not abort an otherwise dry run.
+weather_monitor_min_steps: 2

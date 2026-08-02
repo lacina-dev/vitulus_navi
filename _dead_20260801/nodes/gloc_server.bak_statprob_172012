@@ -39,7 +39,6 @@ from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import LaserScan, CompressedImage
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from std_msgs.msg import Bool
-from std_msgs.msg import Int8
 from std_msgs.msg import String
 from std_srvs.srv import Trigger, TriggerResponse
 from tf.transformations import quaternion_from_euler, euler_from_quaternion
@@ -57,21 +56,6 @@ class GlocServer(object):
         # margin 95% on open grass -> 50% was not safe there. 100% + the IMU-yaw
         # sanity check below killed every observed false-confident case.
         self.apply_min_margin = rospy.get_param('~apply_min_margin', 1.0)  # 100 %
-        # SOFT-MAP RELOCK GUARD (2026-07-12, forensic: garage session shove).
-        # Log evidence (gloc_server-34.log, 17:1x): the pose was shoved by an
-        # AUTO-RELOCK APPLIED on the soft garage map — 17:18:14 relock to
-        # (0.83, -5.67, 260deg) margin 112% delta 1.47m, jumping ~1.5 m into a
-        # -6 m aisle alias that the 100% margin gate had (correctly) rejected 8x
-        # at margin 45-75% until one sample crept to 112%. A relock that MOVES
-        # the pose far (delta_m) is high-consequence: on a soft/aliased map the
-        # runner-up margin barely clearing 100% is not enough proof. So a relock
-        # whose delta exceeds ~relock_big_delta_m must clear a HIGHER margin
-        # (~relock_big_delta_margin) — small-delta relocks (confirming roughly
-        # the current pose) keep the normal gate. This does NOT slow legitimate
-        # recovery from a genuine large offset (that produces a decisive margin,
-        # like the 280% relock at 17:03); it only blocks a MARGINAL far jump.
-        self.relock_big_delta_m = float(rospy.get_param('~relock_big_delta_m', 0.6))
-        self.relock_big_delta_margin = float(rospy.get_param('~relock_big_delta_margin', 2.0))  # 200 %
         # The gyro tracks rotation even when the robot is carried (kidnap), so the
         # current heading stays roughly valid when position is lost — a candidate
         # whose yaw disagrees wildly is a mirror alias, not the robot.
@@ -209,99 +193,6 @@ class GlocServer(object):
         self._lost_states = ('poor_match', 'degenerate', 'corr_too_big')
         self._lost_since = None        # wall time the lost-streak started (None = healthy)
         self._last_relock_t = 0.0      # wall time of the last relock attempt
-
-        # ---- RASTER-AWARE RMS BASELINE + RELOCK ABSOLUTE-QUALITY GATE
-        # (2026-07-19, FIELD INCIDENT: the served raster switched to the DIRECT
-        # mapper's product — sparse 2D log-odds walls, ~3x thinner than the old
-        # BAND rasters. On it: (a) standstill track_align rms 0.14-0.24 (vs
-        # 0.03-0.05 on band) EXCEEDED the hardcoded track_max_rms_m=0.20 ->
-        # false poor_match -> LOST -> AUTO-RELOCK; (b) the relock trusted the
-        # RELATIVE margin, which INFLATES on sparse rasters (every wrong
-        # hypothesis is equally terrible so the runner-up gap looks huge — 337%);
-        # (c) a 4.68 m big-delta apply had no absolute-quality or external
-        # corroboration check -> the pose teleported in the field. THREE gates:
-        #
-        # (1) SELF-CALIBRATING BASELINE: while a TRUSTED anchor holds the pose
-        #     (gps_good OR docked) the tracker still runs its align every tick;
-        #     capture that rms as the raster's expected good-match scale
-        #     (EMA'd). The poor_match/lost threshold becomes
-        #     max(track_max_rms_m, baseline * track_lost_rms_factor) — scales up
-        #     on a sparse raster, but never DROPS below the old absolute floor
-        #     so band rasters (baseline ~0.04 -> 0.10 < 0.20) are byte-identical.
-        # (2) RELOCK ABSOLUTE-QUALITY GATE: an auto-relock hypothesis may be
-        #     APPLIED only if its OWN align rms is below baseline *
-        #     relock_abs_rms_factor (fallback: relock_abs_rms_floor_m when no
-        #     baseline yet). Relative margin alone NEVER suffices.
-        # (3) BIG-DELTA CORROBORATION: a relock that MOVES the pose >
-        #     relock_big_delta_m needs external corroboration (docked OR
-        #     gps_good) — the auto path can not teleport far on lidar alone.
-        #     Without it the hypothesis is PUBLISHED to track_status
-        #     (observability) and logged loudly, but NOT applied. The manual
-        #     /gloc/apply path (operator-triggered) is unaffected.
-        self.track_lost_rms_factor = float(rospy.get_param('~track_lost_rms_factor', 2.5))
-        self.track_baseline_alpha = float(rospy.get_param('~track_baseline_alpha', 0.15))
-        self.relock_abs_rms_factor = float(rospy.get_param('~relock_abs_rms_factor', 1.5))
-        # absolute-quality fallback when no trusted baseline has been measured on
-        # this raster yet (e.g. woke up under-roof, never docked/GPS this session)
-        self.relock_abs_rms_floor_m = float(rospy.get_param('~relock_abs_rms_floor_m', 0.30))
-        self.relock_bigdelta_require_corrob = bool(
-            rospy.get_param('~relock_bigdelta_require_corroboration', True))
-        # RELOCK V2 (2026-08-02, per RTAB-Map LoopGPS/OptimizeMaxError principles):
-        # (1) RADIUS GATE — search is only trusted within a circle around the
-        #     current (drifting) pose: base + k * distance travelled while lost.
-        #     A candidate outside the circle is physically implausible (the
-        #     4.68 m teleport dies here unless the robot really drove that far).
-        # (2) overlap gate joins the absolute-rms gate (sparse-raster candidates
-        #     can have lucky rms on few points; most beams must actually hit map).
-        # (3) PROBATION — a passing candidate is NOT applied immediately: it must
-        #     keep matching scans while the robot moves (odometry-predicted pose
-        #     re-scored each tick). Big jumps without external corroboration get
-        #     an EXTENDED probation instead of the old flat refusal.
-        self.relock_radius_base_m = float(rospy.get_param('~relock_radius_base_m', 1.5))
-        self.relock_radius_per_m = float(rospy.get_param('~relock_radius_per_m', 0.5))
-        self.relock_radius_max_m = float(rospy.get_param('~relock_radius_max_m', 8.0))
-        self.relock_overlap_min = float(rospy.get_param('~relock_overlap_min', 0.60))
-        self.relock_probe_ticks = int(rospy.get_param('~relock_probe_ticks', 3))
-        self.relock_probe_travel_m = float(rospy.get_param('~relock_probe_travel_m', 0.3))
-        self.relock_probe_timeout_s = float(rospy.get_param('~relock_probe_timeout_s', 60.0))
-        self.relock_bigdelta_probe_mult = float(rospy.get_param('~relock_bigdelta_probe_mult', 3.0))
-        self._lost_travel_m = 0.0      # odometric distance accumulated while lost
-        self._odom_pose = None         # latest wheel-odom pose (x, y, yaw)
-        self._relock_probe = None      # candidate under probation (dict) or None
-        self._rms_baseline = None      # measured good-match rms (None = uncalibrated)
-        self._grid_key = None          # (h, w, ox, oy) — new key invalidates baseline
-        self._docked = False           # /dock_smach/dock_status == 0 (corroboration)
-        # ---- SCAN-OVERLAP GATE ON BASELINE CAPTURE (PROTOCOL 2026-07-19) -------
-        # KNOWN FLAW (pre-protocol): the baseline EMA captured whenever a trusted
-        # anchor (gps_good OR docked) held, INCLUDING when the live scan did NOT
-        # overlap the mapped area (e.g. docked on a fresh map before it covers the
-        # dock, or facing unmapped space) — the align rms then reflects
-        # nothing-to-match (~cap) and contaminated the baseline toward ~0.9. FIX:
-        # only capture the baseline when the scan actually corresponds to mapped
-        # structure — overlap_frac (fraction of aligned scan points whose EDT
-        # distance is below track_overlap_dist_m) must exceed track_overlap_min.
-        # overlap_frac is computed in _track_align and published in track_status.
-        self.track_overlap_dist_m = float(rospy.get_param(
-            '~track_overlap_dist_m', 1.0))
-        self.track_overlap_min = float(rospy.get_param(
-            '~track_overlap_min', 0.5))
-        # ---- PER-MAP BASELINE PERSISTENCE (PROTOCOL 2026-07-19) ---------------
-        # After a fresh baseline stabilises over baseline_publish_after_n DOCKED
-        # captures on the served raster, publish it (latched, JSON) on
-        # /gloc/baseline so mapping_manager can persist it into the serving
-        # site's site_config.json. On serve, mapping_manager republishes it on
-        # /mapping_manager/track_baseline and we SEED self._rms_baseline from it
-        # at map load — every later boot then starts calibrated instead of
-        # re-learning the raster's scale from scratch.
-        self.baseline_publish_after_n = int(rospy.get_param(
-            '~baseline_publish_after_n', 10))
-        self._baseline_dock_captures = 0   # docked captures on the current raster
-        self._baseline_published_key = None  # grid_key already published to avoid spam
-        self._baseline_seed = None         # seed rms from /mapping_manager/track_baseline
-        self._baseline_seed_raster = None  # raster the seed belongs to ('site/raster')
-        self._serving_site = None          # from /mapping_manager/status
-        self._serving_raster = None
-        self._last_overlap_frac = None     # last measured overlap (for baseline pub)
         # URGENT-CORR bypass (2026-07-12, prevention): the smoothing gates (2-tick
         # persistence + EMA + deadband) must not STARVE corrections during motion.
         # When the smoothed correction is large (|corr| > track_urgent_corr_m) that
@@ -398,15 +289,6 @@ class GlocServer(object):
                                               PoseStamped, queue_size=1)
         self.pub_track_status = rospy.Publisher('/gloc/track_status', String,
                                                 queue_size=1, latch=True)
-        # PER-MAP BASELINE PERSISTENCE: publish a stabilised docked baseline for
-        # mapping_manager to persist; subscribe to the seed it republishes on
-        # serve, and to its status to learn the serving site/raster name.
-        self.pub_baseline = rospy.Publisher('/gloc/baseline', String,
-                                            queue_size=1, latch=True)
-        rospy.Subscriber('/mapping_manager/track_baseline', String,
-                         self._cb_track_baseline, queue_size=1)
-        rospy.Subscriber('/mapping_manager/status', String,
-                         self._cb_mm_status, queue_size=1)
         rospy.Subscriber(self.scan_topic, LaserScan,
                          lambda m: setattr(self, '_last_scan', m), queue_size=1)
         # ENGAGE FAST (2026-07-12, correctness-first): the tracker must take over
@@ -423,19 +305,10 @@ class GlocServer(object):
         # _gps_stable() is TRUE the RTK set_pose path owns map->odom; a tracker
         # correction published then still routes through set_map_pose_tracker but
         # the slew loop yields to the GPS anchor (see callback_set_map_pose gate).
-        # AUDIT E1 (2026-08-01): migrated bridge_status(string) -> loc_status
-        # (typed JSON, latched) — same producer (navi_transform), same fields,
-        # no string parsing. Finishes the WP2 migration for this consumer.
-        rospy.Subscriber('/nav_tf/loc_status', String,
-                         self._cb_loc_status, queue_size=1)
+        rospy.Subscriber('/nav_tf/bridge_status', String,
+                         self._cb_bridge_status, queue_size=1)
         rospy.Subscriber('/nav_tf/rtabmap_confident', Bool,
                          lambda m: setattr(self, '_rtab_conf', bool(m.data)),
-                         queue_size=1)
-        # docked truth (Int8, latched, 0 == docked) — a trusted anchor for the
-        # rms baseline AND external corroboration for a big-delta relock. Same
-        # topic/semantics navi_transform's arbiter uses.
-        rospy.Subscriber('/dock_smach/dock_status', Int8,
-                         lambda m: setattr(self, '_docked', int(m.data) == 0),
                          queue_size=1)
         # STANDSTILL GATE: 50 Hz odom feed, see _cb_odom().
         rospy.Subscriber('/mobile_base_controller/odom', Odometry,
@@ -452,101 +325,9 @@ class GlocServer(object):
     def _set_status(self, s):
         self.pub_status.publish(String(s))
 
-    # ---- per-map baseline persistence ----------------------------------------
-
-    def _cb_mm_status(self, msg):
-        """Learn the serving site/raster name from mapping_manager so a published
-        baseline can be tagged with the raster it belongs to."""
-        try:
-            d = json.loads(msg.data)
-        except (ValueError, TypeError):
-            return
-        serving = d.get('serving') or {}
-        self._serving_site = serving.get('site')
-        self._serving_raster = serving.get('raster')
-
-    def _cb_track_baseline(self, msg):
-        """SEED the rms baseline from the value mapping_manager persisted for the
-        served raster (republished latched on serve). Applied immediately if a
-        grid is already loaded and no baseline has been measured yet; otherwise
-        cb_grid applies it when the matching grid loads. Empty payload clears the
-        seed (raster with no stored baseline -> self-calibrate from scratch)."""
-        try:
-            d = json.loads(msg.data) if msg.data.strip() else {}
-        except (ValueError, TypeError):
-            return
-        rms = d.get('rms_baseline')
-        if rms is None:
-            self._baseline_seed = None
-            self._baseline_seed_raster = None
-            return
-        try:
-            self._baseline_seed = float(rms)
-        except (TypeError, ValueError):
-            self._baseline_seed = None
-            return
-        self._baseline_seed_raster = d.get('raster')
-        with self._lock:
-            if self._grid is not None and self._rms_baseline is None:
-                self._rms_baseline = self._baseline_seed
-                seeded = True
-            else:
-                seeded = False
-        if seeded:
-            rospy.loginfo('[gloc] rms baseline SEEDED from persisted %.3f '
-                          '(raster %s)', self._baseline_seed,
-                          self._baseline_seed_raster)
-
-    def _maybe_publish_baseline(self):
-        """Publish the stabilised baseline once it has been refined over
-        baseline_publish_after_n DOCKED captures on the served raster, so
-        mapping_manager persists it. Idempotent per grid_key."""
-        if (self._rms_baseline is None or self._serving_raster is None
-                or self._grid_key is None
-                or self._baseline_dock_captures < self.baseline_publish_after_n
-                or self._grid_key == self._baseline_published_key):
-            return
-        payload = {'rms_baseline': round(float(self._rms_baseline), 4),
-                   'overlap_frac': (None if self._last_overlap_frac is None
-                                    else round(self._last_overlap_frac, 3)),
-                   'site': self._serving_site,
-                   'raster': self._serving_raster}
-        self.pub_baseline.publish(String(json.dumps(payload)))
-        self._baseline_published_key = self._grid_key
-        rospy.loginfo('[gloc] baseline PUBLISHED for %s/%s: rms %.3f overlap %s '
-                      '(%d docked captures) -> /gloc/baseline',
-                      self._serving_site, self._serving_raster,
-                      self._rms_baseline,
-                      ('%.2f' % self._last_overlap_frac)
-                      if self._last_overlap_frac is not None else 'n/a',
-                      self._baseline_dock_captures)
-
     # ---- map ------------------------------------------------------------------
 
     def cb_grid(self, msg):
-        # servesync (2026-07-12): an explicitly EMPTY (0x0, header-only) grid from
-        # mapping_manager means "no map is being served" (a FRESH site is being
-        # mapped) — CLEAR the in-memory map so the tracker goes no_map instead of
-        # silently keeping the previous site's grid/EDT latched (it would keep
-        # matching the OLD map under the NEW site's datum). A merely sparse grid
-        # (<20 occupied but nonzero cells) keeps the old skip-and-retain semantics.
-        if msg.info.width * msg.info.height == 0:
-            with self._lock:
-                had = self._grid is not None
-                self._grid = None
-                self._edt = None
-                self._edt_gx = None
-                self._edt_gy = None
-                self._grid_stamp = None
-                self._rms_baseline = None   # raster gone -> baseline invalid
-                self._grid_key = None
-                self._baseline_dock_captures = 0
-                self._baseline_published_key = None
-            if had:
-                rospy.logwarn('[gloc] served map cleared (empty grid — fresh site '
-                              'being mapped); tracker -> no_map until a map is '
-                              'served again')
-            return
         if abs(euler_from_quaternion([msg.info.origin.orientation.x,
                                       msg.info.origin.orientation.y,
                                       msg.info.origin.orientation.z,
@@ -572,26 +353,6 @@ class GlocServer(object):
             self._edt_gx = (gx / msg.info.resolution).astype(np.float32)
             self._edt_gy = (gy / msg.info.resolution).astype(np.float32)
             self._grid_stamp = msg.header.stamp
-            # RASTER-AWARE BASELINE: a genuinely new raster (different shape or
-            # origin = a different site/map) invalidates the measured rms
-            # baseline so it re-calibrates against the new raster. Incremental
-            # updates of the SAME grid (rtabmap growing it) keep the baseline.
-            key = (h, w, round(msg.info.origin.position.x, 3),
-                   round(msg.info.origin.position.y, 3))
-            if key != self._grid_key:
-                self._grid_key = key
-                self._rms_baseline = None
-                self._relock_probe = None   # RELOCK V2: raster gone -> candidate void
-                self._baseline_dock_captures = 0
-                self._baseline_published_key = None
-                # SEED from a persisted baseline (mapping_manager republished it
-                # on serve) so a booted-calibrated map starts with the right
-                # poor_match/lost scale before self-calibration refines it.
-                if self._baseline_seed is not None:
-                    self._rms_baseline = self._baseline_seed
-                    rospy.loginfo('[gloc] rms baseline seeded %.3f on map load '
-                                  '(persisted, raster %s)', self._baseline_seed,
-                                  self._baseline_seed_raster)
         if self._last_result is None:
             self._set_status('idle')
         rospy.loginfo('[gloc] map %dx%d @ %.2f m updated (occ %d, free %d)',
@@ -654,7 +415,7 @@ class GlocServer(object):
              + arr[r0 + 1, c0] * (1 - fc) * fr + arr[r0 + 1, c0 + 1] * fc * fr)
         return v, ok
 
-    def _cb_loc_status(self, m):
+    def _cb_bridge_status(self, m):
         """ENGAGE FAST (2026-07-12): parse BOTH gps_good (=_gps_stable, pose
         ownership incl. the ~8 s outage grace) and fix_usable (=raw
         position_fix_usable, drops immediately on denial) from the human-readable
@@ -664,14 +425,9 @@ class GlocServer(object):
         window instead of dead-reckoning through the first ~8 s of every denial.
         navi_transform's callback_map_coords now also yields the georef the
         moment fix_usable==0, so the two never write map->odom at the same time."""
-        # AUDIT E1: typed JSON /nav_tf/loc_status ('gps_good', 'fix_usable')
-        # replaces the old 'gps_good=1' substring parse of bridge_status.
-        try:
-            d = json.loads(m.data or '{}')
-        except ValueError:
-            return
-        gps_stable = bool(d.get('gps_good'))
-        fix_usable = bool(d.get('fix_usable'))
+        d = m.data or ''
+        gps_stable = 'gps_good=1' in d
+        fix_usable = 'fix_usable=1' in d
         self._gps_stable = gps_stable
         self._fix_usable = fix_usable
         self._gps_good = gps_stable and fix_usable
@@ -680,7 +436,6 @@ class GlocServer(object):
         # back the streak is cleared, no lingering engagement.
         if fix_usable:
             self._fix_lost_since = None
-            self._relock_probe = None   # RELOCK V2: GPS owns again -> probation moot
         elif self._fix_lost_since is None:
             self._fix_lost_since = time.time()
 
@@ -707,15 +462,10 @@ class GlocServer(object):
         track_engage_after_s — i.e. we are in the "waiting to see if this is a
         real denial or just a flap" window. False once the fix is back (no
         delay on the way back) or once the denial has proven itself real."""
-        # AUDIT A5 (2026-08-01): guard was INVERTED since 2026-07-12 — it read
-        # `if not self._tracker_should_idle()` and returned False exactly when
-        # the fix was LOST (the only case the delay exists for), so the 5 s
-        # anti-flap window NEVER held the tracker back. _tracker_should_idle()
-        # is True when the fix is usable (tracker idles under GPS ownership).
-        if self._tracker_should_idle():
+        if not self._tracker_should_idle():
             return False   # fix is usable right now -> not even in question
         if self._fix_lost_since is None:
-            return False   # should not happen (lost implies timestamp), safe default
+            return False   # should not happen (idle implies lost), safe default
         return (time.time() - self._fix_lost_since) < self.track_engage_after_s
 
     def _tracker_engaged(self):
@@ -735,18 +485,6 @@ class GlocServer(object):
         exceeds threshold (immediate resume on motion, no symmetric delay)."""
         vx = m.twist.twist.linear.x
         wz = m.twist.twist.angular.z
-        # RELOCK V2: odom pose for probation prediction + travelled-while-lost
-        # for the radius gate (odom pose delta, no dt integration needed).
-        _q = m.pose.pose.orientation
-        _yaw = math.atan2(2.0 * (_q.w * _q.z + _q.x * _q.y),
-                          1.0 - 2.0 * (_q.y * _q.y + _q.z * _q.z))
-        _prev = self._odom_pose
-        self._odom_pose = (m.pose.pose.position.x, m.pose.pose.position.y, _yaw)
-        if self._lost_since is not None and _prev is not None:
-            self._lost_travel_m += math.hypot(self._odom_pose[0] - _prev[0],
-                                              self._odom_pose[1] - _prev[1])
-        elif self._lost_since is None:
-            self._lost_travel_m = 0.0
         slow = abs(vx) < self.track_standstill_lin_mps and abs(wz) < self.track_standstill_ang_rps
         if not slow:
             self._standstill_since = None
@@ -767,7 +505,7 @@ class GlocServer(object):
             _, _, res, ox, oy, h, w = self._grid
         x, y, th = pose0
         n_used = 0
-        best = None            # (rms, pose, overlap) — return the best iterate: near
+        best = None            # (rms, pose) — return the best iterate: near
         first_eigs = None      # convergence the on-ridge EDT gradients
         #                        collapse and a raw GN step OSCILLATES
         for it in range(self.track_max_iter):
@@ -786,13 +524,8 @@ class GlocServer(object):
             r, gx, gy = r[use], gx[use], gy[use]
             px, py = pts_base[use, 0], pts_base[use, 1]
             rms = float(np.sqrt(np.mean(r ** 2)))
-            # SCAN OVERLAP: fraction of aligned (in-map) scan points that fall
-            # within track_overlap_dist_m of mapped structure. Near 0 = the scan
-            # does not correspond to the map (nothing to match); near 1 = the
-            # scan sits on mapped geometry. Gates the baseline capture.
-            ov = float(np.mean(r < self.track_overlap_dist_m))
             if best is None or rms < best[0]:
-                best = (rms, (x, y, th), ov)
+                best = (rms, (x, y, th))
             dth = gx * (-s * px - c * py) + gy * (c * px - s * py)
             J = np.stack([gx, gy, dth], axis=1)
             H = J.T @ J
@@ -819,9 +552,8 @@ class GlocServer(object):
             th += delta[2]
             if dnorm < 0.002 and abs(delta[2]) < 1e-4:
                 break
-        rms, pose, overlap_frac = best
+        rms, pose = best
         return {'pose': pose, 'rms': rms, 'n': n_used,
-                'overlap_frac': overlap_frac,
                 'eig_min': float(first_eigs[0]), 'eig_max': float(first_eigs[1])}
 
     def _bigcorr_reset(self):
@@ -855,48 +587,6 @@ class GlocServer(object):
               ratio < self.track_bigcorr_consist_ratio)
         return ok, spread_deg, ratio
 
-    def _effective_max_rms(self):
-        """RASTER-AWARE poor_match/lost threshold: scale up on a sparse raster
-        via the measured good-pose baseline, but NEVER below the old absolute
-        floor (track_max_rms_m) — band rasters (baseline*factor < floor) keep
-        the exact legacy 0.20 m gate, no regression."""
-        if self._rms_baseline is None:
-            return self.track_max_rms_m
-        return max(self.track_max_rms_m,
-                   self._rms_baseline * self.track_lost_rms_factor)
-
-    def _relock_cand_rms(self, pose):
-        """Align rms of the live scan at a candidate map pose (Gauss-Newton,
-        the SAME metric as the tracker baseline) — used by the relock
-        absolute-quality gate. Returns None if it can not be evaluated."""
-        scan = self._last_scan
-        if scan is None:
-            return None
-        try:
-            pts = self._scan_points_base(scan)
-        except Exception:
-            return None
-        if pts is None:
-            return None
-        out = self._track_align(pts, pose)
-        return out.get('rms')
-
-    def _relock_cand_quality(self, pose):
-        """RELOCK V2: rms + overlap_frac of the live scan at a candidate pose
-        (same Gauss-Newton metric as the tracker). Returns (rms, overlap) or
-        (None, None)."""
-        scan = self._last_scan
-        if scan is None:
-            return None, None
-        try:
-            pts = self._scan_points_base(scan)
-        except Exception:
-            return None, None
-        if pts is None:
-            return None, None
-        out = self._track_align(pts, pose)
-        return out.get('rms'), out.get('overlap_frac')
-
     def _try_relock(self, info):
         """Run the global kidnap scorer and, if it passes the margin + yaw-sanity
         gates, publish the found pose to /nav_tf/set_map_pose_tracker (navi_transform
@@ -928,213 +618,38 @@ class GlocServer(object):
             self._set_status('relock rejected: %s' % why)
             return False
         b = r['best']
-        # (1b) RELOCK V2 RADIUS GATE: the candidate must lie within the
-        # plausibility circle around the current (drifting) pose — radius grows
-        # with distance travelled while lost. Outside = physically impossible,
-        # however good the score looks.
-        _radius = min(self.relock_radius_max_m,
-                      self.relock_radius_base_m
-                      + self.relock_radius_per_m * self._lost_travel_m)
-        _dcur0 = r.get('delta_to_current') or {}
-        _d0 = _dcur0.get('dist_m')
-        info['relock_radius_m'] = round(_radius, 2)
-        info['relock_lost_travel_m'] = round(self._lost_travel_m, 2)
-        if _d0 is not None and _d0 > _radius:
-            rospy.logwarn('[gloc-track] AUTO-RELOCK REJECTED: candidate %.2f m '
-                          'away > plausibility radius %.2f m (lost travel '
-                          '%.2f m) — physically implausible, staying lost.',
-                          _d0, _radius, self._lost_travel_m)
-            info['state'] = 'relock_failed'
-            info['relock_radius_reject'] = True
-            self._set_status('relock rejected: %.2fm > radius %.2fm' % (_d0, _radius))
-            return False
-        # (2) RELOCK ABSOLUTE-QUALITY GATE (2026-07-19 incident): the relative
-        # margin is meaningless on a sparse DIRECT raster — every wrong
-        # hypothesis is equally terrible, so the runner-up gap (margin) inflates
-        # even for a garbage lock (337% on the 4.68 m teleport). Require the
-        # candidate's OWN align rms to be near the calibrated good-pose baseline.
-        # Relative margin NEVER suffices alone. Fallback to an absolute floor
-        # when no trusted baseline has been measured on this raster yet.
-        cand_rms, cand_overlap = self._relock_cand_quality(
-            (b['x'], b['y'], math.radians(b['yaw_deg'])))
-        abs_gate = (self._rms_baseline * self.relock_abs_rms_factor
-                    if self._rms_baseline is not None
-                    else self.relock_abs_rms_floor_m)
-        info['relock_cand_rms'] = None if cand_rms is None else round(cand_rms, 3)
-        info['relock_abs_gate'] = round(abs_gate, 3)
-        info['relock_baseline'] = (None if self._rms_baseline is None
-                                   else round(self._rms_baseline, 3))
-        info['relock_cand_overlap'] = (None if cand_overlap is None
-                                       else round(cand_overlap, 2))
-        if (cand_rms is None or cand_rms > abs_gate
-                or cand_overlap is None
-                or cand_overlap < self.relock_overlap_min):
-            rospy.logwarn('[gloc-track] AUTO-RELOCK REJECTED: candidate rms %s > '
-                          'absolute gate %.3f (baseline %s) — margin %.0f%% alone '
-                          'is NOT trusted on a sparse raster; staying lost, retry '
-                          'in %.0fs',
-                          ('%.3f' % cand_rms) if cand_rms is not None else 'n/a',
-                          abs_gate,
-                          ('%.3f' % self._rms_baseline) if self._rms_baseline
-                          is not None else 'none',
-                          r['margin'] * 100, self.relock_min_interval_s)
-            info['state'] = 'relock_failed'
-            info['relock_abs_reject'] = True
-            self._set_status('relock rejected: rms %s > gate %.3f'
-                             % (('%.3f' % cand_rms) if cand_rms is not None
-                                else 'n/a', abs_gate))
-            return False
-        # (3) BIG-DELTA CORROBORATION (2026-07-19 incident: a 4.68 m auto-relock
-        # teleport on lidar alone). A far jump (> relock_big_delta_m) is
-        # high-consequence — require EXTERNAL corroboration (docked OR a live GPS
-        # fix). Absent it, PUBLISH the hypothesis to track_status for
-        # observability and log loudly, but do NOT apply — the operator can still
-        # force it via /gloc/apply (manual path is unaffected).
-        _dcur = r.get('delta_to_current') or {}
-        _delta_m = _dcur.get('dist_m')
-        _probe_mult = 1.0
-        if _delta_m is not None and _delta_m > self.relock_big_delta_m:
-            corrob = self._docked or self._gps_good
-            if self.relock_bigdelta_require_corrob and not corrob:
-                # RELOCK V2: a far uncorroborated jump is no longer flatly
-                # refused — it gets an EXTENDED probation (more travel, more
-                # confirming ticks) instead. The old observability logging is
-                # kept below for the status consumer.
-                _probe_mult = self.relock_bigdelta_probe_mult
-                rospy.logwarn('[gloc-track] AUTO-RELOCK far jump %.2f m (> %.2f m) '
-                              'WITHOUT corroboration (docked=%s gps=%s) — '
-                              'entering EXTENDED probation (x%.0f travel/ticks).',
-                              _delta_m, self.relock_big_delta_m, self._docked,
-                              self._gps_good, _probe_mult)
-                info['relock_bigdelta_uncorroborated'] = True
-        # SOFT-MAP RELOCK GUARD (2026-07-12): a FAR relock (moves the pose more
-        # than relock_big_delta_m) is high-consequence on a soft/aliased map —
-        # require a stronger-than-normal margin. The garage shove (delta 1.47 m,
-        # margin 112%) is rejected here; a decisive far relock (e.g. margin 280%)
-        # still passes, so genuine recovery from a real large offset is unaffected.
-        _dcur = r.get('delta_to_current') or {}
-        _delta_m = _dcur.get('dist_m')
-        if (_delta_m is not None and _delta_m > self.relock_big_delta_m and
-                r['margin'] < self.relock_big_delta_margin):
-            rospy.logwarn('[gloc-track] AUTO-RELOCK REJECTED: far jump %.2f m '
-                          '(> %.2f m) at margin %.0f%% < soft-map gate %.0f%% — '
-                          'staying lost, will retry in %.0fs', _delta_m,
-                          self.relock_big_delta_m, r['margin'] * 100,
-                          self.relock_big_delta_margin * 100,
-                          self.relock_min_interval_s)
-            info['state'] = 'relock_failed'
-            info['relock_far_reject'] = True
-            self._set_status('relock rejected: far %.2fm at margin %.0f%%'
-                             % (_delta_m, r['margin'] * 100))
-            return False
-        # RELOCK V2 PROBATION: do NOT publish yet. Stash the candidate with the
-        # current odom pose; _relock_probe_tick re-scores the odometry-predicted
-        # candidate each tick and only a candidate that KEEPS matching while the
-        # robot moves gets applied. A fluke one-angle match dies within 0.5 m.
-        b = r['best']
-        self._relock_probe = {
-            'pose': (b['x'], b['y'], math.radians(b['yaw_deg'])),
-            'odom0': self._odom_pose,
-            't0': time.time(),
-            'ticks_ok': 0,
-            'need_ticks': max(1, int(round(self.relock_probe_ticks * _probe_mult))),
-            'need_travel': self.relock_probe_travel_m * _probe_mult,
-            'margin': r['margin'],
-        }
-        dcur = r.get('delta_to_current') or {}
-        rospy.logwarn('[gloc-track] RELOCK CANDIDATE (%.2f, %.2f, %.1fdeg) margin '
-                      '%.0f%% rms %.3f overlap %.2f delta %.2fm — PROBATION: needs '
-                      '%d confirming ticks over >= %.2f m of travel.',
-                      b['x'], b['y'], b['yaw_deg'], r['margin'] * 100, cand_rms,
-                      cand_overlap, dcur.get('dist_m', -1),
-                      self._relock_probe['need_ticks'],
-                      self._relock_probe['need_travel'])
-        self._set_status('relock probation (%.2f, %.2f) %d ticks / %.2f m'
-                         % (b['x'], b['y'], self._relock_probe['need_ticks'],
-                            self._relock_probe['need_travel']))
-        info['state'] = 'relock_probe'
-        info['relock_hyp_x'] = b['x']
-        info['relock_hyp_y'] = b['y']
-        info['relock_hyp_yaw_deg'] = b['yaw_deg']
-        return True
-
-    def _relock_probe_tick(self, info):
-        """RELOCK V2: one probation step. Predict the candidate forward with the
-        odometry delta since capture, re-score the live scan there; enough
-        confirming ticks over enough travel -> APPLY; one failing tick -> drop."""
-        pr = self._relock_probe
-        if pr is None:
-            return
-        if (time.time() - pr['t0']) > self.relock_probe_timeout_s:
-            rospy.logwarn('[gloc-track] relock probation TIMED OUT — dropped.')
-            self._relock_probe = None
-            return
-        if self._odom_pose is None or pr['odom0'] is None:
-            info['state'] = 'relock_probe'
-            return
-        ox0, oy0, oyaw0 = pr['odom0']
-        ox1, oy1, oyaw1 = self._odom_pose
-        dx, dy = ox1 - ox0, oy1 - oy0
-        travel = math.hypot(dx, dy)
-        info['state'] = 'relock_probe'
-        info['relock_probe_travel'] = round(travel, 2)
-        info['relock_probe_ticks_ok'] = pr['ticks_ok']
-        if travel < 0.05 and abs(oyaw1 - oyaw0) < 0.05:
-            return   # not moved yet — probation waits for motion (no free ticks)
-        # compose candidate with the odom delta rotated into the candidate frame
-        cx, cy, cyaw = pr['pose']
-        th = cyaw - oyaw0
-        px = cx + math.cos(th) * dx - math.sin(th) * dy
-        py = cy + math.sin(th) * dx + math.cos(th) * dy
-        pyaw = cyaw + (oyaw1 - oyaw0)
-        rms, overlap = self._relock_cand_quality((px, py, pyaw))
-        abs_gate = (self._rms_baseline * self.relock_abs_rms_factor
-                    if self._rms_baseline is not None
-                    else self.relock_abs_rms_floor_m)
-        ok = (rms is not None and rms <= abs_gate
-              and overlap is not None and overlap >= self.relock_overlap_min)
-        if not ok:
-            rospy.logwarn('[gloc-track] relock probation FAILED after %.2f m '
-                          '(rms %s gate %.3f, overlap %s) — candidate dropped, '
-                          'staying lost.', travel,
-                          ('%.3f' % rms) if rms is not None else 'n/a', abs_gate,
-                          ('%.2f' % overlap) if overlap is not None else 'n/a')
-            self._relock_probe = None
-            self._set_status('relock probation failed — lost')
-            return
-        pr['ticks_ok'] += 1
-        if pr['ticks_ok'] < pr['need_ticks'] or travel < pr['need_travel']:
-            self._set_status('relock probation %d/%d ticks, %.2f/%.2f m'
-                             % (pr['ticks_ok'], pr['need_ticks'], travel,
-                                pr['need_travel']))
-            return
-        # PASSED — apply the PREDICTED pose (current position, not the stale capture)
         ps = PoseStamped()
         ps.header.stamp = rospy.Time.now()
         ps.header.frame_id = self.map_frame
-        ps.pose.position.x = px
-        ps.pose.position.y = py
-        q = quaternion_from_euler(0, 0, pyaw)
-        ps.pose.orientation.x, ps.pose.orientation.y = q[0], q[1]
-        ps.pose.orientation.z, ps.pose.orientation.w = q[2], q[3]
+        ps.pose.position.x = b['x']
+        ps.pose.position.y = b['y']
+        q = quaternion_from_euler(0, 0, math.radians(b['yaw_deg']))
+        ps.pose.orientation.x = q[0]
+        ps.pose.orientation.y = q[1]
+        ps.pose.orientation.z = q[2]
+        ps.pose.orientation.w = q[3]
         self.pub_track_pose.publish(ps)
-        self._relock_probe = None
+        # fresh lock — clear all reject/smoothing state so the tracker resumes
+        # clean from the snapped pose next tick.
         self._lost_since = None
         self._bigcorr_reset()
         self._persist_dirs = []
         self._ema_pose = None
         self._reject_reason = None
         self._reject_streak = 0
-        rospy.logwarn('[gloc-track] RELOCK APPLIED after probation (%d ticks, '
-                      '%.2f m) -> /nav_tf/set_map_pose_tracker (%.2f, %.2f, '
-                      '%.1fdeg)', pr['ticks_ok'], travel, px, py,
-                      math.degrees(pyaw))
-        self._set_status('RELOCK APPLIED (%.2f, %.2f) po probaci' % (px, py))
+        dcur = r.get('delta_to_current') or {}
+        rospy.logwarn('[gloc-track] AUTO-RELOCK APPLIED -> /nav_tf/set_map_pose_tracker '
+                      '(%.2f, %.2f, %.1fdeg) margin %.0f%% delta %.2fm '
+                      '(navi_transform snaps if >0.6m)', b['x'], b['y'],
+                      b['yaw_deg'], r['margin'] * 100, dcur.get('dist_m', -1))
+        self._set_status('RELOCK APPLIED (%.2f, %.2f, %.1fdeg) margin %.0f%%'
+                         % (b['x'], b['y'], b['yaw_deg'], r['margin'] * 100))
         info['state'] = 'relock'
-        info['relock_x'] = px
-        info['relock_y'] = py
-        info['relock_yaw_deg'] = round(math.degrees(pyaw), 1)
-        info['applied'] = True
+        info['relock_x'] = b['x']
+        info['relock_y'] = b['y']
+        info['relock_yaw_deg'] = b['yaw_deg']
+        info['relock_delta_m'] = dcur.get('dist_m')
+        return True
 
     def _track_tick(self, _evt):
         info = {'applied': False}
@@ -1154,11 +669,6 @@ class GlocServer(object):
                 held = time.time() - self._lost_since
                 info['lost_held_s'] = round(held, 1)
                 info['reject_reason'] = self._reject_reason
-                # RELOCK V2: an active probation owns the lost ticks — no new
-                # scorer runs while a candidate is being verified.
-                if self._relock_probe is not None:
-                    self._relock_probe_tick(info)
-                    return
                 if (held >= self.track_lost_after_s and
                         time.time() - self._last_relock_t >= self.relock_min_interval_s):
                     self._try_relock(info)
@@ -1197,49 +707,9 @@ class GlocServer(object):
                          'track_active_mode': self.track_active_mode,
                          'rtabmap_confident': self._rtab_conf,
                          'engage_delay_active': self._engage_delay_active(),
-                         'is_standstill': self._is_standstill,
-                         'docked': self._docked})
+                         'is_standstill': self._is_standstill})
+            rms_ok = out['rms'] <= self.track_max_rms_m
             eig_ok = out['eig_min'] >= self.track_min_eig_frac * out['n']
-            overlap_frac = out.get('overlap_frac')
-            self._last_overlap_frac = overlap_frac
-            info['overlap_frac'] = (None if overlap_frac is None
-                                    else round(overlap_frac, 3))
-            # (1) SELF-CALIBRATING RMS BASELINE: while a TRUSTED anchor holds the
-            # pose (gps_good OR docked) and the match is healthy (eig ok, the
-            # align did NOT run off toward an alias), capture this raster's
-            # expected good-match rms into an EMA. This is what recalibrates the
-            # poor_match/lost gate for the sparse DIRECT raster without any
-            # hardcoding — it is measured live at the actual location.
-            # PROTOCOL 2026-07-19: ALSO require SCAN OVERLAP (overlap_frac >
-            # track_overlap_min) so a trusted anchor holding over UNMAPPED space
-            # (scan does not match the raster) can no longer contaminate the
-            # baseline toward the cap (~0.9) — the tonight contamination fix.
-            overlap_ok = (overlap_frac is not None
-                          and overlap_frac > self.track_overlap_min)
-            if ((self._gps_good or self._docked) and eig_ok and overlap_ok
-                    and dx <= self.track_max_corr_m):
-                # AUDIT G4 (2026-08-01): under self._lock — cb_grid resets the
-                # baseline (raster swap) holding the lock; this unlocked EMA
-                # read-modify-write could write the OLD raster's baseline back
-                # after the swap and skew the new map's poor_match/lost gate.
-                with self._lock:
-                    if self._rms_baseline is None:
-                        self._rms_baseline = out['rms']
-                    else:
-                        a = self.track_baseline_alpha
-                        self._rms_baseline = ((1.0 - a) * self._rms_baseline
-                                              + a * out['rms'])
-                # PER-MAP PERSISTENCE: count DOCKED calibration captures on the
-                # served raster; once stabilised, publish for mapping_manager.
-                if self._docked:
-                    self._baseline_dock_captures += 1
-                    self._maybe_publish_baseline()
-            info['baseline_dock_captures'] = self._baseline_dock_captures
-            eff_max_rms = self._effective_max_rms()
-            info['rms_baseline'] = (None if self._rms_baseline is None
-                                    else round(self._rms_baseline, 3))
-            info['eff_max_rms'] = round(eff_max_rms, 3)
-            rms_ok = out['rms'] <= eff_max_rms
             corr_ok = (dx <= self.track_max_corr_m and
                        dyaw <= self.track_max_corr_yaw_deg)
             if not rms_ok:
@@ -1305,13 +775,11 @@ class GlocServer(object):
             # correction is healthy (or slewed) — apply only when GPS is denied
             # (the GPS arbiter owns the pose otherwise) and rtabmap does not have
             # priority (defer default OFF 2026-07-11; ~track_defer_to_rtabmap).
-            # AUDIT A5 (2026-08-01): gate on _tracker_engaged(), not bare
-            # _tracker_should_idle() — the old test let corrections fly the
-            # INSTANT the fix dropped (engage_delay state was unreachable:
-            # its check sat inside the fix-usable branch). Now: GPS usable ->
-            # gps_owns; fix lost < engage_after_s -> engage_delay holds the
-            # tracker off (anti-flap); only a proven denial engages.
-            if not self._tracker_engaged():
+            if self._tracker_should_idle():
+                # RULE 1 — ENGAGE DELAY: the raw fix is currently unusable, but
+                # distinguish "still waiting to see if this is a real denial"
+                # from "GPS is simply back and owns the pose" so the status is
+                # honest about which gate is holding the tracker off.
                 if self._engage_delay_active():
                     info['state'] = 'engage_delay'
                     info['fix_lost_held_s'] = round(
@@ -1689,32 +1157,21 @@ class GlocServer(object):
         self._do_apply(r, why='force' if force else 'manual')
 
     def _do_apply(self, r, why):
-        # AUDIT A6 (2026-08-01): route through the LIVE channel. The old target
-        # /rtabmap/initialpose has no subscriber in site-native (rtabmap is not
-        # running) — manual apply published into the void while reporting
-        # APPLIED. /nav_tf/set_map_pose_tracker is the same channel the
-        # auto-relock uses; navi_transform arbitrates it under the WP2 rules.
-        # The legacy initialpose is still published as a no-op courtesy for a
-        # future rtabmap session (latched consumers may appear late).
-        ps = PoseStamped()
-        ps.header.stamp = rospy.Time.now()
-        ps.header.frame_id = self.map_frame
-        ps.pose.position.x = r['best']['x']
-        ps.pose.position.y = r['best']['y']
-        qx, qy, qz, qw = quaternion_from_euler(0, 0, math.radians(r['best']['yaw_deg']))
-        ps.pose.orientation.x = qx
-        ps.pose.orientation.y = qy
-        ps.pose.orientation.z = qz
-        ps.pose.orientation.w = qw
-        self.pub_track_pose.publish(ps)
         out = PoseWithCovarianceStamped()
-        out.header = ps.header
-        out.pose.pose = ps.pose
+        out.header.stamp = rospy.Time.now()
+        out.header.frame_id = self.map_frame
+        out.pose.pose.position.x = r['best']['x']
+        out.pose.pose.position.y = r['best']['y']
+        qx, qy, qz, qw = quaternion_from_euler(0, 0, math.radians(r['best']['yaw_deg']))
+        out.pose.pose.orientation.x = qx
+        out.pose.pose.orientation.y = qy
+        out.pose.pose.orientation.z = qz
+        out.pose.pose.orientation.w = qw
         out.pose.covariance = self._apply_cov
         self.pub_initialpose.publish(out)
-        self._set_status('APPLIED (%s) -> set_map_pose_tracker (%.2f, %.2f, %.1fdeg)'
+        self._set_status('APPLIED (%s) -> rtabmap initialpose (%.2f, %.2f, %.1fdeg)'
                          % (why, r['best']['x'], r['best']['y'], r['best']['yaw_deg']))
-        rospy.loginfo('[gloc] APPLIED (%s) -> /nav_tf/set_map_pose_tracker (%.2f, %.2f, %.1fdeg)',
+        rospy.loginfo('[gloc] APPLIED (%s) -> /rtabmap/initialpose (%.2f, %.2f, %.1fdeg)',
                       why, r['best']['x'], r['best']['y'], r['best']['yaw_deg'])
 
 

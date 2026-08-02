@@ -10,33 +10,11 @@
 <!--            <remap from="/topic" to="/another_topic" />-->
         <!-- </node> -->
         <node name="navi_transform" pkg="vitulus_navi" type="navi_transform" respawn="true" respawn_delay="1" output="log">
-            <!-- 2026-08-02 field fix: spread cap musi pojmout realny sum vzorku
-                 (sigma 1.2-1.6 deg) — 1.5 deg okno NIKDY neproslo (vecny freeze).
-                 6 deg = ~2.5 sigma; multipath rampu (>1 deg/s) chyti i tak. -->
-            <param name="heading_anchor_spread_max_deg" value="6.0"/>
         </node>
         <!-- lidar global localization scorer (passive; apply is margin-gated) -->
         <node name="gloc_server" pkg="vitulus_navi" type="gloc_server" respawn="true" respawn_delay="2" output="log">
             <!-- EDT tracker localizes against the served mapping-v3 site raster -->
             <param name="map_topic" value="/mapping_manager/site_map"/>
-            <!-- 2026-07-19 INCIDENT: auto-relock teleported the pose 4.68 m on
-                 the new DIRECT raster — its sparse obstacle landscape inflates
-                 relative margins (337% on a false lock) and the baseline rms is
-                 ~3x higher than on band rasters, so the lost->relock chain is
-                 unsafe. DISABLED until the scorer is recalibrated for direct
-                 rasters with an ABSOLUTE quality gate + external corroboration
-                 (RTK/dock) for big-delta applies.
-                 RELOCK V2 (2026-08-02) is now implemented: plausibility-radius
-                 search gate + rms+overlap absolute quality + motion-verified
-                 PROBATION before any apply (big jumps = extended probation).
-                 Flip to true for the courtyard kidnap field test; keep false
-                 until that test passes. -->
-            <param name="relock_enable" value="false"/>
-        </node>
-        <!-- AUDIT dock-idle (2026-08-01): pauses VO+ICP odometry while docked
-             (load avg 15.9 in the dock, VO alone >1 core in the dark); resumes
-             the instant undocking begins. ~enable:=false = no-op rollback. -->
-        <node name="dock_idle" pkg="vitulus_navi" type="dock_idle" respawn="true" respawn_delay="2" output="log">
         </node>
     </group>
 

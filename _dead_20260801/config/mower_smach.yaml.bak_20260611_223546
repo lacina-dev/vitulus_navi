@@ -1,0 +1,96 @@
+# ===========================================================================
+# mower_unit_smach configuration
+#
+# Loaded into the private namespace of the node_mower_smach node, so each key
+# below is read as a private param (~key) by helpers.get_weather_config().
+#
+# Read PER CHECK at runtime, so `rosparam set /node_mower_smach/<key> <val>`
+# takes effect without restarting the node.
+# ===========================================================================
+
+# --- Rain gating ------------------------------------------------------------
+# How the mission reacts to the rain forecast (weather_alert/RainAlert).
+
+# true = skip ALL rain checks (pre-start and in-mission). For testing / override.
+weather_rain_bypass: true
+
+# Forecast statuses that count as "rain" and block mowing.
+# The RainAlert nowcast fields carry strings like RAIN / ALERT / WARN / DRY.
+# Was RAIN/ALERT/WARN historically; narrowed to RAIN to avoid false stops.
+weather_reject_statuses: ["RAIN"]
+
+# How far ahead to look, in minutes. The RainAlert message only carries
+# 10/20/30-minute nowcast steps, so this is clamped to 10, 20 or 30.
+# Number of forecast steps checked = horizon // 10 (e.g. 30 -> 3 steps).
+weather_forecast_horizon_min: 30
+
+# In-mission only: how many forecast steps must be a reject status before the
+# robot returns to dock. Pre-start rejects already on a single reject step;
+# during a mission we require this many (default 2 of 3) so one noisy step does
+# not abort an otherwise dry run.
+weather_monitor_min_steps: 2
+
+# ===========================================================================
+# Tuning parameters extracted from mower_unit_smach (high + medium priority).
+#
+# Each value below equals the previous hard-coded default, so loading this file
+# does not change behaviour — it only exposes the knobs for tuning.
+#
+# Read timing:
+#   * battery_* : read PER CHECK (PreStartCheck / BATTERY_MONITOR) -> a live
+#                 `rosparam set` takes effect immediately.
+#   * all others: read once when the state machine is built, so changing them
+#                 requires a node restart (respawn) to take effect.
+# ===========================================================================
+
+# --- Battery gating ---------------------------------------------------------
+battery_min_start_pct: 40       # PreStartCheck: reject a mission below this %
+battery_return_pct: 25          # BATTERY_MONITOR: return to dock at/below this %
+
+# --- Path windowing (WindowPlannerPath) -------------------------------------
+# Segmentisation is ~0.03 m/pose, so pose counts ≈ metres / 0.03.
+window_size: 200                # poses per emitted chunk
+window_fallback_step: 100       # fixed index advance when TF is unavailable
+window_end_tolerance: 0.4       # m to the path end that counts as "finished"
+window_tail_indices: 5          # within this many of the last pose = at the end
+
+# --- Costmap goal guard (WindowPlannerPath) ---------------------------------
+guard_safety_poses: 13          # ~0.40 m: end a chunk this far before an obstacle
+guard_detour_poses: 16          # ~0.50 m: closer than this -> global detour now
+guard_tail_poses: 23            # ~0.70 m: free run past obstacle below this -> trim
+
+# --- Path execution (ExecutePathWithFeedback) -------------------------------
+exe_step_size: 100              # poses; used for last-chunk detection
+exe_stall_time: 5.0             # s without motion -> stall
+exe_stall_move_eps: 0.08        # m; movement below this between samples = "stuck"
+exe_stall_sample_dt: 0.5        # s; TF sampling period for stall detection
+exe_progress_eps: 0.30          # m moved in a chunk -> re-window vs detour/recovery
+exe_near_chunk_end_dist: 0.6    # m to a (non-last) chunk goal -> re-window early
+exe_goal_stall_obstacle_s: 3.0  # s of no goal progress -> probe costmap for obstacle
+exe_goal_stall_time: 6.0        # s of no goal progress -> give up the chunk
+
+# --- Obstacle detour (DetourAroundObstacle) ---------------------------------
+detour_rejoin_distances_m: [1.5, 2.5, 4.0, 6.0]  # rejoin distances to try ahead
+detour_get_path_tolerance: 0.25  # m goal tolerance for the global detour plan
+
+# --- Escalation -------------------------------------------------------------
+max_consecutive_unmowable: 5    # consecutive un-mowable lines -> navigation error
+
+# --- "Go to start/begin" retries (mission flow) -----------------------------
+retry_get_path_to_start_max: 3  # GET_PATH_TO_START plan retries
+retry_get_path_to_begin_max: 3  # GET_PATH_TO_BEGIN plan retries
+retry_exe_to_begin_max: 3       # EXE_PATH_TO_BEGIN drive retries
+
+# --- BLOCKED motor recovery (build_blocked_recovery_sm) ---------------------
+blocked_phase1_retries: 2       # Phase 1 in-place motor restart attempts
+blocked_phase2_retries: 2       # Phase 2 raise-blade + restart attempts
+blocked_wait_run_timeout: 5.0   # s to wait for motor RUN after a restart (P1 & P2)
+blocked_wait_height_timeout: 60.0  # s to wait for READY after raising blade (P2)
+blocked_escape_poses: 67        # ~2 m: poses to drive forward in Phase 3 escape
+blocked_escape_motor_wait_timeout: 10.0  # s to wait for RUN after the escape
+
+# --- Navigation recovery (build_nav_recovery_sm) ----------------------------
+nav_blade_off_wait_s: 6         # s to wait for a dynamic obstacle to self-clear
+nav_backup_speed: 0.1           # m/s reverse speed for the backup maneuver
+nav_backup_distance: 0.4        # m to reverse during the backup maneuver
+nav_retry_max: 2                # same-chunk retries before handing off to detour

@@ -1,0 +1,185 @@
+#!/usr/bin/env python
+"""
+mower_unit_smach — Entry point for the autonomous mowing SMACH state machine.
+
+Architecture:
+  WAIT_FOR_PROGRAM → PRE_START_CHECK → MISSION_CONCURRENCE
+    ├── MISSION_CHILD (undock → map → mow zones → power off)
+    ├── WEATHER_MONITOR
+    ├── BATTERY_MONITOR
+    ├── MOWER_TEMP_MONITOR
+    └── STOP_MONITOR
+  RETURN_TO_DOCK (with embedded STOP monitor)
+  CRITICAL_ERROR (decision: try dock or go terminal)
+  TERMINAL_ERROR (quarantine: buzzer + wait for /mower_smach/reset)
+  STOPPED (recoverable pause after user STOP: wait for /mower_smach/reset)
+"""
+import rospy
+import smach
+import smach_ros
+
+from std_msgs.msg import Bool, String
+
+from mower_unit_smach.publishers import MowerPublishers
+from mower_unit_smach.helpers import wait_for_mbf, safe_blade_shutdown
+from mower_unit_smach.states import PreStartCheck
+from mower_unit_smach.top_level import (
+    CriticalErrorState, TerminalErrorState, StoppedState,
+    build_return_to_dock_with_stop)
+from mower_unit_smach.mission import (
+    build_wait_for_program, build_mission_concurrence)
+
+
+def main():
+    rospy.init_node('mower_unit_smach')
+    pubs = MowerPublishers()
+    pubs.smach_status.publish(String("Starting..."))
+    wait_for_mbf()
+
+    # ===================================================================
+    # Top-level State Machine
+    # ===================================================================
+    sm = smach.StateMachine(outcomes=['shutdown'])
+
+    # --- Userdata initialisation ---
+    sm.userdata.program = None
+    sm.userdata.path_plan = None
+    sm.userdata.path = None
+    sm.userdata.path_planner = None
+    sm.userdata.path_start_pose = None
+    sm.userdata.zone_cut_height = None
+    sm.userdata.zone_rpm = None
+    sm.userdata.zone_name = None
+    sm.userdata.zone_start_pose = None
+    sm.userdata.paths = None
+    sm.userdata.path_cost = None
+    sm.userdata.final_pose = None
+    sm.userdata.prg_start_time = None
+    sm.userdata.path_window_start_index = 0
+    sm.userdata.path_chunk = None
+    sm.userdata.path_chunk_trim_count = 0
+    sm.userdata.unfinished_active = False
+    sm.userdata.unfinished_zone = None
+    sm.userdata.unfinished_path = None
+    sm.userdata.unfinished_window = 0
+    sm.userdata.error_reason = ''
+    sm.userdata.restore_height_pending = False
+    sm.userdata.consecutive_nav_failures = 0
+    # Retry counters
+    sm.userdata.retry_get_path_to_start = 0
+    sm.userdata.retry_get_path_to_begin = 0
+    sm.userdata.retry_exe_to_begin = 0
+    sm.userdata.retry_planner = 0
+
+    pubs.smach_status.publish(String("Ready"))
+    pubs.active_program.publish(String(" "))
+
+    with sm:
+
+        # ==================== WAIT_FOR_PROGRAM ====================
+        wait_cc = build_wait_for_program(pubs)
+        smach.StateMachine.add('WAIT_FOR_PROGRAM', wait_cc,
+                               transitions={
+                                   'program_received': 'PRE_START_CHECK',
+                                   'preempted': 'WAIT_FOR_PROGRAM'
+                               })
+
+        # ==================== PRE_START_CHECK ====================
+        smach.StateMachine.add('PRE_START_CHECK', PreStartCheck(pubs),
+                               transitions={
+                                   'passed': 'MISSION_CONCURRENCE',
+                                   'rejected': 'WAIT_FOR_PROGRAM',
+                                   'preempted': 'TERMINAL_ERROR'
+                               })
+
+        # ==================== MISSION_CONCURRENCE ====================
+        mission_cc = build_mission_concurrence(pubs, sm)
+        smach.StateMachine.add('MISSION_CONCURRENCE', mission_cc,
+                               transitions={
+                                   'mission_complete': 'RETURN_TO_DOCK',
+                                   'weather_preempt': 'RETURN_TO_DOCK',
+                                   'battery_preempt': 'RETURN_TO_DOCK',
+                                   'temp_preempt': 'RETURN_TO_DOCK',
+                                   'stop_preempt': 'STOPPED',
+                                   'critical_error': 'CRITICAL_ERROR',
+                                   'preempted': 'TERMINAL_ERROR'
+                               })
+
+        # ==================== RETURN_TO_DOCK ====================
+        return_dock_cc = build_return_to_dock_with_stop(pubs)
+        smach.StateMachine.add('RETURN_TO_DOCK', return_dock_cc,
+                               transitions={
+                                   'succeeded': 'WAIT_FOR_PROGRAM',
+                                   'failed': 'CRITICAL_ERROR',
+                                   'stop_preempt': 'STOPPED',
+                                   'preempted': 'TERMINAL_ERROR'
+                               })
+
+        # ==================== CRITICAL_ERROR ====================
+        smach.StateMachine.add('CRITICAL_ERROR', CriticalErrorState(pubs),
+                               transitions={
+                                   'try_dock': 'RETURN_TO_DOCK',
+                                   'terminal': 'TERMINAL_ERROR',
+                                   'preempted': 'TERMINAL_ERROR'
+                               })
+
+        # ==================== TERMINAL_ERROR ====================
+        smach.StateMachine.add('TERMINAL_ERROR', TerminalErrorState(pubs),
+                               transitions={
+                                   'reset': 'WAIT_FOR_PROGRAM',
+                                   'preempted': 'shutdown'
+                               })
+
+        # ==================== STOPPED (recoverable pause) ====================
+        smach.StateMachine.add('STOPPED', StoppedState(pubs),
+                               transitions={
+                                   'resume': 'WAIT_FOR_PROGRAM',
+                                   'preempted': 'shutdown'
+                               })
+
+    # ===================================================================
+    # Introspection server (smach_viewer)
+    # ===================================================================
+    sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT')
+    sis.start()
+
+    # ===================================================================
+    # Periodic program state save (every 60s)
+    # ===================================================================
+    def periodic_save_callback(event):
+        if sm.userdata.program is not None:
+            try:
+                pubs.save_program.publish(sm.userdata.program)
+            except Exception as e:
+                rospy.logwarn("Periodic save failed: %s", e)
+
+    rospy.Timer(rospy.Duration(60), periodic_save_callback)
+
+    # ===================================================================
+    # Global STOP handler (for stops outside MISSION_CONCURRENCE)
+    # ===================================================================
+    def stop_callback(msg):
+        if msg.data:
+            rospy.logwarn("[GLOBAL_STOP] Signal received, safe shutdown")
+            safe_blade_shutdown(source='GLOBAL_STOP', pubs=pubs)
+            pubs.dock_cancel.publish(Bool(data=True))
+            # NOTE: Do NOT call sm.request_preempt() here.
+            # The STOP MonitorStates inside MISSION_CONCURRENCE and
+            # RETURN_TO_DOCK handle preemption internally and route to the
+            # recoverable STOPPED state. A top-level preempt would bypass
+            # STOPPED and kill the node.
+
+    rospy.Subscriber("/mower_smach/stop", Bool, stop_callback)
+
+    # ===================================================================
+    # Execute
+    # ===================================================================
+    rospy.loginfo("mower_unit_smach starting execution")
+    outcome = sm.execute()
+    rospy.loginfo("mower_unit_smach finished with outcome: %s", outcome)
+
+    sis.stop()
+
+
+if __name__ == "__main__":
+    main()

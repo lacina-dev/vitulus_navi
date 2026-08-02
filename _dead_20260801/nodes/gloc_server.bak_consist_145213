@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""gloc_server — 2D-lidar global localization scorer (likelihood field / EDT).
+
+Scores pose hypotheses (free-space positions x yaw angles) of the CURRENT
+/rtabmap/grid_map against ONE live /scan: score = mean distance of scan
+endpoints to the nearest occupied cell (distance transform). Coarse but fast
+(~0.5 s for ~100k hypotheses on the NUC) and unambiguity-aware: it reports the
+score margin to the best runner-up outside `ambiguity_radius`. rtabmap's lidar
+proximity (LocalRadius=8) does the precise refinement, so coarse is enough.
+
+Passive by default — computing NEVER moves the robot. The result is only
+applied to localization via the explicit /gloc/apply trigger (or ~auto_apply),
+and only when the margin clears ~apply_min_margin. Apply = publish the pose to
+/rtabmap/initialpose (same mechanism as the dock seed; the rtabmap bridge then
+carries it to the live pose when GPS is denied).
+
+Interfaces
+  in   /rtabmap/grid_map   nav_msgs/OccupancyGrid (latched by rtabmap)
+  in   /scan               sensor_msgs/LaserScan  (grabbed on demand)
+  trig /gloc/compute       std_msgs/String  ("" or "with_heatmap")
+  trig /gloc/localize      std_srvs/Trigger (returns JSON in message)
+  trig /gloc/apply         std_msgs/String  ("" = last result; "force" bypasses margin gate)
+  out  /gloc/result        std_msgs/String  (latched JSON, see build_result())
+  out  /gloc/heatmap       sensor_msgs/CompressedImage (latched PNG)
+  out  /gloc/status        std_msgs/String  (latched: idle/computing/error text)
+"""
+import io
+import json
+import math
+import threading
+import time
+
+import numpy as np
+from scipy import ndimage
+
+import rospy
+import tf2_ros
+from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import LaserScan, CompressedImage
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from std_msgs.msg import Bool
+from std_msgs.msg import String
+from std_srvs.srv import Trigger, TriggerResponse
+from tf.transformations import quaternion_from_euler, euler_from_quaternion
+
+
+class GlocServer(object):
+    def __init__(self):
+        self.pos_stride_m = rospy.get_param('~pos_stride_m', 0.30)
+        self.angle_step_deg = rospy.get_param('~angle_step_deg', 5.0)
+        self.n_rays = int(rospy.get_param('~n_rays', 120))
+        self.dist_cap_m = rospy.get_param('~dist_cap_m', 1.0)
+        self.occ_thresh = int(rospy.get_param('~occ_thresh', 65))
+        self.ambiguity_radius = rospy.get_param('~ambiguity_radius_m', 1.5)
+        # Lawn test 2026-07-04: a mirrored (~180deg-flipped) hypothesis reached
+        # margin 95% on open grass -> 50% was not safe there. 100% + the IMU-yaw
+        # sanity check below killed every observed false-confident case.
+        self.apply_min_margin = rospy.get_param('~apply_min_margin', 1.0)  # 100 %
+        # The gyro tracks rotation even when the robot is carried (kidnap), so the
+        # current heading stays roughly valid when position is lost — a candidate
+        # whose yaw disagrees wildly is a mirror alias, not the robot.
+        self.apply_max_yaw_dev = math.radians(
+            rospy.get_param('~apply_max_yaw_dev_deg', 45.0))
+        self.scan_topic = rospy.get_param('~scan_topic', '/scan')
+        self.auto_apply = bool(rospy.get_param('~auto_apply', False))
+        self.map_frame = rospy.get_param('~map_frame', 'map')
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        # apply covariance: coarse hypothesis -> looser than the dock seed
+        pos_std = rospy.get_param('~apply_pos_std', 0.30)
+        yaw_std = rospy.get_param('~apply_yaw_std', 0.10)
+        self._apply_cov = [0.0] * 36
+        self._apply_cov[0] = self._apply_cov[7] = pos_std ** 2
+        self._apply_cov[35] = yaw_std ** 2
+
+        # ---- EDT TRACKER (POSE_DATUM_PLAN phase 5 / MAPPING_ARCHITECTURE
+        # plan: replaces rtabmap in the pose path): continuous LOCAL
+        # scan-to-EDT alignment (Gauss-Newton over x, y, yaw) of the live
+        # scan against the map, publishing map-frame pose corrections to
+        # /nav_tf/set_map_pose_tracker (WP2 source-tagged; navi_transform's
+        # arbiter ranks dock > tracker > rtabmap > legacy) — the same
+        # interface the rtabmap dock bridge uses, self-gated to GPS-denied
+        # stretches (roofed area) where the
+        # lidar has structure and GPS has nothing.
+        self.track_enable = bool(rospy.get_param('~track_enable', True))
+        self.track_rate_hz = float(rospy.get_param('~track_rate_hz', 1.0))
+        self.track_max_corr_m = float(rospy.get_param('~track_max_corr_m', 0.7))
+        self.track_max_corr_yaw_deg = float(rospy.get_param('~track_max_corr_yaw_deg', 6.0))
+        self.track_min_corr_m = float(rospy.get_param('~track_min_corr_m', 0.02))
+        self.track_max_rms_m = float(rospy.get_param('~track_max_rms_m', 0.20))
+        self.track_min_points = int(rospy.get_param('~track_min_points', 60))
+        self.track_max_iter = int(rospy.get_param('~track_max_iter', 8))
+        # degeneracy gate: weakest position eigendirection must carry at
+        # least this fraction of the point count (a single hedge/wall line
+        # constrains only ACROSS itself — sliding along stays free)
+        self.track_min_eig_frac = float(rospy.get_param('~track_min_eig_frac', 0.05))
+        # 2026-07-11: rtabmap is OUT of the pose path (loc_status.rtabmap_confident
+        # is observability-only, stays false). Deferring to it is dead logic, so
+        # default OFF. Flag kept for rollback (set True to re-instate the defer).
+        self.track_defer_to_rtabmap = bool(rospy.get_param('~track_defer_to_rtabmap', False))
+        # BIG-CORR RECOVERY (2026-07-11): with the tracker OWNING the pose while
+        # driving blind (gps_good=0), per-tick drift is ~cm and corr cap 0.7 m is
+        # fine. But after a LONG blind stretch the accumulated offset can exceed
+        # the cap (seen 0.81 m 2026-07-10) — then every tick is corr_too_big and
+        # the tracker rejects FOREVER (deadlock), never converging back. Recovery:
+        # if corr_too_big persists > track_bigcorr_recover_s AND the match is
+        # otherwise healthy (rms good, eig healthy), apply the correction SLEWED
+        # in steps (<= track_bigcorr_step_m per tick toward the target) instead of
+        # rejecting — walks the pose back in bounded increments, logged.
+        self.track_bigcorr_recover_s = float(rospy.get_param('~track_bigcorr_recover_s', 20.0))
+        self.track_bigcorr_step_m = float(rospy.get_param('~track_bigcorr_step_m', 0.30))
+        self.track_bigcorr_step_yaw_deg = float(rospy.get_param('~track_bigcorr_step_yaw_deg', 3.0))
+        # streak / count state for the recovery path + status observability (2c)
+        self._bigcorr_since = None     # wall time corr_too_big started (None = not)
+        self._applied_count = 0        # total corrections published this session
+        self._reject_reason = None     # last non-ok state string
+        self._reject_streak = 0        # consecutive ticks with the same reject reason
+
+        self._grid = None          # (occ, free, res, ox, oy, h, w)
+        self._edt = None
+        self._edt_gx = None        # d(EDT)/dx [m/m], same shape as grid
+        self._edt_gy = None
+        self._grid_stamp = None
+        self._last_result = None
+        self._last_scan = None
+        self._gps_good = False
+        self._rtab_conf = False
+        self._lock = threading.Lock()
+
+        self._tf_buf = tf2_ros.Buffer()
+        tf2_ros.TransformListener(self._tf_buf)
+
+        self.pub_result = rospy.Publisher('/gloc/result', String, queue_size=1, latch=True)
+        self.pub_heatmap = rospy.Publisher('/gloc/heatmap', CompressedImage, queue_size=1, latch=True)
+        self.pub_status = rospy.Publisher('/gloc/status', String, queue_size=1, latch=True)
+        self.pub_initialpose = rospy.Publisher('/rtabmap/initialpose',
+                                               PoseWithCovarianceStamped, queue_size=1)
+
+        map_topic = rospy.get_param('~map_topic', '/rtabmap/grid_map')
+        rospy.Subscriber(map_topic, OccupancyGrid, self.cb_grid, queue_size=1)
+        rospy.Subscriber('/gloc/compute', String, self.cb_compute, queue_size=1)
+        rospy.Subscriber('/gloc/apply', String, self.cb_apply, queue_size=1)
+        rospy.Service('/gloc/localize', Trigger, self.srv_localize)
+
+        # tracker wiring
+        # WP2 (localization v2): publish to the source-tagged TRACKER topic so
+        # navi_transform's arbiter ranks it (dock > tracker > rtabmap > legacy).
+        # Tracker gating (gps_good / track_defer_to_rtabmap / gates) is unchanged.
+        self.pub_track_pose = rospy.Publisher('/nav_tf/set_map_pose_tracker',
+                                              PoseStamped, queue_size=1)
+        self.pub_track_status = rospy.Publisher('/gloc/track_status', String,
+                                                queue_size=1, latch=True)
+        rospy.Subscriber(self.scan_topic, LaserScan,
+                         lambda m: setattr(self, '_last_scan', m), queue_size=1)
+        rospy.Subscriber('/nav_tf/bridge_status', String,
+                         lambda m: setattr(self, '_gps_good',
+                                           'gps_good=1' in (m.data or '')),
+                         queue_size=1)
+        rospy.Subscriber('/nav_tf/rtabmap_confident', Bool,
+                         lambda m: setattr(self, '_rtab_conf', bool(m.data)),
+                         queue_size=1)
+        if self.track_enable and self.track_rate_hz > 0:
+            rospy.Timer(rospy.Duration(1.0 / self.track_rate_hz),
+                        self._track_tick)
+
+        self._set_status('idle (no map yet)' if self._grid is None else 'idle')
+        rospy.loginfo('[gloc] up: stride %.2f m, angles %.0f deg, %d rays, apply gate %.0f%%',
+                      self.pos_stride_m, self.angle_step_deg, self.n_rays,
+                      self.apply_min_margin * 100)
+
+    def _set_status(self, s):
+        self.pub_status.publish(String(s))
+
+    # ---- map ------------------------------------------------------------------
+
+    def cb_grid(self, msg):
+        if abs(euler_from_quaternion([msg.info.origin.orientation.x,
+                                      msg.info.origin.orientation.y,
+                                      msg.info.origin.orientation.z,
+                                      msg.info.origin.orientation.w])[2]) > 0.01:
+            rospy.logwarn_throttle(60, '[gloc] rotated grid origin unsupported, skipping map')
+            return
+        h, w = msg.info.height, msg.info.width
+        data = np.asarray(msg.data, dtype=np.int8).reshape(h, w)   # row 0 = origin y (bottom)
+        occ = data >= self.occ_thresh
+        free = (data >= 0) & (data <= 25)
+        if occ.sum() < 20:
+            rospy.logwarn_throttle(60, '[gloc] grid has almost no occupied cells, skipping')
+            return
+        edt = ndimage.distance_transform_edt(~occ) * msg.info.resolution
+        edt_capped = np.minimum(edt, self.dist_cap_m).astype(np.float32)
+        # tracker: EDT gradients (per metre). Points beyond the cap get zero
+        # gradient and thus no pull — built-in outlier robustness.
+        gy, gx = np.gradient(edt_capped)
+        with self._lock:
+            self._grid = (occ, free, msg.info.resolution,
+                          msg.info.origin.position.x, msg.info.origin.position.y, h, w)
+            self._edt = edt_capped
+            self._edt_gx = (gx / msg.info.resolution).astype(np.float32)
+            self._edt_gy = (gy / msg.info.resolution).astype(np.float32)
+            self._grid_stamp = msg.header.stamp
+        if self._last_result is None:
+            self._set_status('idle')
+        rospy.loginfo('[gloc] map %dx%d @ %.2f m updated (occ %d, free %d)',
+                      w, h, msg.info.resolution, occ.sum(), free.sum())
+
+    # ---- scan -> base_link endpoints -------------------------------------------
+
+    def _scan_endpoints(self):
+        scan = rospy.wait_for_message(self.scan_topic, LaserScan, timeout=5.0)
+        tr = self._tf_buf.lookup_transform(self.base_frame, scan.header.frame_id,
+                                           rospy.Time(0), rospy.Duration(2.0))
+        q = tr.transform.rotation
+        lyaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        lx, ly = tr.transform.translation.x, tr.transform.translation.y
+        rng = np.asarray(scan.ranges, dtype=np.float32)
+        ang = scan.angle_min + np.arange(len(rng)) * scan.angle_increment
+        good = np.isfinite(rng) & (rng > scan.range_min) & (rng < scan.range_max * 0.99)
+        rng, ang = rng[good], ang[good]
+        if len(rng) < 30:
+            raise RuntimeError('only %d valid rays' % len(rng))
+        step = max(1, len(rng) // self.n_rays)
+        rng, ang = rng[::step], ang[::step]
+        exl, eyl = rng * np.cos(ang), rng * np.sin(ang)
+        cb, sb = math.cos(lyaw), math.sin(lyaw)
+        return (lx + cb * exl - sb * eyl, ly + sb * exl + cb * eyl,
+                int(good.sum()), len(rng))
+
+    # ---- EDT tracker (continuous local scan-to-map alignment) ----------------
+
+    def _scan_points_base(self, scan):
+        """Latest-scan variant of _scan_endpoints (non-blocking): scan
+        endpoints in the base frame, subsampled to ~n_rays."""
+        tr = self._tf_buf.lookup_transform(self.base_frame, scan.header.frame_id,
+                                           rospy.Time(0), rospy.Duration(0.2))
+        q = tr.transform.rotation
+        lyaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        lx, ly = tr.transform.translation.x, tr.transform.translation.y
+        rng = np.asarray(scan.ranges, dtype=np.float32)
+        ang = scan.angle_min + np.arange(len(rng)) * scan.angle_increment
+        good = np.isfinite(rng) & (rng > scan.range_min) & (rng < scan.range_max * 0.99)
+        rng, ang = rng[good], ang[good]
+        if len(rng) < self.track_min_points:
+            return None
+        step = max(1, len(rng) // self.n_rays)
+        rng, ang = rng[::step], ang[::step]
+        exl, eyl = rng * np.cos(ang), rng * np.sin(ang)
+        cb, sb = math.cos(lyaw), math.sin(lyaw)
+        return np.stack([lx + cb * exl - sb * eyl,
+                         ly + sb * exl + cb * eyl], axis=1)
+
+    def _bilinear(self, arr, cols, rows):
+        """Bilinear sample arr[rows, cols] at float indices; also validity."""
+        h, w = arr.shape
+        ok = (cols >= 0) & (cols < w - 1) & (rows >= 0) & (rows < h - 1)
+        c0 = np.clip(np.floor(cols).astype(int), 0, w - 2)
+        r0 = np.clip(np.floor(rows).astype(int), 0, h - 2)
+        fc = np.clip(cols - c0, 0, 1)
+        fr = np.clip(rows - r0, 0, 1)
+        v = (arr[r0, c0] * (1 - fc) * (1 - fr) + arr[r0, c0 + 1] * fc * (1 - fr)
+             + arr[r0 + 1, c0] * (1 - fc) * fr + arr[r0 + 1, c0 + 1] * fc * fr)
+        return v, ok
+
+    def _track_align(self, pts_base, pose0):
+        """Gauss-Newton scan-to-EDT: minimize sum EDT(R(yaw) p + t)^2 over
+        (x, y, yaw). Returns dict with the refined pose + quality metrics,
+        or a dict with 'reject' reason."""
+        with self._lock:
+            if self._edt is None:
+                return {'reject': 'no_map'}
+            edt, gx_a, gy_a = self._edt, self._edt_gx, self._edt_gy
+            _, _, res, ox, oy, h, w = self._grid
+        x, y, th = pose0
+        n_used = 0
+        best = None            # (rms, pose) — return the best iterate: near
+        first_eigs = None      # convergence the on-ridge EDT gradients
+        #                        collapse and a raw GN step OSCILLATES
+        for it in range(self.track_max_iter):
+            c, s = math.cos(th), math.sin(th)
+            wx = x + c * pts_base[:, 0] - s * pts_base[:, 1]
+            wy = y + s * pts_base[:, 0] + c * pts_base[:, 1]
+            cols = (wx - ox) / res - 0.5
+            rows = (wy - oy) / res - 0.5
+            r, ok1 = self._bilinear(edt, cols, rows)
+            gx, _ = self._bilinear(gx_a, cols, rows)
+            gy, _ = self._bilinear(gy_a, cols, rows)
+            use = ok1
+            n_used = int(use.sum())
+            if n_used < self.track_min_points:
+                return {'reject': 'few_points_in_map', 'n': n_used}
+            r, gx, gy = r[use], gx[use], gy[use]
+            px, py = pts_base[use, 0], pts_base[use, 1]
+            rms = float(np.sqrt(np.mean(r ** 2)))
+            if best is None or rms < best[0]:
+                best = (rms, (x, y, th))
+            dth = gx * (-s * px - c * py) + gy * (c * px - s * py)
+            J = np.stack([gx, gy, dth], axis=1)
+            H = J.T @ J
+            g = J.T @ r
+            if first_eigs is None:
+                # degeneracy is judged at the INITIAL pose: once converged the
+                # on-ridge gradients vanish and the eigenvalues say nothing
+                first_eigs = np.linalg.eigvalsh(H[:2, :2])
+            # adaptive Levenberg damping: when the gradients collapse near
+            # convergence, H collapses too — damping must scale WITH it or
+            # the solve produces a huge bogus step from numerical noise
+            lam = max(1e-3, 0.05 * float(np.trace(H)) / 3.0)
+            try:
+                delta = -np.linalg.solve(H + lam * np.eye(3), g)
+            except np.linalg.LinAlgError:
+                return {'reject': 'singular'}
+            # per-iteration step clamp (robustness belt)
+            dnorm = float(np.hypot(delta[0], delta[1]))
+            if dnorm > 0.20:
+                delta[:2] *= 0.20 / dnorm
+            delta[2] = max(-math.radians(2.0), min(math.radians(2.0), delta[2]))
+            x += delta[0]
+            y += delta[1]
+            th += delta[2]
+            if dnorm < 0.002 and abs(delta[2]) < 1e-4:
+                break
+        rms, pose = best
+        return {'pose': pose, 'rms': rms, 'n': n_used,
+                'eig_min': float(first_eigs[0]), 'eig_max': float(first_eigs[1])}
+
+    def _track_tick(self, _evt):
+        info = {'applied': False}
+        try:
+            scan = self._last_scan
+            now = rospy.Time.now()
+            if scan is None or (now - scan.header.stamp).to_sec() > 1.5:
+                info['state'] = 'no_scan'
+                return
+            pose0 = self._current_pose()
+            if pose0 is None:
+                info['state'] = 'no_tf'
+                return
+            pts = self._scan_points_base(scan)
+            if pts is None:
+                info['state'] = 'few_rays'
+                return
+            out = self._track_align(pts, pose0)
+            if 'reject' in out:
+                info['state'] = out['reject']
+                return
+            x, y, th = out['pose']
+            dx = math.hypot(x - pose0[0], y - pose0[1])
+            dyaw = math.degrees(abs(math.atan2(math.sin(th - pose0[2]),
+                                               math.cos(th - pose0[2]))))
+            info.update({'state': 'ok', 'rms': round(out['rms'], 3),
+                         'n': out['n'], 'corr_m': round(dx, 3),
+                         'corr_yaw_deg': round(dyaw, 2),
+                         'eig_min_frac': round(out['eig_min'] / out['n'], 3),
+                         'gps_good': self._gps_good,
+                         'rtabmap_confident': self._rtab_conf})
+            rms_ok = out['rms'] <= self.track_max_rms_m
+            eig_ok = out['eig_min'] >= self.track_min_eig_frac * out['n']
+            corr_ok = (dx <= self.track_max_corr_m and
+                       dyaw <= self.track_max_corr_yaw_deg)
+            if not rms_ok:
+                info['state'] = 'poor_match'
+                self._bigcorr_since = None
+                return
+            if not eig_ok:
+                info['state'] = 'degenerate'
+                self._bigcorr_since = None
+                return
+            # BIG-CORR RECOVERY: normally reject an over-cap correction, but if it
+            # persists (match otherwise healthy: rms + eig already passed) the
+            # tracker would deadlock — after track_bigcorr_recover_s, SLEW toward
+            # the target in bounded steps instead of rejecting outright.
+            slewed = False
+            if not corr_ok:
+                if self._bigcorr_since is None:
+                    self._bigcorr_since = time.time()
+                held = time.time() - self._bigcorr_since
+                if held < self.track_bigcorr_recover_s:
+                    info['state'] = 'corr_too_big'
+                    info['bigcorr_held_s'] = round(held, 1)
+                    return
+                # recover: clamp the correction to a bounded per-tick step toward
+                # (x, y, th), publish the intermediate pose (GPS/rtabmap ownership
+                # is enforced by the shared gate below).
+                if dx > self.track_bigcorr_step_m and dx > 1e-6:
+                    f = self.track_bigcorr_step_m / dx
+                    x = pose0[0] + (x - pose0[0]) * f
+                    y = pose0[1] + (y - pose0[1]) * f
+                dyaw_signed = math.atan2(math.sin(th - pose0[2]),
+                                         math.cos(th - pose0[2]))
+                step_yaw = math.radians(self.track_bigcorr_step_yaw_deg)
+                if abs(dyaw_signed) > step_yaw:
+                    th = pose0[2] + math.copysign(step_yaw, dyaw_signed)
+                slewed = True
+                info['state'] = 'recover_slew'
+                info['bigcorr_held_s'] = round(held, 1)
+            else:
+                self._bigcorr_since = None
+            # correction is healthy (or slewed) — apply only when GPS is denied
+            # (the GPS arbiter owns the pose otherwise) and rtabmap does not have
+            # priority (defer default OFF 2026-07-11; ~track_defer_to_rtabmap).
+            if self._gps_good:
+                info['state'] = 'gps_owns'
+                return
+            if self.track_defer_to_rtabmap and self._rtab_conf:
+                info['state'] = 'rtabmap_owns'
+                return
+            if not slewed and dx < self.track_min_corr_m and dyaw < 0.2:
+                info['state'] = 'aligned'
+                return
+            ps = PoseStamped()
+            ps.header.stamp = now
+            ps.header.frame_id = self.map_frame
+            ps.pose.position.x = x
+            ps.pose.position.y = y
+            q = quaternion_from_euler(0, 0, th)
+            ps.pose.orientation.x = q[0]
+            ps.pose.orientation.y = q[1]
+            ps.pose.orientation.z = q[2]
+            ps.pose.orientation.w = q[3]
+            self.pub_track_pose.publish(ps)
+            info['applied'] = True
+            self._applied_count += 1
+            rospy.loginfo_throttle(
+                10.0, '[gloc-track] %s %.2f m / %.1f deg '
+                '(rms %.2f, n=%d)',
+                'RECOVER-slew' if slewed else 'correcting',
+                dx, dyaw, out['rms'], out['n'])
+        except Exception as e:
+            info['state'] = 'error: %s' % e
+        finally:
+            # (2c) observability: applied total + reject-reason streak counter
+            st = info.get('state', 'ok')
+            if info.get('applied'):
+                self._reject_reason = None
+                self._reject_streak = 0
+            else:
+                if st == self._reject_reason:
+                    self._reject_streak += 1
+                else:
+                    self._reject_reason = st
+                    self._reject_streak = 1
+            info['applied_count'] = self._applied_count
+            info['reject_reason'] = self._reject_reason
+            info['reject_streak'] = self._reject_streak
+            self.pub_track_status.publish(String(json.dumps(info)))
+
+    def _current_pose(self):
+        try:
+            g = self._tf_buf.lookup_transform(self.map_frame, self.base_frame,
+                                              rospy.Time(0), rospy.Duration(1.0))
+            q = g.transform.rotation
+            return (g.transform.translation.x, g.transform.translation.y,
+                    euler_from_quaternion([q.x, q.y, q.z, q.w])[2])
+        except Exception:
+            return None
+
+    # ---- core -------------------------------------------------------------------
+
+    def compute(self, with_heatmap=True):
+        with self._lock:
+            if self._grid is None:
+                raise RuntimeError('no /rtabmap/grid_map received yet (is rtabmap up?)')
+            occ, free, res, ox, oy, H, W = self._grid
+            edt = self._edt
+        exb, eyb, valid, used = self._scan_endpoints()
+
+        stride = max(1, int(round(self.pos_stride_m / res)))
+        fr, fc = np.where(free)
+        keep = (fr % stride == 0) & (fc % stride == 0)
+        fr, fc = fr[keep], fc[keep]
+        px = ox + (fc + 0.5) * res
+        py = oy + (fr + 0.5) * res      # OccupancyGrid: row 0 = origin y
+        M = len(px)
+        if M == 0:
+            raise RuntimeError('no free cells in grid')
+        angles = np.deg2rad(np.arange(0.0, 360.0, self.angle_step_deg))
+
+        t0 = time.time()
+        best_score = np.full(M, np.inf, dtype=np.float32)
+        best_ang = np.zeros(M, dtype=np.float32)
+        for a in angles:
+            ca, sa = math.cos(a), math.sin(a)
+            wx = px[:, None] + ca * exb[None, :] - sa * eyb[None, :]
+            wy = py[:, None] + sa * exb[None, :] + ca * eyb[None, :]
+            cc = ((wx - ox) / res - 0.5).round().astype(np.int32)
+            rr = ((wy - oy) / res - 0.5).round().astype(np.int32)
+            inside = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
+            d = np.full(wx.shape, self.dist_cap_m, dtype=np.float32)
+            d[inside] = edt[rr[inside], cc[inside]]
+            s = d.mean(axis=1)
+            upd = s < best_score
+            best_score[upd] = s[upd]
+            best_ang[upd] = a
+        dt = time.time() - t0
+
+        order = np.argsort(best_score)
+        ib = int(order[0])
+        bx, by, byaw = float(px[ib]), float(py[ib]), float(best_ang[ib])
+        dist = np.hypot(px[order] - bx, py[order] - by)
+        far = order[dist > self.ambiguity_radius]
+        if len(far):
+            i2 = int(far[0])
+            margin = float((best_score[i2] - best_score[ib]) / max(best_score[ib], 1e-6))
+        else:
+            i2, margin = ib, float('inf')
+
+        top = []
+        seen = []
+        for i in order:
+            if all(math.hypot(px[i] - sx, py[i] - sy) > self.ambiguity_radius
+                   for sx, sy in seen):
+                top.append({'x': round(float(px[i]), 2), 'y': round(float(py[i]), 2),
+                            'yaw_deg': round(math.degrees(float(best_ang[i])), 1),
+                            'score': round(float(best_score[i]), 4)})
+                seen.append((px[i], py[i]))
+            if len(top) >= 5:
+                break
+
+        cur = self._current_pose()
+        yaw_sane = True
+        if cur is not None:
+            yaw_dev = abs(math.atan2(math.sin(byaw - cur[2]), math.cos(byaw - cur[2])))
+            yaw_sane = bool(yaw_dev <= self.apply_max_yaw_dev)
+        result = {
+            'stamp': rospy.Time.now().to_sec(),
+            'best': {'x': round(bx, 2), 'y': round(by, 2),
+                     'yaw_deg': round(math.degrees(byaw), 1),
+                     'score_m': round(float(best_score[ib]), 4)},
+            'margin': round(margin, 3) if math.isfinite(margin) else 999.0,
+            'margin_ok': bool(margin >= self.apply_min_margin),
+            'yaw_sane': yaw_sane,
+            'apply_ok': bool(margin >= self.apply_min_margin and yaw_sane),
+            'apply_min_margin': self.apply_min_margin,
+            'top': top,
+            'current_pose': None if cur is None else
+                {'x': round(cur[0], 2), 'y': round(cur[1], 2),
+                 'yaw_deg': round(math.degrees(cur[2]), 1)},
+            'delta_to_current': None if cur is None else
+                {'dist_m': round(math.hypot(bx - cur[0], by - cur[1]), 2),
+                 'dyaw_deg': round(math.degrees(math.atan2(
+                     math.sin(byaw - cur[2]), math.cos(byaw - cur[2]))), 1)},
+            'hypotheses': int(M * len(angles)),
+            'positions': int(M),
+            'rays_used': used,
+            'rays_valid': valid,
+            'compute_s': round(dt, 2),
+            'grid_stamp': None if self._grid_stamp is None else self._grid_stamp.to_sec(),
+        }
+        self._last_result = result
+        self.pub_result.publish(String(json.dumps(result)))
+        if with_heatmap:
+            try:
+                self._publish_heatmap(occ, free, res, ox, oy, H, W,
+                                      fr, fc, best_score, (bx, by, byaw), cur)
+            except Exception as e:
+                rospy.logwarn('[gloc] heatmap failed: %s', e)
+        rospy.loginfo('[gloc] best (%.2f, %.2f, %.1fdeg) score %.3f margin %.0f%% in %.2fs',
+                      bx, by, math.degrees(byaw), best_score[ib],
+                      min(margin, 9.99) * 100, dt)
+        return result
+
+    def _publish_heatmap(self, occ, free, res, ox, oy, H, W, fr, fc,
+                         best_score, best_xyyaw, cur):
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        heat = np.full((H, W), np.nan, dtype=np.float32)
+        # paint a stride-sized block per sampled position — single pixels vanish
+        # at render resolution and the heatmap looked empty
+        s = max(1, int(round(self.pos_stride_m / res)))
+        for dr in range(-(s // 2), s // 2 + 1):
+            for dc in range(-(s // 2), s // 2 + 1):
+                rr2 = np.clip(fr + dr, 0, H - 1)
+                cc2 = np.clip(fc + dc, 0, W - 1)
+                heat[rr2, cc2] = best_score
+        fig, ax = plt.subplots(figsize=(7, 7 * H / max(W, 1)))
+        bg = np.where(occ, 0.0, np.where(free, 1.0, 0.6))
+        ax.imshow(bg, cmap='gray', vmin=0, vmax=1, origin='lower')
+        hm = ax.imshow(heat, cmap='viridis_r', alpha=0.85, origin='lower')
+        fig.colorbar(hm, ax=ax, label='score [m] (lower = better)')
+
+        def draw_pose(x, y, yaw, color, label, crosshair=False):
+            # cross pinpoints the position; short arrow shows the heading;
+            # optional full-image dashed crosshair makes it findable at a glance
+            c = (x - ox) / res - 0.5
+            r = (y - oy) / res - 0.5
+            if crosshair:
+                ax.axhline(r, color=color, lw=0.7, ls='--', alpha=0.35)
+                ax.axvline(c, color=color, lw=0.7, ls='--', alpha=0.35)
+            arrow_px = 0.8 / res
+            ax.annotate('', xy=(c + arrow_px * math.cos(yaw),
+                                r + arrow_px * math.sin(yaw)),
+                        xytext=(c, r),
+                        arrowprops=dict(arrowstyle='-|>', color=color,
+                                        lw=1.8, shrinkA=0, shrinkB=0))
+            ax.plot(c, r, marker='+', color=color, ms=15, mew=2.5,
+                    label=label, zorder=5)
+
+        bx, by, byaw = best_xyyaw
+        draw_pose(bx, by, byaw, '#1e6fff', 'best hypothesis', crosshair=True)
+        if cur is not None:
+            draw_pose(cur[0], cur[1], cur[2], 'red', 'current pose')
+        ax.legend(loc='upper right')
+        ax.set_axis_off()
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=90, bbox_inches='tight')
+        plt.close(fig)
+        msg = CompressedImage()
+        msg.header.stamp = rospy.Time.now()
+        msg.format = 'png'
+        msg.data = buf.getvalue()
+        self.pub_heatmap.publish(msg)
+
+    # ---- triggers ---------------------------------------------------------------
+
+    def _run_compute(self, with_heatmap):
+        self._set_status('computing...')
+        try:
+            r = self.compute(with_heatmap=with_heatmap)
+            self._set_status('ok %.2fs margin %.0f%%' % (r['compute_s'], r['margin'] * 100))
+            if self.auto_apply and r['margin_ok']:
+                self._do_apply(r, why='auto')
+            return r, None
+        except Exception as e:
+            rospy.logwarn('[gloc] compute failed: %s', e)
+            self._set_status('error: %s' % e)
+            return None, str(e)
+
+    def cb_compute(self, msg):
+        threading.Thread(target=self._run_compute,
+                         args=(msg.data != 'no_heatmap',), daemon=True).start()
+
+    def srv_localize(self, _req):
+        r, err = self._run_compute(with_heatmap=True)
+        if r is None:
+            return TriggerResponse(success=False, message=err)
+        return TriggerResponse(success=True, message=json.dumps(r))
+
+    def cb_apply(self, msg):
+        r = self._last_result
+        if r is None:
+            rospy.logwarn('[gloc] apply requested but no result yet')
+            return
+        force = (msg.data == 'force')
+        if not r.get('apply_ok', r['margin_ok']) and not force:
+            why = ('margin %.0f%% < gate %.0f%%' % (r['margin'] * 100,
+                                                    self.apply_min_margin * 100)
+                   if not r['margin_ok'] else
+                   'candidate yaw deviates > %.0f deg from current heading '
+                   '(mirror alias?)' % math.degrees(self.apply_max_yaw_dev))
+            rospy.logwarn("[gloc] apply REFUSED: %s (publish 'force' to override)", why)
+            self._set_status('apply refused: %s' % why)
+            return
+        self._do_apply(r, why='force' if force else 'manual')
+
+    def _do_apply(self, r, why):
+        out = PoseWithCovarianceStamped()
+        out.header.stamp = rospy.Time.now()
+        out.header.frame_id = self.map_frame
+        out.pose.pose.position.x = r['best']['x']
+        out.pose.pose.position.y = r['best']['y']
+        qx, qy, qz, qw = quaternion_from_euler(0, 0, math.radians(r['best']['yaw_deg']))
+        out.pose.pose.orientation.x = qx
+        out.pose.pose.orientation.y = qy
+        out.pose.pose.orientation.z = qz
+        out.pose.pose.orientation.w = qw
+        out.pose.covariance = self._apply_cov
+        self.pub_initialpose.publish(out)
+        self._set_status('APPLIED (%s) -> rtabmap initialpose (%.2f, %.2f, %.1fdeg)'
+                         % (why, r['best']['x'], r['best']['y'], r['best']['yaw_deg']))
+        rospy.loginfo('[gloc] APPLIED (%s) -> /rtabmap/initialpose (%.2f, %.2f, %.1fdeg)',
+                      why, r['best']['x'], r['best']['y'], r['best']['yaw_deg'])
+
+
+if __name__ == '__main__':
+    rospy.init_node('gloc_server')
+    GlocServer()
+    rospy.spin()

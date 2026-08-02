@@ -1,0 +1,46 @@
+<launch>
+  <!-- vitulus_ui / Phase 1: Lidar odometry from the 2D laser (ICP).
+       SHADOW SOURCE ONLY: publishes /licp/odom + /licp/odom_info, with
+       publish_tf=FALSE so it does NOT touch the live odom->base_link TF.
+       Meant to be consumed by navi_transform as a gated bridge source during
+       GPS-denied stretches. Lidar works well at night / in shade and degrades
+       in direct sun (returns vanish) - that is handled by the consumer's
+       confidence gate (ICP fitness / covariance), not here.
+
+       laser_scan_matcher/rf2o are not installed on host; rtabmap_odom's
+       icp_odometry covers the same role and is available.
+
+       Run standalone for validation:
+         roslaunch vitulus_navi lidar_icp_odometry.launch
+       then inspect /licp/odom and /licp/odom_info. -->
+
+  <arg name="scan"       default="/scan"/>
+  <arg name="frame_id"   default="base_link"/>
+
+  <node pkg="rtabmap_odom" type="icp_odometry" name="lidar_icp_odometry" output="screen">
+    <remap from="scan"        to="$(arg scan)"/>
+    <remap from="odom"        to="/licp/odom"/>
+    <remap from="odom_info"   to="/licp/odom_info"/>
+
+    <param name="frame_id"          type="string" value="$(arg frame_id)"/>
+    <param name="odom_frame_id"     type="string" value="licp_odom"/>
+    <param name="publish_tf"        type="bool"   value="false"/>
+    <param name="wait_for_transform_duration" type="double" value="0.2"/>
+
+    <!-- Auto-reset after losing tracking so icp_odometry ALWAYS recovers when
+         structure/returns come back. With 0 it got permanently stuck lost
+         (corr=0) after an open/sun patch and never re-registered even with a
+         good 600-point scan. The bridge consumer absorbs the reset jump. -->
+    <param name="Odom/ResetCountdown"     type="string" value="1"/>
+    <param name="Odom/Holonomic"          type="string" value="false"/>
+    <param name="Reg/Strategy"            type="string" value="1"/>   <!-- ICP -->
+    <param name="Reg/Force3DoF"           type="string" value="true"/>
+    <!-- 2D scan ICP tuning -->
+    <param name="Icp/VoxelSize"                 type="string" value="0.05"/>
+    <param name="Icp/MaxCorrespondenceDistance" type="string" value="0.1"/>
+    <param name="Icp/PointToPlane"              type="string" value="false"/>
+    <param name="Icp/Iterations"                type="string" value="10"/>
+    <param name="Icp/Epsilon"                   type="string" value="0.001"/>
+    <param name="Icp/MaxTranslation"            type="string" value="0.5"/>
+  </node>
+</launch>

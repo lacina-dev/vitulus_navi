@@ -1,0 +1,1375 @@
+"""
+All SMACH state classes for the mower state machine.
+
+Moved from the monolithic mower_unit_smach script.
+Bug fixes applied:
+  - Publisher leak: states receive MowerPublishers, no per-execute publisher creation
+  - Removed dead 'pub_status is None' checks
+  - Unified direction_angle (removed GetPathData.direction duplicate)
+  - Fixed duplicate input_keys
+"""
+import math
+import rospy
+import smach
+import shapely
+from shapely import geometry
+import PyKDL as kdl
+import actionlib
+
+from nav_msgs.msg import Path
+from std_msgs.msg import Bool, String, Int16, Int8
+from geometry_msgs.msg import PoseStamped, Point, Quaternion
+from vitulus_msgs.msg import (
+    DockProgram, StringList, PlannerProgram, Mower,
+    Device_icon_status, Power_status)
+from weather_alert.msg import RainAlert
+from mbf_msgs.msg import (
+    ExePathAction, ExePathGoal, ExePathActionFeedback,
+    GetPathAction, GetPathGoal)
+from mbf_msgs.msg import RecoveryAction, RecoveryGoal
+from mbf_msgs.srv import CheckPath, CheckPathRequest, CheckPathResponse
+from rtabmap_msgs.msg import Info
+
+from .helpers import (
+    get_tf_listener, get_robot_xy_in_map, nearest_pose_index,
+    classify_mbf_result, distance_xy, direction_angle,
+    safe_blade_shutdown, segmentize_raw_path, MOWER_ERROR_STATES,
+    mbf_outcome_str, get_weather_config, rain_forecast_steps,
+    first_lethal_index)
+
+
+# ===========================================================================
+# Generic utility states
+# ===========================================================================
+
+class VerifyAtPose(smach.State):
+    """Confirm via TF that the robot is within *tolerance* metres of a target.
+
+    Prevents premature mower spinup when MBF reports SUCCESS but the robot
+    hasn't actually arrived (TEB/MBF edge case).
+    """
+
+    def __init__(self, target_key, tolerance=0.5, label='VerifyAtPose'):
+        smach.State.__init__(self,
+                             outcomes=['arrived', 'not_arrived', 'tf_unavailable', 'preempted'],
+                             input_keys=[target_key])
+        self.target_key = target_key
+        self.tolerance = float(tolerance)
+        self.label = str(label)
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        target = getattr(userdata, self.target_key, None)
+        if target is None:
+            rospy.logwarn('[%s] target pose userdata.%s is None',
+                          self.label, self.target_key)
+            return 'not_arrived'
+        for _ in range(5):
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            xy = get_robot_xy_in_map(timeout=0.5)
+            if xy is not None:
+                tx = target.pose.position.x
+                ty = target.pose.position.y
+                d = distance_xy(xy[0], xy[1], tx, ty)
+                rospy.loginfo('[%s] distance to %s = %.2fm (tol=%.2fm)',
+                              self.label, self.target_key, d, self.tolerance)
+                if d <= self.tolerance:
+                    return 'arrived'
+                return 'not_arrived'
+            rospy.sleep(0.2)
+        rospy.logwarn('[%s] TF unavailable', self.label)
+        return 'tf_unavailable'
+
+
+class WaitForMowerStatus(smach.State):
+    """Wait until /mower/status reaches a target string with timeout + error detection."""
+
+    def __init__(self, targets, timeout=30.0, extra_check=None):
+        smach.State.__init__(self,
+                             outcomes=['reached', 'error', 'timeout', 'preempted'])
+        if isinstance(targets, str):
+            targets = (targets,)
+        self.targets = tuple(targets)
+        self.timeout = float(timeout)
+        self.extra_check = extra_check
+
+    def execute(self, userdata):
+        deadline = rospy.Time.now() + rospy.Duration(self.timeout)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            try:
+                msg = rospy.wait_for_message('/mower/status', Mower, timeout=1.0)
+            except rospy.ROSException:
+                continue
+            if msg.status in MOWER_ERROR_STATES:
+                rospy.logwarn('[WaitForMowerStatus] FW error state: %s', msg.status)
+                return 'error'
+            if msg.status in self.targets:
+                if self.extra_check is None or self.extra_check(msg):
+                    return 'reached'
+        rospy.logwarn('[WaitForMowerStatus] timeout (%.1fs) waiting for %s',
+                      self.timeout, self.targets)
+        return 'timeout'
+
+
+class WaitForTopic(smach.State):
+    """Generic timeout-bounded wait for a single message that satisfies *predicate*."""
+
+    def __init__(self, topic, msg_type, predicate, timeout=30.0,
+                 output_keys=None, on_match=None):
+        smach.State.__init__(self,
+                             outcomes=['received', 'timeout', 'preempted'],
+                             input_keys=[],
+                             output_keys=output_keys or [])
+        self.topic = topic
+        self.msg_type = msg_type
+        self.predicate = predicate
+        self.timeout = float(timeout)
+        self.on_match = on_match
+
+    def execute(self, userdata):
+        deadline = rospy.Time.now() + rospy.Duration(self.timeout)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            remaining = (deadline - rospy.Time.now()).to_sec()
+            if remaining <= 0:
+                break
+            try:
+                msg = rospy.wait_for_message(self.topic, self.msg_type,
+                                             timeout=min(1.0, remaining))
+            except rospy.ROSException:
+                continue
+            if self.predicate(msg):
+                if self.on_match is not None:
+                    try:
+                        self.on_match(userdata, msg)
+                    except Exception as e:
+                        rospy.logwarn('[WaitForTopic %s] on_match raised: %s', self.topic, e)
+                return 'received'
+        rospy.logwarn('[WaitForTopic] timeout (%.1fs) on %s', self.timeout, self.topic)
+        return 'timeout'
+
+
+class RetryLimitedAction(smach.State):
+    """Reusable retry counter; increments a userdata key, decides retry vs give-up."""
+
+    def __init__(self, counter_key, max_retries=3):
+        smach.State.__init__(self,
+                             outcomes=['retry', 'give_up', 'preempted'],
+                             input_keys=[counter_key],
+                             output_keys=[counter_key])
+        self.counter_key = counter_key
+        self.max_retries = int(max_retries)
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        current = int(getattr(userdata, self.counter_key, 0) or 0) + 1
+        setattr(userdata, self.counter_key, current)
+        if current >= self.max_retries:
+            rospy.logwarn('[RetryLimitedAction] %s reached %d retries; giving up',
+                          self.counter_key, current)
+            setattr(userdata, self.counter_key, 0)
+            return 'give_up'
+        rospy.loginfo('[RetryLimitedAction] %s retry %d/%d',
+                      self.counter_key, current, self.max_retries)
+        return 'retry'
+
+
+# ===========================================================================
+# Pre-start validation
+# ===========================================================================
+
+class PreStartCheck(smach.State):
+    """Validate weather and battery conditions before allowing a mission.
+
+    Rule 1 (weather): reject if raining now, rain in recent history, or the
+    forecast over the configured horizon contains a reject status. Which
+    statuses count, the horizon and a full bypass are configurable
+    (see helpers.get_weather_config).
+    Rule 1 (battery): reject if battery_capacity < 40% (hysteresis).
+    """
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['passed', 'rejected', 'preempted'],
+                             input_keys=['program'], output_keys=[])
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+
+        # --- Weather check ---
+        cfg = get_weather_config()
+        if cfg['bypass']:
+            rospy.logwarn("[PRE_START_CHECK] Rain check BYPASSED by config")
+        else:
+            try:
+                rain = rospy.wait_for_message(
+                    '/weather_alert/rain_alert', RainAlert, timeout=5.0)
+
+                if rain.rain_now == 1:
+                    self.pubs.log_info.publish(String("Start rejected: raining now"))
+                    self.pubs.smach_status.publish(String("Rejected: rain"))
+                    self.pubs.stop_reason.publish(String("rejected:rain"))
+                    return 'rejected'
+
+                past = [rain.status_past60m, rain.status_past50m, rain.status_past40m,
+                        rain.status_past30m, rain.status_past20m, rain.status_past10m,
+                        rain.status_now]
+                for s in past:
+                    if s == 'RAIN':
+                        self.pubs.log_info.publish(String("Start rejected: recent rain"))
+                        self.pubs.smach_status.publish(String("Rejected: recent rain"))
+                        self.pubs.stop_reason.publish(String("rejected:recent_rain"))
+                        return 'rejected'
+
+                nowcast = rain_forecast_steps(rain, cfg['n_steps'])
+                if any(s in cfg['reject_statuses'] for s in nowcast):
+                    rospy.logwarn("[PRE_START_CHECK] Rain (%s) in forecast (<=%d min): %s",
+                                  "/".join(cfg['reject_statuses']), cfg['horizon_min'],
+                                  nowcast)
+                    self.pubs.log_info.publish(String("Start rejected: rain forecast"))
+                    self.pubs.smach_status.publish(String("Rejected: forecast"))
+                    self.pubs.stop_reason.publish(String("rejected:forecast"))
+                    return 'rejected'
+
+            except rospy.ROSException:
+                rospy.logwarn("[PRE_START_CHECK] Weather data unavailable, proceeding")
+
+        # --- Battery check ---
+        min_start_pct = int(rospy.get_param('~battery_min_start_pct', 40))
+        try:
+            pm = rospy.wait_for_message('/pm/power_status', Power_status, timeout=5.0)
+            if pm.battery_capacity < min_start_pct:
+                self.pubs.log_info.publish(String(
+                    "Start rejected: battery {}% < {}%".format(
+                        pm.battery_capacity, min_start_pct)))
+                self.pubs.smach_status.publish(String("Rejected: low battery"))
+                self.pubs.stop_reason.publish(String("rejected:battery"))
+                return 'rejected'
+        except rospy.ROSException:
+            rospy.logwarn("[PRE_START_CHECK] Power status unavailable, proceeding")
+
+        self.pubs.log_info.publish(String("Pre-start checks passed"))
+        return 'passed'
+
+
+# ===========================================================================
+# Zone / path processing states
+# ===========================================================================
+
+class GetZoneData(smach.State):
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['available', 'failed', 'preempted', 'skip_zone'],
+                             input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index',
+                                         'zone_name', 'zone_start_pose', 'paths',
+                                         'unfinished_active', 'unfinished_zone',
+                                         'unfinished_path', 'path_window_start_index',
+                                         'unfinished_window'],
+                             output_keys=['zone_cut_height', 'zone_rpm', 'zone_name',
+                                          'zone_start_pose', 'paths', 'controller',
+                                          'unfinished_active', 'unfinished_zone',
+                                          'unfinished_path', 'path_window_start_index',
+                                          'retry_get_path_to_start',
+                                          'retry_get_path_to_begin',
+                                          'retry_exe_to_begin',
+                                          'retry_planner',
+                                          'consecutive_nav_failures'])
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        rospy.loginfo('[GetZoneData] Getting zone data')
+        # Reset retry counters for new zone
+        userdata.retry_get_path_to_start = 0
+        userdata.retry_get_path_to_begin = 0
+        userdata.retry_exe_to_begin = 0
+        userdata.retry_planner = 0
+        userdata.consecutive_nav_failures = 0
+
+        current_zone_name = userdata.program.zone_list[userdata.index].name
+
+        if userdata.unfinished_active and current_zone_name != userdata.unfinished_zone:
+            rospy.loginfo('[GetZoneData] Skipping zone %s to resume at %s',
+                          current_zone_name, userdata.unfinished_zone)
+            return 'skip_zone'
+
+        if userdata.unfinished_active and current_zone_name == userdata.unfinished_zone:
+            rospy.loginfo('[GetZoneData] Resuming zone: %s path: %s',
+                          userdata.unfinished_zone, userdata.unfinished_path)
+
+        zone = userdata.program.zone_list[userdata.index]
+        # If the program has override_zone set, the program-level cut_height/rpm
+        # take precedence over the per-zone values.
+        if getattr(userdata.program, 'override_zone', False):
+            userdata.zone_cut_height = userdata.program.cut_height
+            userdata.zone_rpm = userdata.program.rpm
+            rospy.loginfo('[GetZoneData] override_zone active: using program '
+                          'cut_height=%d rpm=%d (zone defaults %d/%d ignored)',
+                          userdata.program.cut_height, userdata.program.rpm,
+                          zone.cut_height, zone.rpm)
+        else:
+            userdata.zone_cut_height = zone.cut_height
+            userdata.zone_rpm = zone.rpm
+        userdata.zone_name = zone.name
+        userdata.paths = zone.paths
+
+        if userdata.unfinished_active and current_zone_name == userdata.unfinished_zone:
+            resume_path_idx = int(userdata.unfinished_path)
+            resume_window = int(userdata.unfinished_window) if userdata.unfinished_window else 0
+            raw_resume_path = userdata.paths[resume_path_idx]
+            try:
+                segmented = segmentize_raw_path(raw_resume_path)
+                if not segmented.poses:
+                    raise ValueError("segmented path is empty")
+                resume_window = max(0, min(resume_window, len(segmented.poses) - 1))
+                userdata.zone_start_pose = segmented.poses[resume_window]
+                rospy.loginfo('[GetZoneData] Resume: path %d window %d (poses=%d)',
+                              resume_path_idx, resume_window, len(segmented.poses))
+            except Exception as e:
+                rospy.logwarn('[GetZoneData] Resume pose computation failed (%s); fallback', e)
+                userdata.zone_start_pose = raw_resume_path.poses[0]
+        else:
+            userdata.zone_start_pose = zone.paths[0].poses[0]
+
+        userdata.controller = 'base_local_planner/TrajectoryPlannerROS'
+        self.pubs.show_map_layer.publish(String("SMACH|MAP|FULL"))
+        rospy.sleep(3)
+
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        return 'available'
+
+
+class GetPathData(smach.State):
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['available', 'preempted', 'skip_path'],
+                             input_keys=['program', 'zone_cut_height', 'zone_rpm', 'index',
+                                         'zone_name', 'path_planner', 'zone_start_pose',
+                                         'path_plan', 'index_path', 'paths',
+                                         'path_start_pose', 'path', 'final_pose',
+                                         'unfinished_active', 'unfinished_zone',
+                                         'unfinished_path', 'unfinished_window',
+                                         'path_window_start_index'],
+                             output_keys=['program', 'zone_cut_height', 'zone_rpm',
+                                          'zone_name', 'zone_start_pose', 'path_planner',
+                                          'path_plan', 'paths', 'path_start_pose', 'path',
+                                          'final_pose', 'unfinished_active', 'unfinished_zone',
+                                          'unfinished_path', 'unfinished_window',
+                                          'path_window_start_index',
+                                          'retry_get_path_to_begin', 'retry_exe_to_begin',
+                                          'retry_planner', 'consecutive_nav_failures'])
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        rospy.loginfo('[GetPathData] Getting path data')
+        # Reset path-level retry counters
+        userdata.retry_get_path_to_begin = 0
+        userdata.retry_exe_to_begin = 0
+        userdata.retry_planner = 0
+
+        if userdata.unfinished_active and str(userdata.index_path) != userdata.unfinished_path:
+            rospy.loginfo('[GetPathData] Skipping path %s to resume at %s',
+                          userdata.index_path, userdata.unfinished_path)
+            return 'skip_path'
+
+        path = userdata.paths[userdata.index_path]
+        userdata.path_start_pose = path.poses[0]
+        userdata.path_planner = path
+
+        # Save current position for crash recovery
+        userdata.program.last_result = (
+            'failed: on_path-{}-{}-{}'.format(
+                userdata.zone_name, userdata.index_path,
+                userdata.path_window_start_index))
+        self.pubs.save_program.publish(userdata.program)
+        self.pubs.show_map_layer.publish(
+            String("SMACH|ZONE|{}".format(userdata.zone_name)))
+
+        line = geometry.LineString(
+            [[path.poses[0].pose.position.x, path.poses[0].pose.position.y],
+             [path.poses[-1].pose.position.x, path.poses[-1].pose.position.y]])
+
+        segmentize_distance = 0.03
+
+        # Coverage outline path (closed polygon)
+        if line.length == 0:
+            start_offset = 0.18
+            start_poses_offset = int(round(start_offset / segmentize_distance))
+            path_new = Path()
+            path_new.header = path.header
+            polygon = geometry.LinearRing(
+                [[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
+            polygon = shapely.remove_repeated_points(polygon)
+            for n in range(0, len(polygon.coords) - 1):
+                seg_line = geometry.LineString(
+                    [[polygon.coords[n][0], polygon.coords[n][1]],
+                     [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
+                angle = direction_angle(list(seg_line.coords))
+                seg_line = seg_line.segmentize(segmentize_distance)
+                for point in seg_line.coords:
+                    pose = PoseStamped()
+                    pose.header.frame_id = "map"
+                    pose.header.stamp = rospy.Time.now()
+                    pose.pose.position.x = point[0]
+                    pose.pose.position.y = point[1]
+                    pose.pose.position.z = 0.0
+                    pose.pose.orientation = Quaternion(
+                        *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                    path_new.poses.append(pose)
+            path_new.poses = path_new.poses[0:-start_poses_offset]
+            path_new.poses = path_new.poses[start_poses_offset:]
+            path = path_new
+            userdata.path_start_pose = path.poses[0]
+            userdata.final_pose = path.poses[-1]
+
+        # Coverage infill path
+        else:
+            line_geom = geometry.LineString(
+                [[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
+            path_new = Path()
+            path_new.header.frame_id = "map"
+            path_new.header.stamp = rospy.Time.now()
+            line_geom = line_geom.segmentize(segmentize_distance)
+            for pose_id in range(0, len(line_geom.coords) - 1):
+                angle = direction_angle(
+                    [[line_geom.coords[pose_id][0], line_geom.coords[pose_id][1]],
+                     [line_geom.coords[pose_id + 1][0], line_geom.coords[pose_id + 1][1]]])
+                pose = PoseStamped()
+                pose.header.frame_id = "map"
+                pose.header.stamp = rospy.Time.now()
+                pose.pose.position.x = line_geom.coords[pose_id][0]
+                pose.pose.position.y = line_geom.coords[pose_id][1]
+                pose.pose.position.z = 0.0
+                pose.pose.orientation = Quaternion(
+                    *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                path_new.poses.append(pose)
+            path = path_new
+
+        # If resuming, set start pose to unfinished window
+        if userdata.unfinished_active and str(userdata.index_path) == userdata.unfinished_path:
+            rospy.loginfo('[GetPathData] Resuming path %s window %s',
+                          userdata.unfinished_path, userdata.unfinished_window)
+            userdata.path_window_start_index = userdata.unfinished_window
+            userdata.path_start_pose = path.poses[userdata.path_window_start_index]
+            userdata.unfinished_active = False
+
+        self.pubs.current_path.publish(path)
+        userdata.path = path
+
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        return 'available'
+
+
+class CheckDistance(smach.State):
+    def __init__(self):
+        smach.State.__init__(self,
+                             outcomes=['on_place', 'exe_path', 'preempted'],
+                             input_keys=['path_cost'],
+                             output_keys=['path_cost'])
+
+    def execute(self, userdata):
+        rospy.loginfo('[CheckDistance] path_cost=%.2f', userdata.path_cost or 0)
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        if userdata.path_cost <= 0.2:
+            return 'on_place'
+        return 'exe_path'
+
+
+# ===========================================================================
+# Path windowing and trimming
+# ===========================================================================
+
+class WindowPlannerPath(smach.State):
+    """Produce the next chunk of a long mowing path, anchored to the robot's
+    current TF position.
+
+    Costmap-aware goal guard
+    ------------------------
+    Before emitting a chunk, the candidate is checked against the live GLOBAL
+    costmap (check_path_cost). The aim is that TEB is NEVER handed a chunk goal
+    that sits in/near an obstacle (the root cause of the "dancing" at chunk
+    ends). Three outcomes of the check:
+
+      * line clear                  -> emit chunk unchanged ('available')
+      * obstacle near the chunk END -> trim the goal back to the last free pose
+                                       before it (reachable goal, no dancing);
+                                       the next window then sees the obstacle
+                                       right ahead and detours
+      * obstacle right ahead        -> 'detour_needed' (route around it globally
+                                       via DetourAroundObstacle instead of
+                                       feeding TEB a dead goal)
+
+    A mid-chunk obstacle with free space beyond is left untouched so TEB keeps
+    smoothly deviating around it (that case already works well). If the costmap
+    service is unavailable the guard is skipped (falls back to old behaviour).
+    """
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['available', 'finished', 'detour_needed', 'preempted'],
+                             input_keys=['path', 'path_window_start_index', 'zone_name',
+                                         'index_path', 'program'],
+                             output_keys=['path_chunk', 'path_window_start_index', 'program',
+                                          'path_chunk_trim_count'])
+        self.window_size = int(rospy.get_param('~window_size', 200))
+        self.fallback_step = int(rospy.get_param('~window_fallback_step', 100))
+        self.end_tolerance = float(rospy.get_param('~window_end_tolerance', 0.4))
+        self.tail_indices = int(rospy.get_param('~window_tail_indices', 5))
+        self.pubs = pubs
+        # --- Costmap goal guard ---
+        # Segmentisation is ~0.03 m/pose (see GetPathData / segmentize_raw_path).
+        self._check_path = rospy.ServiceProxy(
+            '/move_base_flex/check_path_cost', CheckPath)
+        # ~0.40 m: end a chunk this far before an obstacle
+        self.guard_safety_poses = int(rospy.get_param('~guard_safety_poses', 13))
+        # ~0.50 m: closer than this -> global detour now
+        self.guard_detour_poses = int(rospy.get_param('~guard_detour_poses', 16))
+        # ~0.70 m: free run past obstacle below this -> trim
+        self.guard_tail_poses = int(rospy.get_param('~guard_tail_poses', 23))
+
+    def _first_lethal_index(self, chunk):
+        """Local index of the first LETHAL pose on *chunk* per the global
+        costmap, or -1 if the chunk is clear / the service is unavailable."""
+        return first_lethal_index(self._check_path, chunk)
+
+    def execute(self, userdata):
+        rospy.loginfo('[WindowPlannerPath] Windowing path')
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+
+        userdata.path_chunk_trim_count = 0
+        full_path = userdata.path
+        if not full_path or not full_path.poses:
+            userdata.path_window_start_index = 0
+            return 'finished'
+
+        prev_index = int(userdata.path_window_start_index or 0)
+        n = len(full_path.poses)
+
+        robot_xy = get_robot_xy_in_map()
+        if robot_xy is not None:
+            current_index = nearest_pose_index(
+                full_path, robot_xy[0], robot_xy[1], hint_index=prev_index)
+            current_index = max(current_index, prev_index)
+
+            last_p = full_path.poses[-1].pose.position
+            dist_to_end = math.hypot(robot_xy[0] - last_p.x, robot_xy[1] - last_p.y)
+            if current_index >= n - self.tail_indices and dist_to_end < self.end_tolerance:
+                rospy.loginfo('[WindowPlannerPath] reached end (idx=%d/%d dist=%.2fm)',
+                              current_index, n, dist_to_end)
+                userdata.path_window_start_index = 0
+                return 'finished'
+        else:
+            rospy.logwarn_throttle(5.0, '[WindowPlannerPath] TF unavailable; fixed-step')
+            current_index = prev_index
+            if current_index >= n:
+                userdata.path_window_start_index = 0
+                return 'finished'
+
+        end_index = min(current_index + self.window_size, n)
+        path_chunk = Path()
+        path_chunk.header = full_path.header
+        path_chunk.poses = full_path.poses[current_index:end_index]
+
+        if not path_chunk.poses:
+            userdata.path_window_start_index = 0
+            return 'finished'
+
+        # --- Costmap goal guard (keeps TEB from chasing a blocked chunk goal) ---
+        blocked_idx = self._first_lethal_index(path_chunk)
+        if blocked_idx >= 0:
+            n_chunk = len(path_chunk.poses)
+            safe_end = blocked_idx - self.guard_safety_poses
+            free_after = n_chunk - blocked_idx
+            if safe_end <= self.guard_detour_poses:
+                # Obstacle is right ahead: nothing worth mowing before it.
+                # Route around it globally instead of letting TEB dance.
+                rospy.logwarn("[WINDOW] obstacle on line at chunk idx %d (~%.2fm ahead) "
+                              "-> detour", blocked_idx, blocked_idx * 0.03)
+                userdata.path_window_start_index = current_index
+                userdata.path_chunk = path_chunk
+                return 'detour_needed'
+            if free_after <= self.guard_tail_poses:
+                # Obstacle near the chunk END: trim the goal back to a reachable
+                # free pose so TEB gets a clean goal; the next window detours.
+                path_chunk = Path()
+                path_chunk.header = full_path.header
+                path_chunk.poses = full_path.poses[current_index:current_index + safe_end]
+                rospy.loginfo("[WINDOW] obstacle near chunk end (idx %d); trimmed goal to "
+                              "%d poses (~%.2fm before obstacle)",
+                              blocked_idx, safe_end, self.guard_safety_poses * 0.03)
+            # else: mid-chunk obstacle with free space beyond -> leave chunk as-is
+            #       so TEB smoothly deviates around it.
+
+        userdata.path_chunk = path_chunk
+
+        goal_p = path_chunk.poses[-1].pose.position
+        rospy.loginfo("[WINDOW] zone=%s path=%d chunk=[%d:%d] of %d "
+                      "robot=%s goal=(%.2f,%.2f)",
+                      userdata.zone_name, userdata.index_path,
+                      current_index, end_index, n,
+                      ("(%.2f,%.2f)" % robot_xy) if robot_xy else "None",
+                      goal_p.x, goal_p.y)
+
+        if robot_xy is not None:
+            userdata.path_window_start_index = current_index
+        else:
+            userdata.path_window_start_index = min(current_index + self.fallback_step, n)
+
+        userdata.program.last_result = (
+            'failed: on_path-{}-{}-{}'.format(
+                userdata.zone_name, userdata.index_path, current_index))
+
+        return 'available'
+
+
+class TrimAndRetry(smach.State):
+    """Progressively trims poses from a path chunk when CHECK_PLANNER_PATH fails."""
+
+    def __init__(self):
+        smach.State.__init__(self,
+                             outcomes=['retry', 'bypass_check', 'preempted'],
+                             input_keys=['path_chunk', 'path_chunk_trim_count'],
+                             output_keys=['path_chunk', 'path_chunk_trim_count'])
+        self.trim_step = 15
+        self.max_trims = 5
+        self.min_chunk_size = 20
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        trim_count = userdata.path_chunk_trim_count
+        chunk = userdata.path_chunk
+        if trim_count >= self.max_trims or len(chunk.poses) <= self.min_chunk_size:
+            rospy.loginfo('[TrimAndRetry] max trims reached (%d), bypassing', trim_count)
+            return 'bypass_check'
+        trimmed = Path()
+        trimmed.header = chunk.header
+        trimmed.poses = chunk.poses[:-self.trim_step]
+        if not trimmed.poses:
+            return 'bypass_check'
+        userdata.path_chunk = trimmed
+        userdata.path_chunk_trim_count = trim_count + 1
+        rospy.loginfo('[TrimAndRetry] trimmed %d poses, now %d (attempt %d/%d)',
+                      self.trim_step, len(trimmed.poses), trim_count + 1, self.max_trims)
+        return 'retry'
+
+
+# ===========================================================================
+# Path execution (extended with BLOCKED detection)
+# ===========================================================================
+
+class ExecutePathWithFeedback(smach.State):
+    """Execute a path chunk via MBF with feedback monitoring.
+
+    Extended outcomes:
+      - 'blocked': /mower/status reported BLOCKED during execution.
+        The MBF goal is cancelled and the caller should enter BLOCKED recovery.
+    """
+
+    # Stall detection: if the robot does not advance for STALL_TIME seconds
+    # while still away from the chunk goal, the goal (chunk end) is most likely
+    # in/near an obstacle and TEB is just oscillating. We cancel early instead
+    # of waiting for TEB's own oscillation_timeout (~10s).
+    STALL_TIME = 5.0           # s without meaningful movement -> stall
+    STALL_MOVE_EPS = 0.08      # m; displacement below this between samples = "not moving"
+    STALL_SAMPLE_DT = 0.5      # s; how often we sample TF for stall detection
+    PROGRESS_EPS = 0.30        # m; moved more than this in the chunk -> re-window,
+    #                            otherwise (blocked right at the start) -> detour
+    LOG_THROTTLE = 2.0         # s; progress log cadence
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['succeeded', 'aborted', 'preempted',
+                                       'replan_needed', 'blocked', 'detour'],
+                             input_keys=['path_chunk', 'paths', 'zone_name', 'index_path',
+                                         'final_pose', 'path', 'path_window_start_index',
+                                         'restore_height_pending', 'zone_cut_height',
+                                         'consecutive_nav_failures'],
+                             output_keys=['restore_height_pending',
+                                          'consecutive_nav_failures'])
+        self._client = actionlib.SimpleActionClient(
+            '/move_base_flex/exe_path', ExePathAction)
+        self.pubs = pubs
+        self._feedback_sub = None
+        self.last_feedback = None
+        self.step_size = int(rospy.get_param('~exe_step_size', 100))
+        # Tunables (defaults = the class constants above); read once at construction.
+        self.STALL_TIME = float(rospy.get_param('~exe_stall_time', self.STALL_TIME))
+        self.STALL_MOVE_EPS = float(rospy.get_param('~exe_stall_move_eps', self.STALL_MOVE_EPS))
+        self.STALL_SAMPLE_DT = float(rospy.get_param('~exe_stall_sample_dt', self.STALL_SAMPLE_DT))
+        self.PROGRESS_EPS = float(rospy.get_param('~exe_progress_eps', self.PROGRESS_EPS))
+        # Re-window when this close to a (non-last) chunk goal.
+        self.near_chunk_end_dist = float(rospy.get_param('~exe_near_chunk_end_dist', 0.6))
+        # No-goal-progress: probe costmap after this long, give up after the longer one.
+        self.goal_stall_obstacle_s = float(rospy.get_param('~exe_goal_stall_obstacle_s', 3.0))
+        self.goal_stall_time = float(rospy.get_param('~exe_goal_stall_time', 6.0))
+        # Live costmap probe: on a stall/abort, tells us whether an obstacle is
+        # actually sitting on the line ahead so we can route straight to a global
+        # detour instead of the slow dynamic-obstacle recovery / re-window loop.
+        self._check_path = rospy.ServiceProxy(
+            '/move_base_flex/check_path_cost', CheckPath)
+        # Persistent mower status subscriber
+        self._mower_status = None
+        self._mower_sub = rospy.Subscriber(
+            '/mower/status', Mower, self._mower_status_cb)
+        if not self._client.wait_for_server(rospy.Duration(5.0)):
+            rospy.logerr("Action server '/move_base_flex/exe_path' not available")
+            raise RuntimeError("exe_path action server not available")
+
+    def _mower_status_cb(self, msg):
+        self._mower_status = msg
+
+    def feedback_cb(self, msg):
+        self.last_feedback = msg.feedback
+
+    def _obstacle_ahead(self, chunk, cur_xy):
+        """True if the live GLOBAL costmap shows a LETHAL obstacle on the part of
+        *chunk* ahead of the robot. Called only on a stall/abort to decide
+        detour (real obstacle on the line) vs. dynamic recovery (costmap clear).
+        At stall time the robot sits right at the obstacle, so the costmap has
+        reliably marked it even though the window-creation guard missed it
+        (out of sensor range / 1 Hz global-costmap lag)."""
+        if chunk is None or not chunk.poses:
+            return False
+        start = 0
+        if cur_xy is not None:
+            start = nearest_pose_index(chunk, cur_xy[0], cur_xy[1], hint_index=0)
+        ahead = Path()
+        ahead.header = chunk.header
+        ahead.poses = chunk.poses[start:]
+        if not ahead.poses:
+            return False
+        return first_lethal_index(self._check_path, ahead) >= 0
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+
+        chunk = userdata.path_chunk
+        n_full = len(userdata.path.poses) if userdata.path else 0
+        start_idx = int(userdata.path_window_start_index or 0)
+        n_chunk = len(chunk.poses) if chunk and chunk.poses else 0
+        is_last_chunk = (start_idx + self.step_size) >= n_full
+
+        goal_xy = (None, None)
+        if n_chunk:
+            gp = chunk.poses[-1].pose.position
+            goal_xy = (gp.x, gp.y)
+        start_xy = get_robot_xy_in_map(timeout=0.3)
+
+        rospy.loginfo("[EXE] START zone=%s path=%d/%d chunk_idx=%d len=%d/%d "
+                      "last_chunk=%s goal=(%.2f,%.2f) robot=%s",
+                      userdata.zone_name, userdata.index_path + 1, len(userdata.paths),
+                      start_idx, n_chunk, n_full, is_last_chunk,
+                      goal_xy[0] or float('nan'), goal_xy[1] or float('nan'),
+                      ("(%.2f,%.2f)" % start_xy) if start_xy else "None")
+
+        self.last_feedback = None
+        self._feedback_sub = rospy.Subscriber(
+            '/move_base_flex/exe_path/feedback', ExePathActionFeedback,
+            self.feedback_cb)
+
+        goal = ExePathGoal()
+        goal.path = chunk
+        self._client.send_goal(goal)
+
+        t_start = rospy.Time.now()
+        last_move_time = t_start
+        last_sample_time = t_start
+        last_log_time = t_start
+        last_xy = start_xy
+        max_displacement = 0.0   # furthest the robot got from chunk-start position
+        stalled = False
+        best_dist_to_goal = float('inf')   # closest we have got to the chunk goal
+        last_goal_progress_time = t_start  # when best_dist_to_goal last improved
+        last_obs_check_time = t_start      # throttle for the live costmap probe
+
+        try:
+            while self._client.get_state() in [actionlib.GoalStatus.PENDING,
+                                                actionlib.GoalStatus.ACTIVE]:
+                if self.preempt_requested():
+                    self._client.cancel_goal()
+                    self.service_preempt()
+                    return 'preempted'
+
+                now = rospy.Time.now()
+                mower = self._mower_status.status if self._mower_status else '?'
+                dist_to_goal = (self.last_feedback.dist_to_goal
+                                if self.last_feedback else float('nan'))
+
+                # --- BLOCKED detection ---
+                if self._mower_status and self._mower_status.status == 'BLOCKED':
+                    rospy.logwarn("[EXE] BLOCKED motor at chunk_idx=%d dist_to_goal=%.2f",
+                                  start_idx, dist_to_goal)
+                    self._client.cancel_goal()
+                    self._client.wait_for_result(rospy.Duration(1.0))
+                    return 'blocked'
+
+                # --- ERR detection ---
+                if self._mower_status and self._mower_status.status == 'ERR':
+                    rospy.logwarn("[EXE] ERR motor at chunk_idx=%d", start_idx)
+                    self._client.cancel_goal()
+                    self._client.wait_for_result(rospy.Duration(1.0))
+                    return 'aborted'
+
+                # --- Smooth window transition (near reachable goal) ---
+                # Raised 0.4 -> 0.6: the robot kept getting stuck ~0.45m from the
+                # chunk goal (just outside 0.4) and "danced" there until TEB gave
+                # up. Re-windowing a little earlier hands the last 0.6m to the
+                # next (robot-anchored) chunk, so nothing is left un-mown.
+                if (not is_last_chunk and self.last_feedback
+                        and self.last_feedback.dist_to_goal < self.near_chunk_end_dist):
+                    rospy.loginfo("[EXE] near chunk end (dist_to_goal=%.2f) -> replan window",
+                                  self.last_feedback.dist_to_goal)
+                    self._client.cancel_goal()
+                    self._client.wait_for_result(rospy.Duration(0.5))
+                    return 'replan_needed'
+
+                # --- No progress toward goal (catches TEB "dancing") ---
+                # The position-based stall below resets on any micro-move, so a
+                # planner that wiggles without closing on the goal never trips it.
+                # Track the best (closest) distance to the goal instead; if it
+                # has not improved for GOAL_STALL_TIME the chunk end is blocked.
+                if not is_last_chunk and self.last_feedback:
+                    dtg = self.last_feedback.dist_to_goal
+                    if dtg < best_dist_to_goal - 0.05:
+                        best_dist_to_goal = dtg
+                        last_goal_progress_time = now
+                    else:
+                        stuck = (now - last_goal_progress_time).to_sec()
+                        # Early out: as soon as we stop closing on the goal AND the
+                        # live costmap confirms a real obstacle on the line ahead,
+                        # go around it -- no need to "dance" the full 6 s first.
+                        # (Probe throttled to 1 Hz.)
+                        if stuck > self.goal_stall_obstacle_s and (now - last_obs_check_time).to_sec() > 1.0:
+                            last_obs_check_time = now
+                            if self._obstacle_ahead(chunk, last_xy):
+                                self._client.cancel_goal()
+                                self._client.wait_for_result(rospy.Duration(0.5))
+                                rospy.logwarn("[EXE] no goal progress %.1fs + obstacle on "
+                                              "line -> detour", stuck)
+                                return 'detour'
+                        if stuck > self.goal_stall_time:
+                            elapsed_d = (now - t_start).to_sec()
+                            self._client.cancel_goal()
+                            self._client.wait_for_result(rospy.Duration(0.5))
+                            if max_displacement >= self.PROGRESS_EPS:
+                                rospy.logwarn("[EXE] no goal progress %.1fs (dist_to_goal=%.2f, "
+                                              "moved=%.2fm) -> re-window from current pos",
+                                              elapsed_d, dtg, max_displacement)
+                                return 'replan_needed'
+                            rospy.logwarn("[EXE] no goal progress %.1fs (dist_to_goal=%.2f, "
+                                          "moved=%.2fm) -> recovery/detour",
+                                          elapsed_d, dtg, max_displacement)
+                            return 'aborted'
+
+                # --- Stall detection (sample TF every STALL_SAMPLE_DT) ---
+                if (now - last_sample_time).to_sec() >= self.STALL_SAMPLE_DT:
+                    cur_xy = get_robot_xy_in_map(timeout=0.2)
+                    if cur_xy is not None:
+                        if last_xy is not None:
+                            moved = distance_xy(cur_xy[0], cur_xy[1],
+                                                last_xy[0], last_xy[1])
+                            if moved > self.STALL_MOVE_EPS:
+                                last_move_time = now
+                            last_xy = cur_xy
+                        else:
+                            last_xy = cur_xy
+                            last_move_time = now
+                        if start_xy is not None:
+                            disp = distance_xy(cur_xy[0], cur_xy[1],
+                                               start_xy[0], start_xy[1])
+                            max_displacement = max(max_displacement, disp)
+                    last_sample_time = now
+
+                    if (now - last_move_time).to_sec() >= self.STALL_TIME:
+                        stalled = True
+                        rospy.logwarn("[EXE] STALL: no motion for %.1fs "
+                                      "(dist_to_goal=%.2f, moved_in_chunk=%.2fm, mower=%s)",
+                                      self.STALL_TIME, dist_to_goal, max_displacement, mower)
+                        self._client.cancel_goal()
+                        self._client.wait_for_result(rospy.Duration(1.0))
+                        break
+
+                # --- Throttled progress log ---
+                if (now - last_log_time).to_sec() >= self.LOG_THROTTLE:
+                    rospy.loginfo("[EXE] ... t=%.1fs dist_to_goal=%.2f moved=%.2fm mower=%s",
+                                  (now - t_start).to_sec(), dist_to_goal,
+                                  max_displacement, mower)
+                    last_log_time = now
+
+                rospy.sleep(0.1)
+        finally:
+            if self._feedback_sub:
+                self._feedback_sub.unregister()
+                self._feedback_sub = None
+
+        elapsed = (rospy.Time.now() - t_start).to_sec()
+
+        # --- Stall outcome: obstacle on the line -> detour straight away;
+        #     otherwise decide re-window vs recovery based on progress made. ---
+        if stalled:
+            if self._obstacle_ahead(chunk, last_xy):
+                rospy.logwarn("[EXE] stalled (%.2fm, %.1fs) + obstacle on line "
+                              "-> detour around it", max_displacement, elapsed)
+                return 'detour'
+            if max_displacement >= self.PROGRESS_EPS:
+                rospy.logwarn("[EXE] stalled after %.2fm progress (%.1fs) -> re-window "
+                              "from current position (chunk end likely near obstacle)",
+                              max_displacement, elapsed)
+                return 'replan_needed'
+            rospy.logwarn("[EXE] stalled with no progress (%.2fm, %.1fs) -> obstacle "
+                          "right ahead, go to recovery/detour", max_displacement, elapsed)
+            return 'aborted'
+
+        result = self._client.get_result()
+        outcome = getattr(result, 'outcome', None) if result is not None else None
+        message = getattr(result, 'message', '') if result is not None else ''
+
+        self.pubs.log_info.publish(String(
+            "{}: path {}/{} chunk done".format(
+                userdata.zone_name, userdata.index_path + 1, len(userdata.paths))))
+        self.pubs.smach_status.publish(String(
+            "{}: path {}/{} done".format(
+                userdata.zone_name, userdata.index_path + 1, len(userdata.paths))))
+
+        rospy.loginfo("[EXE] END chunk_idx=%d outcome=%s elapsed=%.1fs moved=%.2fm msg=%r",
+                      start_idx, mbf_outcome_str(outcome), elapsed, max_displacement, message)
+
+        if result is None:
+            rospy.logerr("[EXE] None result from action server")
+            return 'aborted'
+
+        # After successful chunk: restore height if pending from BLOCKED Phase 2
+        if outcome == 0:
+            if getattr(userdata, 'restore_height_pending', False):
+                rospy.loginfo("[EXE] restoring cut height to %d", userdata.zone_cut_height)
+                self.pubs.mower_set_height.publish(Int16(userdata.zone_cut_height))
+                userdata.restore_height_pending = False
+            # Genuine forward progress on a full chunk → reset the navigation
+            # failure escalation counter (moved here from NAV_RECOVERY so a
+            # trivial recovery nudge no longer resets escalation).
+            userdata.consecutive_nav_failures = 0
+            return 'succeeded'
+        # Non-success MBF outcome (e.g. 103 "trajectory not feasible"). If an
+        # obstacle is actually sitting on the line ahead, go straight to a global
+        # detour around it (skips the slow dynamic-obstacle recovery that just
+        # retries the SAME blocked chunk). Otherwise: real progress this chunk ->
+        # the problem is at/near the chunk end -> re-window forward; no progress
+        # -> 'aborted' routes to recovery (costmap was clear -> likely transient).
+        last_xy = get_robot_xy_in_map(timeout=0.3)
+        if self._obstacle_ahead(chunk, last_xy):
+            rospy.loginfo("[EXE] MBF %s + obstacle on line -> detour around it",
+                          mbf_outcome_str(outcome))
+            return 'detour'
+        if max_displacement >= self.PROGRESS_EPS and not is_last_chunk:
+            rospy.loginfo("[EXE] MBF %s after %.2fm progress -> re-window from current pos",
+                          mbf_outcome_str(outcome), max_displacement)
+            return 'replan_needed'
+        return 'aborted'
+
+
+# ===========================================================================
+# Obstacle detour (drive around, rejoin the mowing line)
+# ===========================================================================
+
+class DetourAroundObstacle(smach.State):
+    """Plan a global route around a blocked section of the mowing line and
+    rejoin the line downstream of the obstacle.
+
+    Used when the local controller (TEB) cannot follow the mowing line because
+    an obstacle sits on it. Instead of abandoning the whole line, this:
+      1. Finds the robot's current index on the full path.
+      2. Picks a rejoin pose further along the line (tries increasing distances).
+      3. Plans a GLOBAL path to that pose via /move_base_flex/get_path — the
+         global costmap now contains live obstacle layers, so the plan routes
+         AROUND the obstacle.
+      4. Drives the detour via /move_base_flex/exe_path with the blade OFF
+         (we are crossing un-mown / off-line ground).
+      5. On arrival, turns the blade back ON and sets path_window_start_index so
+         WINDOW_PLANNER_PATH resumes mowing from the rejoin pose.
+
+    Only the short span right next to the obstacle stays un-mown; the rest of the
+    line is preserved.
+
+    Outcomes:
+      - 'resumed':    detour driven, rejoined the line (blade back on)
+      - 'no_detour':  no feasible rejoin point found (caller decides to escalate)
+      - 'preempted'
+    """
+
+    # Rejoin distances ahead of the robot to try, in metres. We jump past the
+    # blocked span and look for a point the global planner can reach. Start at
+    # 1.5 m (not 1.0): a rejoin pose right next to the obstacle is usually
+    # unreachable -- get_path returns MISSED_GOAL after a slow ~5 s plan -- and
+    # even if it succeeds it lands the robot back at the obstacle, re-triggering
+    # the detour. 1.5 m clears a standing person in one go.
+    REJOIN_DISTANCES_M = (1.5, 2.5, 4.0, 6.0)
+    SEG_SPACING_M = 0.03   # matches GetPathData segmentisation
+    GET_PATH_TOLERANCE = 0.25
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['resumed', 'no_detour', 'preempted'],
+                             input_keys=['path', 'path_window_start_index',
+                                         'zone_name', 'index_path', 'program'],
+                             output_keys=['path_window_start_index', 'program'])
+        self.pubs = pubs
+        # Tunables (defaults = the class constants above).
+        self.REJOIN_DISTANCES_M = tuple(
+            rospy.get_param('~detour_rejoin_distances_m', list(self.REJOIN_DISTANCES_M)))
+        self.GET_PATH_TOLERANCE = float(
+            rospy.get_param('~detour_get_path_tolerance', self.GET_PATH_TOLERANCE))
+        self._get_path = actionlib.SimpleActionClient(
+            '/move_base_flex/get_path', GetPathAction)
+        self._exe_path = actionlib.SimpleActionClient(
+            '/move_base_flex/exe_path', ExePathAction)
+        self._get_path.wait_for_server(rospy.Duration(5.0))
+        self._exe_path.wait_for_server(rospy.Duration(5.0))
+
+    def _wait_for(self, client):
+        """Block until the action finishes; returns False if preempted."""
+        while client.get_state() in [actionlib.GoalStatus.PENDING,
+                                     actionlib.GoalStatus.ACTIVE]:
+            if self.preempt_requested():
+                client.cancel_goal()
+                self.service_preempt()
+                return False
+            if rospy.is_shutdown():
+                client.cancel_goal()
+                return False
+            rospy.sleep(0.2)
+        return True
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+
+        full_path = userdata.path
+        if not full_path or not full_path.poses:
+            rospy.logwarn('[DETOUR] no path to detour on')
+            return 'no_detour'
+
+        poses = full_path.poses
+        n = len(poses)
+        hint = int(userdata.path_window_start_index or 0)
+
+        robot_xy = get_robot_xy_in_map(timeout=0.5)
+        if robot_xy is not None:
+            start_idx = nearest_pose_index(
+                full_path, robot_xy[0], robot_xy[1], hint_index=hint)
+            start_idx = max(start_idx, hint)
+        else:
+            rospy.logwarn('[DETOUR] TF unavailable, using window index')
+            start_idx = hint
+
+        # Blade off while we drive off the mowing line / around the obstacle.
+        self.pubs.mower_set_motor_on.publish(Bool(False))
+        self.pubs.log_info.publish(String("Obstacle ahead - planning detour"))
+        self.pubs.smach_status.publish(String("Detour around obstacle"))
+        rospy.loginfo("[DETOUR] START zone=%s path=%d start_idx=%d (of %d) robot=%s",
+                      userdata.zone_name, userdata.index_path, start_idx, n,
+                      ("(%.2f,%.2f)" % robot_xy) if robot_xy else "None")
+        rospy.sleep(0.5)
+
+        for dist in self.REJOIN_DISTANCES_M:
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+
+            target_idx = min(start_idx + int(dist / self.SEG_SPACING_M), n - 1)
+            if target_idx <= start_idx:
+                break
+            target_pose = poses[target_idx]
+            tp = target_pose.pose.position
+
+            # --- Plan a global detour to the rejoin pose ---
+            gp_goal = GetPathGoal()
+            gp_goal.use_start_pose = False  # plan from current robot pose
+            gp_goal.tolerance = self.GET_PATH_TOLERANCE
+            gp_goal.target_pose = PoseStamped()
+            gp_goal.target_pose.header.frame_id = 'map'
+            gp_goal.target_pose.header.stamp = rospy.Time.now()
+            gp_goal.target_pose.pose = target_pose.pose
+            t0 = rospy.Time.now()
+            self._get_path.send_goal(gp_goal)
+            if not self._wait_for(self._get_path):
+                return 'preempted'
+            gp_res = self._get_path.get_result()
+            gp_out = getattr(gp_res, 'outcome', None) if gp_res else None
+            gp_n = len(gp_res.path.poses) if (gp_res and gp_res.path.poses) else 0
+            rospy.loginfo("[DETOUR] get_path -> idx=%d (%.1fm, goal=(%.2f,%.2f)) "
+                          "outcome=%s poses=%d cost=%.1f t=%.1fs",
+                          target_idx, dist, tp.x, tp.y, mbf_outcome_str(gp_out), gp_n,
+                          getattr(gp_res, 'cost', 0.0) if gp_res else 0.0,
+                          (rospy.Time.now() - t0).to_sec())
+            if gp_out != 0 or gp_n == 0:
+                continue
+
+            # --- Drive the detour ---
+            self.pubs.log_info.publish(String(
+                "Detouring around obstacle ({:.0f} cm ahead)".format(dist * 100)))
+            ep_goal = ExePathGoal()
+            ep_goal.path = gp_res.path
+            t1 = rospy.Time.now()
+            self._exe_path.send_goal(ep_goal)
+            if not self._wait_for(self._exe_path):
+                return 'preempted'
+            ep_res = self._exe_path.get_result()
+            ep_out = getattr(ep_res, 'outcome', None) if ep_res else None
+            rospy.loginfo("[DETOUR] exe_path detour -> idx=%d outcome=%s t=%.1fs",
+                          target_idx, mbf_outcome_str(ep_out),
+                          (rospy.Time.now() - t1).to_sec())
+            if ep_out != 0:
+                continue
+
+            # --- Rejoined the line: resume mowing from the rejoin pose ---
+            userdata.path_window_start_index = target_idx
+            userdata.program.last_result = (
+                'failed: on_path-{}-{}-{}'.format(
+                    userdata.zone_name, userdata.index_path, target_idx))
+            self.pubs.mower_set_motor_on.publish(Bool(True))
+            rospy.sleep(1.0)
+            self.pubs.log_info.publish(String("Rejoined mowing line after obstacle"))
+            rospy.loginfo('[DETOUR] SUCCESS rejoined at idx=%d (skipped %d poses, %.0fcm)',
+                          target_idx, target_idx - start_idx,
+                          (target_idx - start_idx) * self.SEG_SPACING_M * 100)
+            return 'resumed'
+
+        rospy.logwarn('[DETOUR] FAILED no feasible detour around obstacle (start_idx=%d)',
+                      start_idx)
+        self.pubs.log_info.publish(String("No detour possible around obstacle"))
+        return 'no_detour'
+
+
+# ===========================================================================
+# Mower power states
+# ===========================================================================
+
+class WaitForRpmReached(smach.State):
+    """Wait for cutting motor to reach setpoint RPM (±100)."""
+
+    def __init__(self, pubs, timeout=30.0):
+        smach.State.__init__(self,
+                             outcomes=['reached', 'error', 'timeout', 'preempted'],
+                             input_keys=['zone_rpm'])
+        self.timeout = float(timeout)
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        deadline = rospy.Time.now() + rospy.Duration(self.timeout)
+        target = int(userdata.zone_rpm)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            try:
+                msg = rospy.wait_for_message('/mower/status', Mower, timeout=1.0)
+            except rospy.ROSException:
+                continue
+            if msg.status in MOWER_ERROR_STATES:
+                rospy.logwarn('[WaitForRpmReached] FW error: %s', msg.status)
+                return 'error'
+            if target - 100 < msg.moto_rpm < target + 100:
+                self.pubs.log_info.publish(String("Mowing started..."))
+                self.pubs.smach_status.publish(String("Mowing started"))
+                return 'reached'
+        rospy.logwarn('[WaitForRpmReached] timeout (%.1fs) target=%d', self.timeout, target)
+        return 'timeout'
+
+
+class WaitForMowerOff(smach.State):
+    """Wait for /mower/status == OFF after power-off."""
+
+    def __init__(self, pubs, timeout=30.0):
+        smach.State.__init__(self,
+                             outcomes=['off', 'timeout', 'preempted'],
+                             input_keys=['program', 'prg_start_time'],
+                             output_keys=['prg_start_time'])
+        self.timeout = float(timeout)
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        deadline = rospy.Time.now() + rospy.Duration(self.timeout)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            try:
+                msg = rospy.wait_for_message('/mower/status', Mower, timeout=1.0)
+            except rospy.ROSException:
+                continue
+            if msg.status == 'OFF':
+                if userdata.prg_start_time is not None:
+                    duration = (rospy.Time.now() - userdata.prg_start_time).to_sec() / 60
+                    userdata.program.last_duration_minutes = int(round(duration))
+                    self.pubs.save_program.publish(userdata.program)
+                    userdata.prg_start_time = None
+                self.pubs.active_program.publish(String(" "))
+                self.pubs.smach_status.publish(String("Ready"))
+                self.pubs.log_info.publish(String("Done"))
+                return 'off'
+        rospy.logwarn('[WaitForMowerOff] timeout (%.1fs)', self.timeout)
+        self.pubs.active_program.publish(String(" "))
+        return 'timeout'
+
+
+# ===========================================================================
+# Dock-related states
+# ===========================================================================
+
+class CheckIfDockedState(smach.State):
+    MAX_WAITS = 5
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['proceed_to_undock', 'skip_undocking', 'wait', 'preempted'])
+        self.pubs = pubs
+        self._wait_count = 0
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        try:
+            msg = rospy.wait_for_message('/dock_smach/dock_status', Int8, timeout=5.0)
+            self._wait_count = 0
+            if msg.data == 3:  # Undocked
+                self.pubs.log_info.publish(String("Mower is already undocked."))
+                return 'skip_undocking'
+            elif msg.data == 0:  # Docked
+                self.pubs.log_info.publish(String("Mower is docked, starting undock."))
+                return 'proceed_to_undock'
+            else:
+                self.pubs.log_info.publish(String(
+                    "Waiting for dock status, current: {}".format(msg.data)))
+                return 'wait'
+        except rospy.ROSException:
+            self._wait_count += 1
+            rospy.logwarn("Timeout /dock_smach/dock_status (%d/%d)",
+                          self._wait_count, self.MAX_WAITS)
+            if self._wait_count >= self.MAX_WAITS:
+                self.pubs.log_info.publish(String(
+                    "No dock_status, assuming undocked."))
+                self._wait_count = 0
+                return 'skip_undocking'
+            return 'wait'
+
+
+class WaitForPlannerLoaded(smach.State):
+    def __init__(self, pubs, timeout=120.0):
+        smach.State.__init__(self,
+                             outcomes=['received', 'timeout', 'preempted'],
+                             input_keys=['program'], output_keys=['program'])
+        self.timeout = float(timeout)
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        userdata.program.last_result = 'failed: on_planner'
+        deadline = rospy.Time.now() + rospy.Duration(self.timeout)
+        target = userdata.program.map_name
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            try:
+                msg = rospy.wait_for_message(
+                    '/web_plan/planner_loaded', String, timeout=1.0)
+            except rospy.ROSException:
+                continue
+            if msg.data == target:
+                self.pubs.show_map_layer.publish(String("SMACH|MAP|FULL"))
+                self.pubs.log_info.publish(String("Map is ready"))
+                self.pubs.smach_status.publish(String("Map ready"))
+                self.pubs.pm_play_melody.publish(Int16(1))
+                rospy.sleep(2.0)
+                return 'received'
+        rospy.logwarn('WAIT_FOR_PLANNER timeout (%.1fs) for map=%s', self.timeout, target)
+        return 'timeout'
+
+
+class WaitForDockedState(smach.State):
+    DOCK_TIMEOUT = 600.0
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['succeeded', 'failed', 'timeout', 'preempted'],
+                             input_keys=['error_reason'],
+                             output_keys=['error_reason'])
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        rospy.loginfo("Waiting for docked (timeout %.0fs)...", self.DOCK_TIMEOUT)
+        deadline = rospy.Time.now() + rospy.Duration(self.DOCK_TIMEOUT)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self.preempt_requested():
+                self.pubs.log_info.publish(String("Docking preempted."))
+                self.service_preempt()
+                return 'preempted'
+            try:
+                msg = rospy.wait_for_message('/dock_smach/dock_status', Int8, timeout=1.0)
+                if msg.data == 0:  # Docked
+                    self.pubs.log_info.publish(String("Mower successfully docked."))
+                    self.pubs.smach_status.publish(String("Ready"))
+                    return 'succeeded'
+                elif msg.data == 4:  # Failed
+                    self.pubs.log_info.publish(String("Docking failed."))
+                    userdata.error_reason = 'DOCKING_FAILED'
+                    return 'failed'
+            except rospy.ROSException:
+                pass
+        rospy.logwarn("WAIT_FOR_DOCKED timeout after %.0fs.", self.DOCK_TIMEOUT)
+        self.pubs.log_info.publish(String("Docking timed out."))
+        userdata.error_reason = 'DOCKING_TIMEOUT'
+        return 'timeout'
+
+
+class CheckForDockPoint(smach.State):
+    """Check if a DOCK waypoint exists in the map point list."""
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['dock_point_found', 'no_dock_point', 'preempted'])
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        rospy.loginfo('[CheckForDockPoint] Checking for DOCK point')
+        try:
+            msg = rospy.wait_for_message(
+                '/navi_manager/map_point_str_list', StringList, timeout=5.0)
+            if 'DOCK' in msg.string_list:
+                self.pubs.log_info.publish(String("DOCK point found."))
+                return 'dock_point_found'
+            else:
+                self.pubs.log_info.publish(String("DOCK point not found."))
+                return 'no_dock_point'
+        except rospy.ROSException:
+            self.pubs.log_info.publish(String("Could not get map point list."))
+            return 'no_dock_point'

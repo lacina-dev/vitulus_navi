@@ -5,14 +5,8 @@ global_costmap:
 
   update_frequency: 1.0  # was 0.5 - raised so the global planner sees live
   publish_frequency: 1.0  # obstacles fresh enough to plan a detour around them
+  inflation_radius: 0.85
   static_map: true
-  # AUDIT A18 (2026-08-01): inflation_radius used to sit at the costmap top
-  # level (legacy pre-plugin location) where it silently OVERRODE the 0.5 from
-  # costmap_common_params' inflation_layer block. 0.85 was the live behaviour,
-  # so it is kept — but now declared where it actually belongs, per-layer:
-  inflation_layer:
-    inflation_radius: 0.85
-    cost_scaling_factor: 10.0
   plugins:
     - name: static_layer
       type: "costmap_2d::StaticLayer"

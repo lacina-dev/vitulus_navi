@@ -32,15 +32,9 @@ clear_costmap_laser:
   layer_names: [lidar_costmap_layer, cloud_costmap_layer, obstacle_layer]
 
 clear_costmap_static:
-  # AUDIT A17 (2026-08-01): this behavior cleared [static_layer] — exactly what
-  # the comment above forbids (blanked mapped walls let the planner cut through
-  # them), and smach_exe_goal invokes it on every second recovery. Repointed to
-  # the LIVE obstacle layers with the wide inverted area; the name is kept so
-  # the smach recovery sequence needs no change. No behavior touches the static
-  # map any more.
   reset_distance: 2
   force_updating: true
   invert_area_to_clear: true
 #  both, local, global
   affected_maps: both
-  layer_names: [lidar_costmap_layer, cloud_costmap_layer, obstacle_layer]
+  layer_names: [static_layer]

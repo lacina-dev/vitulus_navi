@@ -59,6 +59,7 @@ class NavTfNode:
         self.fused_msg = Imu()
         self.fused_msg.orientation.w = 1
         self.fix_usable = False
+        self.fix_usable_history = [0, 0, 0]
         # Phase-2 decouple: RTK position acceptance independent of heading.
         self.position_fix_usable = False
         self.position_fix_usable_history = [0, 0, 0]
@@ -102,12 +103,18 @@ class NavTfNode:
         self.rtk_odom_heading_msg.pose.pose.orientation.w = 1
         self.filtered_wheel_odom_msg = Odometry()
         self.filtered_wheel_odom_msg.pose.pose.orientation.w = 1
+        self.offset_wheel_odom_msg = Odometry()
+        self.offset_wheel_odom_msg.pose.pose.orientation.w = 1
         self.odom_for_gps_msg = Odometry()
         self.odom_for_gps_msg.pose.pose.orientation.w = 1
         self.odom_fused_msg = Odometry()
         self.odom_fused_msg.pose.pose.orientation.w = 1
         self.navheading_wheel_odom_msg = Odometry()
         self.navheading_wheel_odom_msg.pose.pose.orientation.w = 1
+        self.offset_navheading_wheel_odom_msg = Odometry()
+        self.offset_navheading_wheel_odom_msg.pose.pose.orientation.w = 1
+        self.offset_rtk_odom_msg = Odometry()
+        self.offset_rtk_odom_msg.pose.pose.orientation.w = 1
         self.ekf_wheel_odom_msg = Odometry()
         self.ekf_wheel_odom_msg.pose.pose.orientation.w = 1
         self.ekf_wheel_nav_odom_msg = Odometry()
@@ -391,6 +398,7 @@ class NavTfNode:
         self.odometry_odom_pub = rospy.Publisher("/odometry/odom", Odometry, queue_size=100)
         self.odometry_for_gps_pub = rospy.Publisher("/odometry/for_gps", Odometry, queue_size=100)
         self.fused_nav_pub = rospy.Publisher("/gnss_heading/nav_fused", Imu, queue_size=100)
+        self.base_link_imu_pub = rospy.Publisher("/bno085/imu_base_link", Imu, queue_size=100)
         self.marker_pub = rospy.Publisher("/gnss_heading/markers", MarkerArray, queue_size=1)
         self.yaws_pub = rospy.Publisher("/gnss_heading/yaws", Float32MultiArray, queue_size=1)
         self.wheel_odom_pub = rospy.Publisher("/nav_tf/odom_wheel", Odometry, queue_size=100)
@@ -481,6 +489,8 @@ class NavTfNode:
         self.tf2_StaticTransformBroadcaster = tf2_ros.StaticTransformBroadcaster()
         self.tf2_TransformBroadcaster = tf2_ros.TransformBroadcaster()
 
+        self.reset_wheel_odom_srv = rospy.Service("nav_tf/reset_wheel_odom", Empty, self.srv_cb_reset_wheel_odom)
+        self.set_nav_wheel_odom_srv = rospy.Service("nav_tf/set_nav_wheel_odom", Empty, self.srv_cb_set_nav_wheel_odom)
         self.set_pose_srv = rospy.Service("nav_tf/set_pose", SetPose, self.srv_cb_set_pose)
 
         rospy.loginfo("<{}> GNSSNode initiated.".format(rospy.get_caller_id()))
@@ -953,13 +963,6 @@ class NavTfNode:
         # wheels. Default OFF for safety (dock/undock + startup run on known-good
         # wheel odom); enable per-drive via param or /nav_tf/bridge_live_enable.
         self._bridge_live_enable = rospy.get_param('~bridge/live_enable', False)
-        # AUDIT E1 (2026-08-01): both downstream consumers (gloc tracker, dock
-        # seed) migrated to the typed /nav_tf/loc_status, so the shadow-bridge
-        # 30 Hz computation feeds nothing — its live branch was already
-        # unreachable (live_enable=False, no publisher of bridge_live_enable).
-        # Parked behind this flag instead of deleted: flip to true to restore
-        # the forensic preview (odom_bridge_preview + bridge_status string).
-        self._bridge_compute_enable = rospy.get_param('~bridge/compute_enable', False)
 
     @staticmethod
     def _odom_xyyaw(msg):
@@ -1335,7 +1338,12 @@ class NavTfNode:
                         usable = True
                 else:
                     usable = True
+                # self.set_nav_wheel_odom()
+                # self.reset_wheel_odom()
+                # self.set_wheel_base_pose()
         self.fix_usable = usable
+        self.fix_usable_history.pop(0)
+        self.fix_usable_history.append(usable)
         # Phase-2 decouple: track position usability separately from heading.
         # The dual-antenna RTK heading is unreliable while DRIVING (cov 0.02-0.16,
         # σ≈8-23°), which used to gate the whole fix and throw away the perfect
@@ -1376,6 +1384,7 @@ class NavTfNode:
             self._gps_bad_since = None
             if self._gps_good_since is None:
                 self._gps_good_since = now_t
+        # print(self.fix_usable_history)
         # print("gnss_fix usable: ", usable)
 
 
@@ -1782,6 +1791,7 @@ class NavTfNode:
         (roll, pitch, yaw) = euler_from_quaternion(
             [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
         self.imu_yaw = yaw
+        self.publish_imu_baselink()
         self.publish_fused_navheading()
 
     def transform_odom_to_base_link(self):
@@ -1935,15 +1945,201 @@ class NavTfNode:
         self.odom_for_gps_msg.child_frame_id = "base_link"
         self.odometry_for_gps_pub.publish(self.odom_for_gps_msg)
 
-    # AUDIT T2 (2026-08-01): publish_odom_fused removed (30 Hz, zero consumers)
+    def publish_odom_fused(self):
+        msg = Odometry()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "odom"
+        msg.child_frame_id = "base_link"
+        # msg.pose.pose.position.x = self.rtk_odom_heading_msg.pose.pose.position.x - self.filtered_wheel_odom_msg.pose.pose.position.x
+        # msg.pose.pose.position.y = self.rtk_odom_heading_msg.pose.pose.position.y - self.filtered_wheel_odom_msg.pose.pose.position.y
+        # msg.pose.pose.position.z = self.rtk_odom_heading_msg.pose.pose.position.z - self.filtered_wheel_odom_msg.pose.pose.position.z
+        msg.pose.pose.position.x = self.rtk_odom_heading_msg.pose.pose.position.x
+        msg.pose.pose.position.y = self.rtk_odom_heading_msg.pose.pose.position.y
+        msg.pose.pose.position.z = self.rtk_odom_heading_msg.pose.pose.position.z
+        # msg.pose.pose.orientation.x = self.rtk_odom_heading_msg.pose.pose.orientation.x - self.filtered_wheel_odom_msg.pose.pose.orientation.x
+        # msg.pose.pose.orientation.y = self.rtk_odom_heading_msg.pose.pose.orientation.y - self.filtered_wheel_odom_msg.pose.pose.orientation.y
+        # msg.pose.pose.orientation.z = self.rtk_odom_heading_msg.pose.pose.orientation.z - self.filtered_wheel_odom_msg.pose.pose.orientation.z
+        # msg.pose.pose.orientation.w = self.rtk_odom_heading_msg.pose.pose.orientation.w - self.filtered_wheel_odom_msg.pose.pose.orientation.w
+        # msg.pose.pose.orientation.x = self.rtk_odom_heading_msg.pose.pose.orientation.x
+        # msg.pose.pose.orientation.y = self.rtk_odom_heading_msg.pose.pose.orientation.y
+        # msg.pose.pose.orientation.z = self.rtk_odom_heading_msg.pose.pose.orientation.z
+        # msg.pose.pose.orientation.w = self.rtk_odom_heading_msg.pose.pose.orientation.w
+        msg.pose.pose.orientation.x = self.rtk_odom_heading_msg.pose.pose.orientation.x
+        msg.pose.pose.orientation.y = self.rtk_odom_heading_msg.pose.pose.orientation.y
+        msg.pose.pose.orientation.z = self.rtk_odom_heading_msg.pose.pose.orientation.z
+        msg.pose.pose.orientation.w = self.rtk_odom_heading_msg.pose.pose.orientation.w
 
-    # AUDIT T2: publish_relative_wheel_odom removed (30 Hz, zero consumers)
+        self.odom_fused_msg = msg
+        self.fused_odom_pub.publish(self.odom_fused_msg)
 
-    # AUDIT T2: publish_navheading_wheel_odom removed (30 Hz, zero consumers)
+    def publish_relative_wheel_odom(self):
+        """
+        Publish the relative wheel odom. The wheel odom with the offset.
+        :return:
+        """
+        self.filtered_wheel_odom_msg = Odometry()
+        self.filtered_wheel_odom_msg.header.stamp = self.wheel_odom_msg.header.stamp
+        self.filtered_wheel_odom_msg.header.frame_id = self.wheel_odom_msg.header.frame_id
 
-    # AUDIT T4: reset_wheel_odom service removed (no caller)
+        wheel_odom_roll, wheel_odom_pitch, wheel_odom_yaw = euler_from_quaternion(
+            [self.wheel_odom_msg.pose.pose.orientation.x,
+             self.wheel_odom_msg.pose.pose.orientation.y,
+             self.wheel_odom_msg.pose.pose.orientation.z,
+             self.wheel_odom_msg.pose.pose.orientation.w])
+        offset_wheel_odom_roll, offset_wheel_odom_pitch, offset_wheel_odom_yaw = euler_from_quaternion(
+            [self.offset_wheel_odom_msg.pose.pose.orientation.x,
+             self.offset_wheel_odom_msg.pose.pose.orientation.y,
+             self.offset_wheel_odom_msg.pose.pose.orientation.z,
+             self.offset_wheel_odom_msg.pose.pose.orientation.w])
 
-    # AUDIT T4: set_nav_wheel_odom service removed (no caller)
+        n_off_distance, n_off_theta = cart2pol(
+                        self.wheel_odom_msg.pose.pose.position.x - self.offset_wheel_odom_msg.pose.pose.position.x,
+                        self.wheel_odom_msg.pose.pose.position.y - self.offset_wheel_odom_msg.pose.pose.position.y)
+
+        n_x, n_y = pol2cart(n_off_distance,  n_off_theta - offset_wheel_odom_yaw)
+
+
+        self.filtered_wheel_odom_msg.pose.pose.position.x = n_x
+        self.filtered_wheel_odom_msg.pose.pose.position.y = n_y
+        self.filtered_wheel_odom_msg.pose.pose.position.z = 0
+
+
+        wheel_odom_yaw = wheel_odom_yaw - offset_wheel_odom_yaw
+        quaternion = quaternion_from_euler(wheel_odom_roll, wheel_odom_pitch, wheel_odom_yaw)
+        self.filtered_wheel_odom_msg.pose.pose.orientation.x = quaternion[0]
+        self.filtered_wheel_odom_msg.pose.pose.orientation.y = quaternion[1]
+        self.filtered_wheel_odom_msg.pose.pose.orientation.z = quaternion[2]
+        self.filtered_wheel_odom_msg.pose.pose.orientation.w = quaternion[3]
+
+        self.filtered_wheel_odom_msg.pose.covariance = self.wheel_odom_msg.pose.covariance
+        self.filtered_wheel_odom_msg.twist.twist = self.wheel_odom_msg.twist.twist
+        self.filtered_wheel_odom_msg.twist.covariance = self.wheel_odom_msg.twist.covariance
+        self.wheel_odom_pub.publish(self.filtered_wheel_odom_msg)
+
+    def publish_navheading_wheel_odom(self):
+        """
+        Publish the navheading wheel odom. The realtive wheel odom with the gnss navheading.
+        :return:
+        """
+        self.navheading_wheel_odom_msg = Odometry()
+        self.navheading_wheel_odom_msg.header.stamp = self.ekf_wheel_odom_msg.header.stamp
+        self.navheading_wheel_odom_msg.header.frame_id = self.ekf_wheel_odom_msg.header.frame_id
+
+        wheel_odom_roll, wheel_odom_pitch, wheel_odom_yaw = euler_from_quaternion(
+            [self.ekf_wheel_odom_msg.pose.pose.orientation.x,
+             self.ekf_wheel_odom_msg.pose.pose.orientation.y,
+             self.ekf_wheel_odom_msg.pose.pose.orientation.z,
+             self.ekf_wheel_odom_msg.pose.pose.orientation.w])
+        offset_wheel_odom_roll, offset_wheel_odom_pitch, offset_wheel_odom_yaw = euler_from_quaternion(
+            [self.offset_navheading_wheel_odom_msg.pose.pose.orientation.x,
+             self.offset_navheading_wheel_odom_msg.pose.pose.orientation.y,
+             self.offset_navheading_wheel_odom_msg.pose.pose.orientation.z,
+             self.offset_navheading_wheel_odom_msg.pose.pose.orientation.w])
+        offset_rtk_odom_roll, offset_rtk_odom_pitch, offset_rtk_odom_yaw = euler_from_quaternion(
+            [self.offset_rtk_odom_msg.pose.pose.orientation.x,
+             self.offset_rtk_odom_msg.pose.pose.orientation.y,
+             self.offset_rtk_odom_msg.pose.pose.orientation.z,
+             self.offset_rtk_odom_msg.pose.pose.orientation.w])
+
+        n_off_distance, n_off_theta = cart2pol(
+            self.ekf_wheel_odom_msg.pose.pose.position.x - self.offset_navheading_wheel_odom_msg.pose.pose.position.x,
+            self.ekf_wheel_odom_msg.pose.pose.position.y - self.offset_navheading_wheel_odom_msg.pose.pose.position.y)
+        n_off_rtk_distance, n_off_rtk_theta = cart2pol(
+            self.rtk_odom_heading_msg.pose.pose.position.x - self.offset_rtk_odom_msg.pose.pose.position.x,
+            self.rtk_odom_heading_msg.pose.pose.position.y - self.offset_rtk_odom_msg.pose.pose.position.y)
+
+        n_x, n_y = pol2cart(n_off_distance, n_off_theta + offset_rtk_odom_yaw)
+        rtk_x, rtk_y = pol2cart(n_off_distance, n_off_rtk_theta)
+
+        # self.navheading_wheel_odom_msg.pose.pose.position.x = self.offset_rtk_odom_msg.pose.pose.position.x + n_x
+        # self.navheading_wheel_odom_msg.pose.pose.position.y = self.offset_rtk_odom_msg.pose.pose.position.x + n_y
+        self.navheading_wheel_odom_msg.pose.pose.position.x = self.offset_rtk_odom_msg.pose.pose.position.x + rtk_x
+        self.navheading_wheel_odom_msg.pose.pose.position.y = self.offset_rtk_odom_msg.pose.pose.position.y + rtk_y
+        self.navheading_wheel_odom_msg.pose.pose.position.z = self.offset_rtk_odom_msg.pose.pose.position.z
+
+        wheel_odom_yaw = wheel_odom_yaw - offset_wheel_odom_yaw
+        wheel_odom_yaw = wheel_odom_yaw + offset_rtk_odom_yaw
+        quaternion = quaternion_from_euler(wheel_odom_roll, wheel_odom_pitch, wheel_odom_yaw)
+        self.navheading_wheel_odom_msg.pose.pose.orientation.x = quaternion[0]
+        self.navheading_wheel_odom_msg.pose.pose.orientation.y = quaternion[1]
+        self.navheading_wheel_odom_msg.pose.pose.orientation.z = quaternion[2]
+        self.navheading_wheel_odom_msg.pose.pose.orientation.w = quaternion[3]
+
+        self.navheading_wheel_odom_msg.pose.covariance = self.ekf_wheel_odom_msg.pose.covariance
+        self.navheading_wheel_odom_msg.twist.twist = self.ekf_wheel_odom_msg.twist.twist
+        self.navheading_wheel_odom_msg.twist.covariance = self.ekf_wheel_odom_msg.twist.covariance
+        self.nav_wheel_odom_pub.publish(self.navheading_wheel_odom_msg)
+
+
+        # self.navheading_wheel_odom_msg = Odometry()
+        # self.navheading_wheel_odom_msg.header.stamp = self.filtered_wheel_odom_msg.header.stamp
+        # self.navheading_wheel_odom_msg.header.frame_id = self.filtered_wheel_odom_msg.header.frame_id
+        #
+        #
+        # wheel_odom_roll, wheel_odom_pitch, wheel_odom_yaw = euler_from_quaternion(
+        #     [self.filtered_wheel_odom_msg.pose.pose.orientation.x,
+        #      self.filtered_wheel_odom_msg.pose.pose.orientation.y,
+        #      self.filtered_wheel_odom_msg.pose.pose.orientation.z,
+        #      self.filtered_wheel_odom_msg.pose.pose.orientation.w])
+        # nav_odom_roll, nav_odom_pitch, nav_odom_yaw = euler_from_quaternion(
+        #     [self.fused_msg.orientation.x,
+        #      self.fused_msg.orientation.y,
+        #      self.fused_msg.orientation.z,
+        #      self.fused_msg.orientation.w])
+        # wheel_odom_yaw_result = wheel_odom_yaw + nav_odom_yaw
+        # quaternion = quaternion_from_euler(nav_odom_roll, nav_odom_pitch, wheel_odom_yaw_result)
+        # self.navheading_wheel_odom_msg.pose.pose.orientation.x = quaternion[0]
+        # self.navheading_wheel_odom_msg.pose.pose.orientation.y = quaternion[1]
+        # self.navheading_wheel_odom_msg.pose.pose.orientation.z = quaternion[2]
+        # self.navheading_wheel_odom_msg.pose.pose.orientation.w = quaternion[3]
+        #
+        #
+        #
+        #
+        #
+        #
+        # n_distance, n_theta = cart2pol(self.filtered_wheel_odom_msg.pose.pose.position.x,
+        #                                self.filtered_wheel_odom_msg.pose.pose.position.y)
+        #
+        # n_x, n_y = pol2cart(n_distance, self.nav_wheel_odom_offset_theta - wheel_odom_yaw_result)
+        # # print("##################")
+        # # print("n_distance: {:.2f} n_theta: {:.2f} imu_theta_offset: {:.2f} n_x: {:.2f}, n_y: {:.2f}".format(
+        # #                                                                n_distance,
+        # #                                                                 math.degrees(n_theta),
+        # #                                                                math.degrees(wheel_odom_yaw_result),
+        # #                                                                n_x,
+        # #                                                                n_y))
+        # # print("##################")
+        #
+        # self.navheading_wheel_odom_msg.pose.pose.position.x = n_x
+        # self.navheading_wheel_odom_msg.pose.pose.position.y = n_y
+        # self.navheading_wheel_odom_msg.pose.pose.position.z = self.filtered_wheel_odom_msg.pose.pose.position.z
+        #
+        #
+        #
+        # self.navheading_wheel_odom_msg.pose.covariance = self.filtered_wheel_odom_msg.pose.covariance
+        # self.navheading_wheel_odom_msg.twist.twist = self.filtered_wheel_odom_msg.twist.twist
+        # self.navheading_wheel_odom_msg.twist.covariance = self.filtered_wheel_odom_msg.twist.covariance
+        # # print(self.filtered_wheel_odom_msg.pose.pose)
+        # self.nav_wheel_odom_pub.publish(self.navheading_wheel_odom_msg)
+
+    def srv_cb_reset_wheel_odom(self, srv):
+        """
+        Service callback to set the wheel odom offset. it zero the wheel odom.
+        :param srv:
+        :return:
+        """
+        self.reset_wheel_odom()
+        return EmptyResponse()
+
+    def srv_cb_set_nav_wheel_odom(self, srv):
+        """
+        Service callback to set the wheel odom to navheading offset. Make wheel odom same orientation as navheading.
+        :param srv:
+        :return:
+        """
+        self.set_nav_wheel_odom()
+        return EmptyResponse()
 
     def srv_cb_set_pose(self, srv):
         """
@@ -1960,7 +2156,8 @@ class NavTfNode:
         self.set_wheel_base_nav_pose(pose)
         return SetPoseResponse()
 
-    # AUDIT T4: reset_wheel_odom helper removed (uncalled)
+    def reset_wheel_odom(self):
+        self.offset_wheel_odom_msg = copy.deepcopy(self.wheel_odom_msg)
 
     def set_nav_pose(self, pose):
         """
@@ -1976,7 +2173,33 @@ class NavTfNode:
                                                    pose.orientation.w])[2]
         rospy.logdebug("Set pose yaw: %s" % self.set_pose_yaw)
 
-    # AUDIT T4: set_nav_wheel_odom helper removed (uncalled)
+    def set_nav_wheel_odom(self):
+        self.offset_navheading_wheel_odom_msg = copy.deepcopy(self.wheel_odom_msg)
+        self.offset_rtk_odom_msg = copy.deepcopy(self.rtk_odom_heading_msg)
+
+    def set_wheel_base_pose(self):
+        rospy.wait_for_service('/ekf_wheel_odometry/set_pose')
+        try:
+            pose_srv = SetPoseRequest()
+            pose_srv.pose.pose.pose.position.x = self.rtk_odom_msg.pose.pose.position.x
+            pose_srv.pose.pose.pose.position.y = self.rtk_odom_msg.pose.pose.position.y
+            pose_srv.pose.pose.pose.position.z = self.rtk_odom_msg.pose.pose.position.z
+            # pose_srv.pose.pose.pose.orientation.x = self.fused_msg.orientation.x
+            # pose_srv.pose.pose.pose.orientation.y = self.fused_msg.orientation.y
+            # pose_srv.pose.pose.pose.orientation.z = self.fused_msg.orientation.z
+            # pose_srv.pose.pose.pose.orientation.w = self.fused_msg.orientation.w
+            pose_srv.pose.pose.pose.orientation.x = self.rtk_odom_msg.pose.pose.orientation.x
+            pose_srv.pose.pose.pose.orientation.y = self.rtk_odom_msg.pose.pose.orientation.y
+            pose_srv.pose.pose.pose.orientation.z = self.rtk_odom_msg.pose.pose.orientation.z
+            pose_srv.pose.pose.pose.orientation.w = self.rtk_odom_msg.pose.pose.orientation.w
+            pose_srv.pose.header.frame_id = ('odom')
+            pose_srv.pose.header.stamp = rospy.Time.now()
+
+            srv = rospy.ServiceProxy('/ekf_wheel_odometry/set_pose', SetPose)  # Connect to the service
+            response = srv(pose_srv)
+            rospy.logdebug("Response: %s" % response)
+        except rospy.ServiceException as e:
+            rospy.logerr("Service /ekf_wheel_odometry/set_pose call failed: %s" % e)
 
     def set_wheel_base_nav_pose(self, pose=None, frame='map'):
         rospy.wait_for_service('/ekf_wheel_nav_odometry/set_pose')
@@ -2205,7 +2428,21 @@ class NavTfNode:
         self.nav_odom_status_pub.publish(msg)
 
 
-    # AUDIT T3: publish_imu_baselink removed (docstring said Obsolete; zero consumers)
+    def publish_imu_baselink(self):
+        """
+        Publish imu in base_link frame. Obsolete
+        :return:
+        """
+        imu = Imu()
+        imu.header.stamp = rospy.Time.now()
+        imu.header.frame_id = "base_link"
+        imu.orientation = self.imu_msg.orientation
+        imu.orientation_covariance = self.imu_msg.orientation_covariance
+        imu.angular_velocity = self.imu_msg.angular_velocity
+        imu.angular_velocity_covariance = self.imu_msg.angular_velocity_covariance
+        imu.linear_acceleration = self.imu_msg.linear_acceleration
+        imu.linear_acceleration_covariance = self.imu_msg.linear_acceleration_covariance
+        self.base_link_imu_pub.publish(imu)
 
     def publish_fused_navheading(self):
         """
@@ -2474,7 +2711,10 @@ class NavTfNode:
 
 
     def loop30hz(self, event=None):
+        self.publish_relative_wheel_odom()
         self.publish_odom_for_gps()
+        self.publish_navheading_wheel_odom()
+        self.publish_odom_fused()
         self.transform_odom_to_base_link()
         self.slew_map_pose()
         self.transform_map_to_odom()
@@ -2483,13 +2723,10 @@ class NavTfNode:
         self.init_navsat()
         # vitulus_ui Phase 1 (Step A): shadow bridge preview. Wrapped so a bug
         # here can NEVER disturb the live odometry pipeline above.
-        # AUDIT E1: parked (consumers migrated to loc_status) — see
-        # ~bridge/compute_enable at __init__.
-        if self._bridge_compute_enable:
-            try:
-                self.update_bridge_preview()
-            except Exception as e:
-                rospy.logwarn_throttle(10.0, "[bridge_preview] %s" % e)
+        try:
+            self.update_bridge_preview()
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[bridge_preview] %s" % e)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,44 @@
+<launch>
+  <!-- vitulus_ui / Phase 1: Visual Odometry from the d435 (RGB-D).
+       SHADOW SOURCE ONLY: this node ONLY publishes an odometry topic
+       (/vo/odom) + quality info (/vo/odom_info). publish_tf is FALSE so it
+       does NOT touch the live odom->base_link TF produced by navi_transform.
+       It is meant to be consumed by navi_transform as a gated bridge source
+       during GPS-denied stretches (daylight; it degrades at night - that is
+       handled by the consumer's confidence gate, not here).
+
+       Run standalone for validation:
+         roslaunch vitulus_navi vo_rgbd_odometry.launch
+       then inspect /vo/odom and /vo/odom_info (Vis/inliers, lost). -->
+
+  <arg name="camera"        default="d435"/>
+  <arg name="frame_id"      default="base_link"/>
+  <arg name="approx_sync"   default="true"/>
+
+  <node pkg="rtabmap_odom" type="rgbd_odometry" name="vo_rgbd_odometry" output="screen">
+    <remap from="rgb/image"        to="/$(arg camera)/color/image_raw"/>
+    <remap from="depth/image"      to="/$(arg camera)/aligned_depth_to_color/image_raw"/>
+    <remap from="rgb/camera_info"  to="/$(arg camera)/color/camera_info"/>
+    <remap from="odom"             to="/vo/odom"/>
+    <remap from="odom_info"        to="/vo/odom_info"/>
+
+    <param name="frame_id"          type="string" value="$(arg frame_id)"/>
+    <!-- isolated odom frame; never published as TF -->
+    <param name="odom_frame_id"     type="string" value="vo_odom"/>
+    <param name="publish_tf"        type="bool"   value="false"/>
+    <param name="approx_sync"       type="bool"   value="$(arg approx_sync)"/>
+    <param name="wait_for_transform_duration" type="double" value="0.2"/>
+
+    <!-- Auto-reset after losing tracking so the node ALWAYS recovers when good
+         conditions return. With 0 (no reset) it stayed lost forever after a
+         single bad patch (e.g. sun / open area), so it never came back in the
+         shade. The consumer (navi_transform bridge) absorbs the reset jump: it
+         only uses this source while gated (low covariance) and refreshes its
+         reference every cycle. -->
+    <param name="Odom/ResetCountdown" type="string" value="1"/>
+    <param name="Odom/Holonomic"      type="string" value="false"/>
+    <param name="Reg/Force3DoF"       type="string" value="true"/>
+    <param name="Vis/EstimationType"  type="string" value="1"/>   <!-- PnP (3D->2D) -->
+    <param name="Vis/MinInliers"      type="string" value="15"/>
+  </node>
+</launch>

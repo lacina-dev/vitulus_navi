@@ -15,18 +15,12 @@
   <arg name="frame_id"      default="base_link"/>
   <arg name="approx_sync"   default="true"/>
 
-  <node pkg="rtabmap_odom" type="rgbd_odometry" name="vo_rgbd_odometry" output="screen" respawn="true" respawn_delay="3">
+  <node pkg="rtabmap_odom" type="rgbd_odometry" name="vo_rgbd_odometry" output="screen">
     <remap from="rgb/image"        to="/$(arg camera)/color/image_raw"/>
     <remap from="depth/image"      to="/$(arg camera)/aligned_depth_to_color/image_raw"/>
     <remap from="rgb/camera_info"  to="/$(arg camera)/color/camera_info"/>
     <remap from="odom"             to="/vo/odom"/>
     <remap from="odom_info"        to="/vo/odom_info"/>
-    <!-- AUDIT dock-idle (2026-08-01): pause/resume advertised globally by
-         rtabmap collide between VO and ICP (one registration wins). Remap
-         into a per-node namespace so dock_idle can address each one. -->
-    <remap from="pause_odom"  to="/vo/pause_odom"/>
-    <remap from="resume_odom" to="/vo/resume_odom"/>
-    <remap from="reset_odom"  to="/vo/reset_odom"/>
 
     <param name="frame_id"          type="string" value="$(arg frame_id)"/>
     <!-- isolated odom frame; never published as TF -->

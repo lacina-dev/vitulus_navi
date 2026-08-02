@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""dock_idle — CPU relief while docked (AUDIT 2026-08-01, phase 2).
+
+Runtime measurement with the robot parked in the dock showed load avg 15.9:
+vo_rgbd_odometry at ~107 % CPU (full RGBD VO in the dark, output unused) and
+lidar_icp_odometry burning cycles the same way, while move_base_flex missed
+its own 10 Hz map-update loop. Neither odometry contributes anything while the
+robot is physically latched in the dock.
+
+This node watches /dock_smach/dock_status (0=docked, 1=undocking, 2=docking,
+3=undocked, 5=unknown; latched) and:
+  - after the robot has been DOCKED continuously for ~dock_hold_s, calls the
+    pause services of both visual and lidar odometry (remapped per-node:
+    /vo/pause_odom, /licp/pause_odom — the raw rtabmap names collide);
+  - the INSTANT the status leaves 0 (undocking starts before any wheel moves),
+    calls the resume services, so the odometries are live again well before
+    the robot leaves the dock.
+
+Safety posture: resume is also attempted on node shutdown and re-attempted
+with a throttled warn if a service is unavailable. ~enable=false turns the
+whole node into a no-op. State is latched on /dock_idle/status as JSON.
+"""
+
+import json
+import time
+
+import rospy
+from std_msgs.msg import Int8, String
+from std_srvs.srv import Empty
+
+DOCKED = 0
+
+
+class DockIdle(object):
+    def __init__(self):
+        self.enable = bool(rospy.get_param('~enable', True))
+        self.hold_s = float(rospy.get_param('~dock_hold_s', 20.0))
+        # service pairs to pause/resume, in call order
+        self.pause_srvs = rospy.get_param(
+            '~pause_services', ['/vo/pause_odom', '/licp/pause_odom'])
+        self.resume_srvs = rospy.get_param(
+            '~resume_services', ['/vo/resume_odom', '/licp/resume_odom'])
+        self.paused = False
+        self.docked_since = None
+        self.status_pub = rospy.Publisher('/dock_idle/status', String,
+                                          queue_size=1, latch=True)
+        rospy.Subscriber('/dock_smach/dock_status', Int8, self.cb_dock,
+                         queue_size=2)
+        rospy.Timer(rospy.Duration(2.0), self.tick)
+        rospy.on_shutdown(self.on_shutdown)
+        self._publish()
+        rospy.loginfo('[dock_idle] up (enable=%s, hold=%.0fs, pause=%s)',
+                      self.enable, self.hold_s, self.pause_srvs)
+
+    # ---- dock state ---------------------------------------------------------
+    def cb_dock(self, msg):
+        if msg.data == DOCKED:
+            if self.docked_since is None:
+                self.docked_since = time.time()
+        else:
+            self.docked_since = None
+            if self.paused:
+                # leaving the dock (undocking has begun) — wake the odometries
+                # BEFORE any motion happens
+                self._call_all(self.resume_srvs, 'resume')
+                self.paused = False
+                self._publish()
+
+    def tick(self, _evt):
+        if not self.enable or self.paused or self.docked_since is None:
+            return
+        if (time.time() - self.docked_since) >= self.hold_s:
+            self._call_all(self.pause_srvs, 'pause')
+            self.paused = True
+            self._publish()
+
+    # ---- plumbing -----------------------------------------------------------
+    def _call_all(self, names, what):
+        for name in names:
+            try:
+                rospy.wait_for_service(name, timeout=3.0)
+                rospy.ServiceProxy(name, Empty)()
+                rospy.loginfo('[dock_idle] %s -> %s', what, name)
+            except Exception as e:
+                rospy.logwarn_throttle(
+                    30.0, '[dock_idle] %s via %s failed: %s', what, name, e)
+
+    def _publish(self):
+        self.status_pub.publish(String(json.dumps(
+            {'enabled': self.enable, 'paused': self.paused})))
+
+    def on_shutdown(self):
+        if self.paused:
+            self._call_all(self.resume_srvs, 'resume(shutdown)')
+
+
+if __name__ == '__main__':
+    rospy.init_node('dock_idle')
+    DockIdle()
+    rospy.spin()

@@ -1,0 +1,14 @@
+### Navi manager init ###
+
+# Name of the map to load (create new map if empty).
+# Boot-in-dock: load the production outdoor map so the dock seed can place the
+# robot in it immediately (no GPS needed). The map MUST contain the "docked"
+# waypoint (be docked + localized, then publish "docked" to /navi_manager/save_waypoint
+# and SAVE the map).
+load_map_on_start: "GARDEN_2026***env*OUTDOOR"
+
+# When loading a map (at boot AND from the UI), also start the rtabmap docker
+# container in LOCALIZATION mode on it. This is what lets the robot localize in
+# the map without GPS (dock seed -> /rtabmap/initialpose -> lidar proximity lock).
+# false = legacy behavior (map loads, rtabmap container is stopped).
+rtabmap_on_start: true

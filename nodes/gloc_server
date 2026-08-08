@@ -1171,7 +1171,21 @@ class GlocServer(object):
             if scan is None or (now - scan.header.stamp).to_sec() > 1.5:
                 info['state'] = 'no_scan'
                 return
-            pose0 = self._current_pose()
+            # AUDIT P0-2 (2026-08-08): align against the pose AT THE SCAN
+            # STAMP, not the latest — the old latest-pose init put a
+            # v*scan_age error (3-45 cm at 0.3 m/s) into every correction
+            # while driving. The aligned pose is published with the scan's
+            # stamp; navi_transform composes it with odom->base at that same
+            # stamp, so the map->odom correction is time-consistent
+            # regardless of processing/publish latency. Fallback: latest
+            # pose (old behavior) when TF cannot serve the stamp.
+            info['scan_age_ms'] = round((now - scan.header.stamp).to_sec() * 1e3, 1)
+            pose0 = self._pose_at(scan.header.stamp)
+            if pose0 is None:
+                info['pose_at_scan'] = False
+                pose0 = self._current_pose()
+            else:
+                info['pose_at_scan'] = True
             if pose0 is None:
                 info['state'] = 'no_tf'
                 return
@@ -1409,7 +1423,10 @@ class GlocServer(object):
                         info['state'] = 'settling'
                         return
             ps = PoseStamped()
-            ps.header.stamp = now
+            # AUDIT P0-2: stamp = SCAN time — the pose is valid at the scan
+            # measurement instant; navi_transform pairs odom->base at this
+            # stamp so the correction survives publish/processing latency.
+            ps.header.stamp = scan.header.stamp
             ps.header.frame_id = self.map_frame
             ps.pose.position.x = x
             ps.pose.position.y = y
@@ -1483,6 +1500,21 @@ class GlocServer(object):
         try:
             g = self._tf_buf.lookup_transform(self.map_frame, self.base_frame,
                                               rospy.Time(0), rospy.Duration(1.0))
+            q = g.transform.rotation
+            return (g.transform.translation.x, g.transform.translation.y,
+                    euler_from_quaternion([q.x, q.y, q.z, q.w])[2])
+        except Exception:
+            return None
+
+    def _pose_at(self, stamp):
+        """map->base_link at a specific stamp (AUDIT P0-2, 2026-08-08): the
+        tracker aligns a scan measured in the past — the initial pose must be
+        the pose AT THAT TIME, or every correction inherits a v*scan_age
+        offset along the direction of travel. Returns None when TF cannot
+        serve the stamp (caller falls back to the latest pose)."""
+        try:
+            g = self._tf_buf.lookup_transform(self.map_frame, self.base_frame,
+                                              stamp, rospy.Duration(0.15))
             q = g.transform.rotation
             return (g.transform.translation.x, g.transform.translation.y,
                     euler_from_quaternion([q.x, q.y, q.z, q.w])[2])

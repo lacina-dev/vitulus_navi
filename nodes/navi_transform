@@ -289,8 +289,20 @@ class NavTfNode:
         self._rewind_verify_step_s = float(rospy.get_param('~rewind_verify_step_s', 0.5))
         # trailing sub-window (s) for the |Dgps| vs |Dwheel| agreement test
         self._rewind_verify_subwin_s = float(rospy.get_param('~rewind_verify_subwin_s', 1.5))
-        # buffer tuple: (t, rtk_xy, wheel_xy, wheel_yaw, nav_yaw) @ ~10 Hz
+        # buffer tuple: (t, rtk_xy, wheel_xy, wheel_yaw, nav_yaw) — one entry
+        # per NEW GPS sample (~5 Hz), stamped with the GPS header.stamp.
         self._pose_buffer = deque(maxlen=200)
+        # ANCHOR PAIRING FIX (2026-08-07, bag validacni_jizda_2026-08-02 /
+        # BAG_ANALYZA_2026-08-07.md): entries used to pair the LATEST
+        # /odometry/gps msg (5 Hz, 96-196 ms old at the 10 Hz tick) with the
+        # FRESH wheel-EKF pose — the v*age pairing error jittered the anchor
+        # target +-40 mm tick-to-tick (sign-alternating, longitudinal) and
+        # set_pose teleported the nav EKF at 10 Hz ('cukani na GPS' under TEB).
+        # Entries now pair the GPS pose with the wheel/nav state INTERPOLATED
+        # at the GPS measurement stamp, from the short histories below.
+        self._wheel_hist = deque(maxlen=150)    # (t, x, y, yaw) @ 30 Hz = 5 s
+        self._nav_yaw_hist = deque(maxlen=150)  # (t, yaw)       @ 30 Hz = 5 s
+        self._last_buffered_gps_t = 0.0
         # Georef (map->odom) slew: rate-limit corrections from the utm georef
         # path; only a kidnap-size mismatch snaps.
         self._georef_slew_mps = float(rospy.get_param('~georef_slew_mps', 0.10))
@@ -321,6 +333,11 @@ class NavTfNode:
         # smooth takeover: slew rates for large corrections after GPS acquisition
         self._heading_slew_dps = float(rospy.get_param('~heading_slew_dps', 5.0))
         self._pos_slew_mps = float(rospy.get_param('~pos_slew_mps', 0.5))
+        # ANCHOR PAIRING FIX (2026-08-07): corrections below the deadband skip
+        # the set_pose call entirely (RTK noise floor ~14 mm must not touch the
+        # EKF), corrections above it are ALWAYS slewed (the old 10 cm direct-
+        # apply floor teleported every 40-95 mm target jitter straight in).
+        self._anchor_deadband_m = float(rospy.get_param('~anchor_deadband_m', 0.015))
         # WP2 (localization v2): magic constants -> ~params, defaults UNCHANGED.
         self._probation_tol_abs_m = float(rospy.get_param('~probation_tol_abs_m', 0.1))
         self._probation_tol_frac = float(rospy.get_param('~probation_tol_frac', 0.2))
@@ -612,7 +629,11 @@ class NavTfNode:
                     5.0, "[set_map_pose] source '%s' rejected — higher-priority "
                     "'%s' fresh within %.1fs", source, higher, self._map_pose_hold_s)
                 return
-        odom_base = self.get_base_link_transform()   # odom->base_link
+        # AUDIT P0-2 (2026-08-08): pair with odom->base AT THE MESSAGE STAMP
+        # (gloc tracker stamps its pose with the scan time) — composing a
+        # past-time map pose with the LATEST odometry put a v*latency error
+        # into map->odom on every correction while driving.
+        odom_base = self.get_base_link_transform(stamp=msg.header.stamp)
         if odom_base is None:
             rospy.logwarn_throttle(5.0, "[set_map_pose] no odom->base_link TF yet — skipping")
             return
@@ -862,9 +883,40 @@ class NavTfNode:
 
     def callback_ekf_wheel_odom(self, msg):
         self.ekf_wheel_odom_msg = msg
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        self._wheel_hist.append((msg.header.stamp.to_sec(), p.x, p.y,
+                                 euler_from_quaternion([q.x, q.y, q.z, q.w])[2]))
 
     def callback_ekf_wheel_nav_odom(self, msg):
         self.ekf_wheel_nav_odom_msg = msg
+        q = msg.pose.pose.orientation
+        self._nav_yaw_hist.append((msg.header.stamp.to_sec(),
+                                   euler_from_quaternion([q.x, q.y, q.z, q.w])[2]))
+
+    # ---- anchor pairing fix helpers (2026-08-07) ---------------------------
+    @staticmethod
+    def _hist_at(hist, t):
+        """Locate time t in a time-ordered history deque of tuples. Returns
+        (entry_before, entry_after, blend_factor) or None when t falls outside
+        the covered range (caller skips — bootstrap handles an empty buffer)."""
+        buf = list(hist)
+        if len(buf) < 2 or not (buf[0][0] <= t <= buf[-1][0]):
+            return None
+        for i in range(len(buf) - 1, 0, -1):
+            if buf[i - 1][0] <= t:
+                a, b = buf[i - 1], buf[i]
+                dt = b[0] - a[0]
+                return a, b, (0.0 if dt <= 0 else (t - a[0]) / dt)
+        return None
+
+    @staticmethod
+    def _interp_scalar(a, b, f):
+        return a + (b - a) * f
+
+    @staticmethod
+    def _interp_angle(a, b, f):
+        return a + math.atan2(math.sin(b - a), math.cos(b - a)) * f
 
 
     def callback_wheel_odom(self, msg):
@@ -1559,16 +1611,22 @@ class NavTfNode:
         return True
 
     def _set_anchor_pose_slewed(self, tx, ty, tz):
-        """Write a map/odom-frame position target into the nav EKF with the SAME
-        per-call slew the legacy rtk(NOW) correction used (drive-6 forensics:
-        snapping the EKF straight to a target was half the takeover jump). Small
-        deltas apply directly; large ones converge at ~pos_slew_mps."""
+        """Write a map/odom-frame position target into the nav EKF, deadbanded
+        and ALWAYS slewed (2026-08-07, BAG_ANALYZA_2026-08-07.md): below
+        ~anchor_deadband_m the set_pose call is skipped entirely (RTK noise
+        floor must not slam the EKF 10x/s — and skipping also leaves the EKF
+        velocity state untouched between real corrections); above it the step
+        is capped at ~pos_slew_mps. The old `max(max_step, 0.10)` floor applied
+        everything <=10 cm DIRECTLY — every 40-95 mm target jitter teleported
+        the pose and TEB chased the sawtooth ('cukani na GPS')."""
         cx = self.ekf_wheel_nav_odom_msg.pose.pose.position.x
         cy = self.ekf_wheel_nav_odom_msg.pose.pose.position.y
         dx, dy = tx - cx, ty - cy
         dist = math.hypot(dx, dy)
+        if dist < self._anchor_deadband_m:
+            return
         max_step = self._pos_slew_mps * 0.1   # per call at ~10 Hz
-        if dist > max(max_step, 0.10):
+        if dist > max_step:
             scale = max_step / dist
             tx, ty = cx + dx * scale, cy + dy * scale
         pose = Pose()
@@ -1812,12 +1870,25 @@ class NavTfNode:
             msg.child_frame_id = "base_link"
             self.odometry_odom_pub.publish(msg)
 
-    def get_base_link_transform(self):
+    def get_base_link_transform(self, stamp=None):
+        """odom->base_link. With a stamp (AUDIT P0-2, 2026-08-08) the lookup is
+        served AT that time so an external map pose measured in the past (gloc
+        tracker stamps its output with the SCAN time) composes with the
+        odometry pose of the SAME instant — the resulting map->odom correction
+        is then time-consistent regardless of publish/processing latency.
+        Falls back to the latest transform when the stamp cannot be served."""
         trans = None
-        try:
-            trans = self.tf2_Buffer.lookup_transform('odom', 'base_link', rospy.Time(0))
-        except:
-            trans = None
+        if stamp is not None and stamp != rospy.Time(0):
+            try:
+                trans = self.tf2_Buffer.lookup_transform(
+                    'odom', 'base_link', stamp, rospy.Duration(0.15))
+            except Exception:
+                trans = None
+        if trans is None:
+            try:
+                trans = self.tf2_Buffer.lookup_transform('odom', 'base_link', rospy.Time(0))
+            except:
+                trans = None
 
         if trans is not None:
             odom_base_transform = TransformStamped()
@@ -1995,8 +2066,13 @@ class NavTfNode:
                 cy = self.ekf_wheel_nav_odom_msg.pose.pose.position.y
                 dx, dy = tx - cx, ty - cy
                 dist = math.hypot(dx, dy)
+                # 2026-08-07: deadband + always-slew, mirroring
+                # _set_anchor_pose_slewed (the 10 cm direct-apply floor let
+                # target jitter teleport the pose — BAG_ANALYZA_2026-08-07.md)
+                if dist < self._anchor_deadband_m:
+                    return
                 max_step = self._pos_slew_mps * 0.1   # per call at ~10 Hz
-                if dist > max(max_step, 0.10):
+                if dist > max_step:
                     scale = max_step / dist
                     tx, ty = cx + dx * scale, cy + dy * scale
                 pose_srv.pose.pose.pose.position.x = tx
@@ -2388,26 +2464,32 @@ class NavTfNode:
                     self.fix_last_fused_time = rospy.Time.now()
                     # rewind buffer FIRST: pair the GPS pose with the never-
                     # set_pose'd wheel-EKF pose (+ wheel & nav yaw for delta
-                    # rotation) at correction time. Appending before anchoring
-                    # is intentional — the continuous anchor selects an entry at
-                    # (now - anchor_lag_s), never THIS tick, so this append only
-                    # feeds FUTURE ticks; the rewind path also consumes it.
-                    self._pose_buffer.append((
-                        rospy.get_time(),
-                        (self.rtk_odom_msg.pose.pose.position.x,
-                         self.rtk_odom_msg.pose.pose.position.y),
-                        (self.ekf_wheel_odom_msg.pose.pose.position.x,
-                         self.ekf_wheel_odom_msg.pose.pose.position.y),
-                        euler_from_quaternion([
-                            self.ekf_wheel_odom_msg.pose.pose.orientation.x,
-                            self.ekf_wheel_odom_msg.pose.pose.orientation.y,
-                            self.ekf_wheel_odom_msg.pose.pose.orientation.z,
-                            self.ekf_wheel_odom_msg.pose.pose.orientation.w])[2],
-                        euler_from_quaternion([
-                            self.ekf_wheel_nav_odom_msg.pose.pose.orientation.x,
-                            self.ekf_wheel_nav_odom_msg.pose.pose.orientation.y,
-                            self.ekf_wheel_nav_odom_msg.pose.pose.orientation.z,
-                            self.ekf_wheel_nav_odom_msg.pose.pose.orientation.w])[2]))
+                    # rotation). Appending before anchoring is intentional — the
+                    # continuous anchor selects an entry at (now - anchor_lag_s),
+                    # never THIS tick, so this append only feeds FUTURE ticks;
+                    # the rewind path also consumes it.
+                    # PAIRING FIX (2026-08-07, BAG_ANALYZA_2026-08-07.md): one
+                    # entry per NEW GPS sample, stamped with the GPS measurement
+                    # time and paired with wheel/nav state INTERPOLATED at that
+                    # stamp. The old latest-msg pairing at the 10 Hz tick put a
+                    # v*age (96-196 ms) error into every entry — the anchor
+                    # target jittered +-40 mm and the pose sawtoothed under TEB.
+                    gps_t = self.rtk_odom_msg.header.stamp.to_sec()
+                    if gps_t > self._last_buffered_gps_t:
+                        wh = self._hist_at(self._wheel_hist, gps_t)
+                        nv = self._hist_at(self._nav_yaw_hist, gps_t)
+                        if wh is not None and nv is not None:
+                            wa, wb, wf = wh
+                            na, nb, nf = nv
+                            self._pose_buffer.append((
+                                gps_t,
+                                (self.rtk_odom_msg.pose.pose.position.x,
+                                 self.rtk_odom_msg.pose.pose.position.y),
+                                (self._interp_scalar(wa[1], wb[1], wf),
+                                 self._interp_scalar(wa[2], wb[2], wf)),
+                                self._interp_angle(wa[3], wb[3], wf),
+                                self._interp_angle(na[1], nb[1], nf)))
+                            self._last_buffered_gps_t = gps_t
                     # CONTINUOUS SAME-TIME ANCHOR: write GPS_pose(now-lag) o
                     # wheel-delta(now-lag -> now). On the FIRST owning tick after
                     # an outage, emit the accumulated-error drift report. Falls

@@ -1,4 +1,12 @@
 ############################################## WHEEL ODOMETRY ##############################################
+# AUDIT P2-4 (2026-08-08) — why two_d_mode stays FALSE on both outdoor EKFs:
+# the mower runs on sloped terrain and the 3D states are consumed, not vestigial:
+#  - roll/pitch (IMU-measured) project wheel vx onto the slope — 2D mode would
+#    over-count distance on climbs (cos(pitch) error, ~1.5% at 10 deg);
+#  - z feeds the DR-z used by mapping v3 (insertion_gate DR height,
+#    trajectory_dem) and the anchor writes rtk z into the nav EKF;
+#  - unmeasured 3D states are bounded by the process noise + absolute IMU
+#    orientation, and the map->odom output consumed downstream is 2D anyway.
 ekf_wheel_odometry:
   frequency: 30
   sensor_timeout: 0.1

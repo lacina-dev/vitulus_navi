@@ -406,6 +406,29 @@ class NavTfNode:
             rospy.get_param('~tracker_reject_above_m', 1.5))
         self._tracker_reject_above_deg = float(
             rospy.get_param('~tracker_reject_above_deg', 30.0))
+        # DRIFT-BUDGET gate (2026-08-15 late, user design): odometry is the
+        # short-horizon truth. A tracker correction claims "the pose is off by
+        # |corr|" — but pose error can only ACCUMULATE from odometry drift, so
+        # |corr| is bounded by a budget grown from the path driven since the
+        # last trusted anchor (dock seed / GPS georef / any accepted external
+        # correction). Above the budget = physically impossible = map aliasing
+        # (tonight's sparse-map wall slide: 1 m claimed after ~3 m driven).
+        # Long dark drives legitimately earn a bigger budget (6 %/m + turn
+        # penalty), so genuine recovery is NOT starved — it just has to be
+        # consistent with how far we actually drove.
+        self._budget_c0_m = float(
+            rospy.get_param('~tracker_budget_base_m', 0.15))
+        self._budget_per_m = float(
+            rospy.get_param('~tracker_budget_per_m', 0.06))
+        self._budget_per_rot_m = float(
+            rospy.get_param('~tracker_budget_per_rot_deg_m', 0.003))
+        self._budget_yaw0_deg = float(
+            rospy.get_param('~tracker_budget_yaw_base_deg', 4.0))
+        self._budget_yaw_per_rot = float(
+            rospy.get_param('~tracker_budget_yaw_per_rot', 0.05))
+        self._budget_path_m = 0.0    # wheel-odom path since last trusted anchor
+        self._budget_rot_deg = 0.0   # accumulated |rotation| since last anchor
+        self._budget_prev = None     # last pure-wheel-EKF sample (x, y, yaw)
         # active slew target (tx, ty, target_yaw) or None; set by callback,
         # consumed by slew_map_pose() in the 30 Hz loop
         self._map_pose_target = None
@@ -731,19 +754,29 @@ class NavTfNode:
                 dist = math.hypot(tx - cur.x, ty - cur.y)
                 dyaw = abs(math.atan2(math.sin(m - self.map_odom_yaw),
                                       math.cos(m - self.map_odom_yaw)))
-                # UNDOCK-2026-08-15: sanity bound ABOVE the snap threshold —
-                # a continuous tracker demanding this much is a wrong match,
-                # not a relocalisation; reject instead of snapping onto it.
-                if source == 'tracker' and (
-                        dist > self._tracker_reject_above_m or
-                        dyaw > math.radians(self._tracker_reject_above_deg)):
-                    rospy.logwarn_throttle(
-                        5.0, "[set_map_pose] tracker correction %.2f m / "
-                        "%.1f deg exceeds sanity bound (%.1f m / %.0f deg) "
-                        "— REJECTED", dist, math.degrees(dyaw),
-                        self._tracker_reject_above_m,
-                        self._tracker_reject_above_deg)
-                    return
+                # DRIFT-BUDGET gate (2026-08-15 late): a tracker correction may
+                # never exceed what odometry drift could have accumulated since
+                # the last trusted anchor. Falls back to the fixed sanity bound
+                # while no wheel-odom sample has arrived yet.
+                if source == 'tracker':
+                    if self._budget_prev is not None:
+                        lim_m = (self._budget_c0_m
+                                 + self._budget_per_m * self._budget_path_m
+                                 + self._budget_per_rot_m * self._budget_rot_deg)
+                        lim_deg = (self._budget_yaw0_deg
+                                   + self._budget_yaw_per_rot * self._budget_rot_deg)
+                    else:
+                        lim_m = self._tracker_reject_above_m
+                        lim_deg = self._tracker_reject_above_deg
+                    if dist > lim_m or dyaw > math.radians(lim_deg):
+                        rospy.logwarn_throttle(
+                            5.0, "[set_map_pose] tracker correction %.2f m / "
+                            "%.1f deg exceeds DRIFT BUDGET (%.2f m / %.1f deg; "
+                            "path %.1f m, rot %.0f deg since anchor) — "
+                            "REJECTED (map aliasing?)", dist,
+                            math.degrees(dyaw), lim_m, lim_deg,
+                            self._budget_path_m, self._budget_rot_deg)
+                        return
                 if (dist > self._map_pose_slew_snap_m or
                         dyaw > math.radians(self._map_pose_slew_snap_deg)):
                     self.map_odom_yaw = m
@@ -773,6 +806,10 @@ class NavTfNode:
         # WP2: correction ACCEPTED and applied — stamp this source for arbitration.
         if source in self._map_pose_last_accept:
             self._map_pose_last_accept[source] = rospy.get_time()
+        # DRIFT-BUDGET: an accepted external correction re-anchors the pose —
+        # the odometry drift budget restarts from its base.
+        self._budget_path_m = 0.0
+        self._budget_rot_deg = 0.0
         rospy.loginfo_throttle(5.0,
             "[set_map_pose] map->odom target from external map pose (%.2f, %.2f, %.1fdeg) -> "
             "t=(%.2f, %.2f) yaw=%.2fdeg src=%s%s",
@@ -951,6 +988,10 @@ class NavTfNode:
                 # correction (its translation math above assumes the
                 # identity-rotation broadcast).
                 self.map_odom_yaw = 0.0
+            # DRIFT-BUDGET: GPS georef is a trusted absolute anchor — restart
+            # the odometry drift budget for tracker corrections.
+            self._budget_path_m = 0.0
+            self._budget_rot_deg = 0.0
         self.map_coords_msg = msg
 
     def callback_base_odom(self, msg):
@@ -960,8 +1001,17 @@ class NavTfNode:
         self.ekf_wheel_odom_msg = msg
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
-        self._wheel_hist.append((msg.header.stamp.to_sec(), p.x, p.y,
-                                 euler_from_quaternion([q.x, q.y, q.z, q.w])[2]))
+        _wyaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        self._wheel_hist.append((msg.header.stamp.to_sec(), p.x, p.y, _wyaw))
+        # DRIFT-BUDGET accumulation — from the never-set_pose'd wheel EKF
+        # (pure motion, immune to every correction channel)
+        if self._budget_prev is not None:
+            self._budget_path_m += math.hypot(p.x - self._budget_prev[0],
+                                              p.y - self._budget_prev[1])
+            _dy = abs(math.atan2(math.sin(_wyaw - self._budget_prev[2]),
+                                 math.cos(_wyaw - self._budget_prev[2])))
+            self._budget_rot_deg += math.degrees(_dy)
+        self._budget_prev = (p.x, p.y, _wyaw)
 
     def callback_ekf_wheel_nav_odom(self, msg):
         self.ekf_wheel_nav_odom_msg = msg

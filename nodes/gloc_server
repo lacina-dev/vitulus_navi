@@ -146,6 +146,14 @@ class GlocServer(object):
         # least this fraction of the point count (a single hedge/wall line
         # constrains only ACROSS itself — sliding along stays free)
         self.track_min_eig_frac = float(rospy.get_param('~track_min_eig_frac', 0.05))
+        # WEAK-AXIS PROJECTION (2026-08-15 late, user design): between total
+        # degeneracy (< track_min_eig_frac -> reject) and full confidence
+        # (>= this), apply the correction ONLY along the well-constrained
+        # eigendirection; odometry governs the weak axis. Kills the corridor
+        # slide (confident 1 m drift along a single garage wall) while keeping
+        # the across-the-wall correction alive.
+        self.track_weak_axis_frac = float(
+            rospy.get_param('~track_weak_axis_frac', 0.15))
         # 2026-07-11: rtabmap is OUT of the pose path (loc_status.rtabmap_confident
         # is observability-only, stays false). Deferring to it is dead logic, so
         # default OFF. Flag kept for rollback (set True to re-instate the defer).
@@ -769,6 +777,7 @@ class GlocServer(object):
         n_used = 0
         best = None            # (rms, pose, overlap) — return the best iterate: near
         first_eigs = None      # convergence the on-ridge EDT gradients
+        first_evecs = None     # matching eigenvectors (weak-axis projection)
         #                        collapse and a raw GN step OSCILLATES
         for it in range(self.track_max_iter):
             c, s = math.cos(th), math.sin(th)
@@ -800,7 +809,7 @@ class GlocServer(object):
             if first_eigs is None:
                 # degeneracy is judged at the INITIAL pose: once converged the
                 # on-ridge gradients vanish and the eigenvalues say nothing
-                first_eigs = np.linalg.eigvalsh(H[:2, :2])
+                first_eigs, first_evecs = np.linalg.eigh(H[:2, :2])
             # adaptive Levenberg damping: when the gradients collapse near
             # convergence, H collapses too — damping must scale WITH it or
             # the solve produces a huge bogus step from numerical noise
@@ -822,7 +831,8 @@ class GlocServer(object):
         rms, pose, overlap_frac = best
         return {'pose': pose, 'rms': rms, 'n': n_used,
                 'overlap_frac': overlap_frac,
-                'eig_min': float(first_eigs[0]), 'eig_max': float(first_eigs[1])}
+                'eig_min': float(first_eigs[0]), 'eig_max': float(first_eigs[1]),
+                'eig_vec': first_evecs}
 
     def _bigcorr_reset(self):
         """Clear the big-corr freshness timer and consistency buffers."""
@@ -1198,6 +1208,23 @@ class GlocServer(object):
                 info['state'] = out['reject']
                 return
             x, y, th = out['pose']
+            # WEAK-AXIS PROJECTION (2026-08-15 late, user design): corridor
+            # geometry constrains the match only ACROSS the wall — along it the
+            # EDT cost is flat and the align slides (tonight: confident 1 m
+            # slide along the garage wall on the sparse raster). When the weak
+            # eigendirection carries too little information, keep only the
+            # correction component along the STRONG axis; odometry (drift-
+            # budget gated in navi_transform) governs the weak axis. Yaw stays
+            # full — a wall constrains orientation well.
+            _eig_frac = out['eig_min'] / max(out['n'], 1)
+            if (out.get('eig_vec') is not None
+                    and _eig_frac < self.track_weak_axis_frac):
+                _strong = out['eig_vec'][:, 1]   # eigh ascending -> col 1
+                _ddx, _ddy = x - pose0[0], y - pose0[1]
+                _amp = _ddx * _strong[0] + _ddy * _strong[1]
+                x = pose0[0] + _amp * _strong[0]
+                y = pose0[1] + _amp * _strong[1]
+                info['weak_axis_proj'] = True
             dx = math.hypot(x - pose0[0], y - pose0[1])
             dyaw = math.degrees(abs(math.atan2(math.sin(th - pose0[2]),
                                                math.cos(th - pose0[2]))))

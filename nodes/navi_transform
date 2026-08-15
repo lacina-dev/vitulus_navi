@@ -476,8 +476,13 @@ class NavTfNode:
         # see callback_dock_status / _tracker_pose_suppressed.
         self._dock_status_val = None
         self._dock_free_since = 0.0
+        # 2026-08-15 evening field feedback: 20 s grace + the tracker's own
+        # bigcorr machinery (0.7 m cap -> 20 s consistency -> 0.3 m/step slew)
+        # stacked into minutes of visible misalignment after a roofed-dock
+        # undock (no RTK there by design). 8 s still covers the manoeuvre
+        # itself; the sanity bound + slew caps remain the wrong-match guards.
         self._tracker_dock_grace_s = float(
-            rospy.get_param('~tracker_dock_grace_s', 20.0))
+            rospy.get_param('~tracker_dock_grace_s', 8.0))
         from std_msgs.msg import Int8 as _Int8
         self.dock_status_sub = rospy.Subscriber(
             "/dock_smach/dock_status", _Int8, self.callback_dock_status,

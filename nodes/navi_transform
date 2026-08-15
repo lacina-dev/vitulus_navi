@@ -397,6 +397,15 @@ class NavTfNode:
         # slewing (genuine relocalisation / kidnap; do not crawl 1 m at 0.15 m/s)
         self._map_pose_slew_snap_m = float(rospy.get_param('~map_pose_slew_snap_m', 0.6))
         self._map_pose_slew_snap_deg = float(rospy.get_param('~map_pose_slew_snap_deg', 15.0))
+        # UNDOCK-2026-08-15: a CONTINUOUS tracker must never demand a huge
+        # correction — above this bound the snap branch used to apply a
+        # confident-but-wrong EDT minimum instantly (incident 2026-08-09
+        # 19:10:00: tracker target 5.4 m / 120 deg off during an undock).
+        # Genuine kidnap recovery is gloc relock's job, not the tracker's.
+        self._tracker_reject_above_m = float(
+            rospy.get_param('~tracker_reject_above_m', 1.5))
+        self._tracker_reject_above_deg = float(
+            rospy.get_param('~tracker_reject_above_deg', 30.0))
         # active slew target (tx, ty, target_yaw) or None; set by callback,
         # consumed by slew_map_pose() in the 30 Hz loop
         self._map_pose_target = None
@@ -460,10 +469,19 @@ class NavTfNode:
             "/nav_tf/set_map_pose_rtabmap", PoseStamped,
             lambda m: self.callback_set_map_pose(m, source='rtabmap'), queue_size=1)
         # docked truth (Int8, latched, 0 == docked) -> suppress GPS ownership at the dock
+        # UNDOCK-2026-08-15: full status tracking (0=docked 1=undocking 2=docking
+        # 3=undocked 4=failed 5=unknown). Tracker map-pose corrections are
+        # suppressed while the dock owns the manoeuvre (0/1/2) plus a grace
+        # window after, and GPS probation is re-armed on the undock edge —
+        # see callback_dock_status / _tracker_pose_suppressed.
+        self._dock_status_val = None
+        self._dock_free_since = 0.0
+        self._tracker_dock_grace_s = float(
+            rospy.get_param('~tracker_dock_grace_s', 20.0))
         from std_msgs.msg import Int8 as _Int8
-        self.dock_status_sub = rospy.Subscriber("/dock_smach/dock_status", _Int8,
-                                                lambda m: setattr(self, '_docked', int(m.data) == 0),
-                                                queue_size=2)
+        self.dock_status_sub = rospy.Subscriber(
+            "/dock_smach/dock_status", _Int8, self.callback_dock_status,
+            queue_size=2)
         # ownership pivot: map owns the pose while rtabmap is confident
         self.rtabmap_conf_sub = rospy.Subscriber("/nav_tf/rtabmap_confident", Bool,
                                                  lambda m: setattr(self, '_rtabmap_confident', bool(m.data)),
@@ -595,6 +613,39 @@ class NavTfNode:
             (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s and \
             self._heading_good_after_acq
 
+    def callback_dock_status(self, msg):
+        """UNDOCK-2026-08-15: dock_smach status feed (latched Int8).
+        Tracks the full status (not just docked-truth) so tracker suppression
+        and the GPS probation re-arm can key off the manoeuvre edges."""
+        val = int(msg.data)
+        prev = self._dock_status_val
+        self._dock_status_val = val
+        self._docked = (val == 0)
+        if prev in (0, 1, 2) and val not in (0, 1, 2):
+            self._dock_free_since = rospy.get_time()
+        if prev == 0 and val != 0:
+            # undock edge: GPS trust accumulated while PARKED under the dock
+            # roof (stationary probation + hysteresis) must be re-earned in
+            # motion — the known multipath trap (2.4 m yank 2026-07-05).
+            self._gps_proven = False
+            self._gps_good_since = None
+            rospy.logwarn('[navi_transform] undock edge — GPS probation '
+                          're-armed (must re-prove in motion)')
+
+    def _tracker_pose_suppressed(self):
+        """UNDOCK-2026-08-15: tracker map-pose corrections have no business
+        while the robot is docked / undocking / docking — near-dock indoor
+        geometry gives the EDT tracker confident-but-wrong minima (incident
+        2026-08-09 19:09: rms 0.09 matches dragged map->odom 2.5 m during an
+        undock) — nor for a grace window after the manoeuvre ends."""
+        if self._dock_status_val in (0, 1, 2):
+            return True
+        if self._dock_free_since and (
+                rospy.get_time() - self._dock_free_since
+                < self._tracker_dock_grace_s):
+            return True
+        return False
+
     def callback_set_map_pose(self, msg, source='legacy'):
         """Drive the live map->odom from an external map-frame robot pose (rtabmap lidar
         localization when GPS is denied), FULL 2D pose incl. yaw:
@@ -629,6 +680,12 @@ class NavTfNode:
                     5.0, "[set_map_pose] source '%s' rejected — higher-priority "
                     "'%s' fresh within %.1fs", source, higher, self._map_pose_hold_s)
                 return
+        # UNDOCK-2026-08-15: hard-suppress tracker corrections around dock ops
+        if source == 'tracker' and self._tracker_pose_suppressed():
+            rospy.loginfo_throttle(
+                5.0, "[set_map_pose] tracker correction suppressed near dock "
+                "(dock_status=%s)", self._dock_status_val)
+            return
         # AUDIT P0-2 (2026-08-08): pair with odom->base AT THE MESSAGE STAMP
         # (gloc tracker stamps its pose with the scan time) — composing a
         # past-time map pose with the LATEST odometry put a v*latency error
@@ -669,6 +726,19 @@ class NavTfNode:
                 dist = math.hypot(tx - cur.x, ty - cur.y)
                 dyaw = abs(math.atan2(math.sin(m - self.map_odom_yaw),
                                       math.cos(m - self.map_odom_yaw)))
+                # UNDOCK-2026-08-15: sanity bound ABOVE the snap threshold —
+                # a continuous tracker demanding this much is a wrong match,
+                # not a relocalisation; reject instead of snapping onto it.
+                if source == 'tracker' and (
+                        dist > self._tracker_reject_above_m or
+                        dyaw > math.radians(self._tracker_reject_above_deg)):
+                    rospy.logwarn_throttle(
+                        5.0, "[set_map_pose] tracker correction %.2f m / "
+                        "%.1f deg exceeds sanity bound (%.1f m / %.0f deg) "
+                        "— REJECTED", dist, math.degrees(dyaw),
+                        self._tracker_reject_above_m,
+                        self._tracker_reject_above_deg)
+                    return
                 if (dist > self._map_pose_slew_snap_m or
                         dyaw > math.radians(self._map_pose_slew_snap_deg)):
                     self.map_odom_yaw = m

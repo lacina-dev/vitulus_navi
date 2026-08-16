@@ -25,8 +25,15 @@ global_costmap:
     # shrank the global costmap to 5x5 m and erased the walls -> the planner
     # routed straight through them. ObstacleLayer only overlays sensor
     # observations (never resizes) and self-clears via raytracing.
+    # MEMORYLESS (2026-08-16, user field test): NonPersistentVoxelLayer marks
+    # ONLY what the sensors see in the current update and forgets everything
+    # each cycle — the old ObstacleLayer accumulated marks across the whole
+    # drive (a "map that builds as you drive" that confused the factory-fresh
+    # test and went stale between mows). The global planner still detours
+    # around CURRENTLY-seen obstacles (that was this layer's purpose); past
+    # sightings no longer haunt the costmap. Local rolling costmap unchanged.
     - name: obstacle_layer
-      type: "costmap_2d::ObstacleLayer"
+      type: "costmap_2d::NonPersistentVoxelLayer"
     - name: inflation_layer
       type: "costmap_2d::InflationLayer"
 
@@ -38,6 +45,14 @@ global_costmap:
     observation_sources: laser_scan obstacles_pc
     combination_method: 1          # 1 = max (do not override the static map)
     track_unknown_space: false
+    # NonPersistentVoxelLayer voxel grid (2026-08-16): shallow 3-voxel column
+    # covering the 0..0.6 m obstacle band; mark_threshold 0 = one hit marks.
+    publish_voxel_map: false
+    origin_z: 0.0
+    z_resolution: 0.2
+    z_voxels: 3
+    unknown_threshold: 15
+    mark_threshold: 0
 
     # 2D lidar (already range-limited to 5 m), height-filtered like the original
     # local-costmap laser config.

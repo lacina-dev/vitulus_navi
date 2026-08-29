@@ -44,6 +44,43 @@ def pol2cart(rho, phi):
     return x, y
 
 
+# ---- DOCKFIX-2026-08-29: pure helpers (unit-tested offline, see
+#      vitulus_navi/tools/test_dockfix_gates.py) -----------------------------
+
+def dock_hold_map_odom(anchor, odom_base):
+    """map->odom that places base_link exactly on `anchor` given the live
+    odom->base. Both are 2D poses (x, y, yaw).
+
+        map->base = R(map_odom_yaw) . odom->base + t   ==!  anchor
+        map_odom_yaw = anchor.yaw - odom_base.yaw
+        t            = anchor.xy - R(map_odom_yaw) . odom_base.xy
+
+    Returns (tx, ty, map_odom_yaw). Same algebra as callback_set_map_pose, but
+    evaluated continuously instead of on a 5 s pulse."""
+    ax, ay, ayaw = anchor
+    obx, oby, obyaw = odom_base
+    m = math.atan2(math.sin(ayaw - obyaw), math.cos(ayaw - obyaw))
+    cm, sm = math.cos(m), math.sin(m)
+    return (ax - (cm * obx - sm * oby),
+            ay - (sm * obx + cm * oby),
+            m)
+
+
+def tracker_budget_limits(c0_m, per_m, per_rot_m, yaw0_deg, yaw_per_rot,
+                          path_m, rot_deg, used_m, used_deg, ratchet):
+    """Drift budget available to a tracker correction. Grows with the distance
+    actually driven since the last TRUSTED anchor and, with the DOCKFIX ratchet
+    on, SHRINKS by what earlier tracker corrections already consumed — so a
+    sequence of in-budget corrections can no longer walk the pose away by
+    refilling its own allowance. Returns (limit_m, limit_deg)."""
+    lim_m = c0_m + per_m * path_m + per_rot_m * rot_deg
+    lim_deg = yaw0_deg + yaw_per_rot * rot_deg
+    if ratchet:
+        lim_m = max(0.0, lim_m - used_m)
+        lim_deg = max(0.0, lim_deg - used_deg)
+    return lim_m, lim_deg
+
+
 class NavTfNode:
 
     def __init__(self):
@@ -349,7 +386,15 @@ class NavTfNode:
         # higher-priority one was accepted within ~map_pose_hold_s. Priority:
         # dock > tracker > rtabmap > legacy (index = priority rank, 0=highest).
         self._map_pose_hold_s = float(rospy.get_param('~map_pose_hold_s', 5.0))
-        self._map_pose_priority = ('dock', 'tracker', 'rtabmap', 'legacy')
+        # DOCKFIX-2026-08-29 (R5): 'relock' is a distinct source between dock and
+        # tracker. gloc's probation-verified relock and the operator's manual
+        # /gloc/apply publish there instead of masquerading as the tracker, so the
+        # tracker DRIFT BUDGET (sized for continuous small corrections) can no
+        # longer reject a genuine recovery. It is NOT a free pass: it ranks below
+        # the dock, is suppressed around dock operations like every other non-dock
+        # source (A3), and only reaches the topic after gloc's own probation /
+        # margin gates.
+        self._map_pose_priority = ('dock', 'relock', 'tracker', 'rtabmap', 'legacy')
         # last accept time per source (for arbitration + loc_status observability)
         self._map_pose_last_accept = {s: 0.0 for s in self._map_pose_priority}
         # --- SMOOTH map-pose corrections (2026-07-12) ---------------------------
@@ -429,6 +474,18 @@ class NavTfNode:
         self._budget_path_m = 0.0    # wheel-odom path since last trusted anchor
         self._budget_rot_deg = 0.0   # accumulated |rotation| since last anchor
         self._budget_prev = None     # last pure-wheel-EKF sample (x, y, yaw)
+        # DOCKFIX-2026-08-29 — BUDGET RATCHET FIX. The budget used to be reset by
+        # ANY accepted correction, the tracker's own included: each accepted
+        # 0.15 m correction handed itself a fresh 0.15 m allowance, so at 5 Hz the
+        # pose could walk away without limit while every single step passed the
+        # gate. Only a TRUSTED ABSOLUTE anchor (dock / GPS georef) may restart the
+        # budget; a tracker correction CONSUMES it instead.
+        self._budget_ratchet = bool(
+            rospy.get_param('~tracker_budget_ratchet', True))
+        self._budget_reset_sources = set(
+            rospy.get_param('~tracker_budget_reset_sources', ['dock']))
+        self._budget_used_m = 0.0    # tracker correction magnitude consumed
+        self._budget_used_deg = 0.0  #   since the last trusted anchor
         # active slew target (tx, ty, target_yaw) or None; set by callback,
         # consumed by slew_map_pose() in the 30 Hz loop
         self._map_pose_target = None
@@ -458,6 +515,10 @@ class NavTfNode:
         self.ekf_wheel_nav_odom_sub = rospy.Subscriber("/odometry/ekf_wheel_nav_odom", Odometry, self.callback_ekf_wheel_nav_odom, queue_size=200)
         self.map_coords_sub = rospy.Subscriber("/navi_manager/map_coords", PoseStamped, self.callback_map_coords)
         self.navi_indoor_sub = rospy.Subscriber("/navi_manager/is_indoor", Bool, self.callback_navi_indoor)
+        # DOCKFIX-2026-08-29 (A2): invalidate the cached "docked" waypoint when
+        # the served map changes — every map has its own dock anchor.
+        self.active_map_sub = rospy.Subscriber("/navi_manager/active_map", String,
+                                               self.cb_active_map, queue_size=2)
         self.set_pose_sub = rospy.Subscriber("/nav_tf/set_pose", PoseWithCovarianceStamped, self.callback_set_pose)
         self.set_dock_pose_sub = rospy.Subscriber("/nav_tf/set_dock_pose", Bool, self.callback_set_dock_pose)
         # Anchor the ABSOLUTE heading from an EXTERNAL map-frame yaw (Float64, radians). The
@@ -488,6 +549,10 @@ class NavTfNode:
         self.set_map_pose_tracker_sub = rospy.Subscriber(
             "/nav_tf/set_map_pose_tracker", PoseStamped,
             lambda m: self.callback_set_map_pose(m, source='tracker'), queue_size=1)
+        # DOCKFIX-2026-08-29 (R5): probation-verified relock / manual gloc apply.
+        self.set_map_pose_relock_sub = rospy.Subscriber(
+            "/nav_tf/set_map_pose_relock", PoseStamped,
+            lambda m: self.callback_set_map_pose(m, source='relock'), queue_size=1)
         self.set_map_pose_rtabmap_sub = rospy.Subscriber(
             "/nav_tf/set_map_pose_rtabmap", PoseStamped,
             lambda m: self.callback_set_map_pose(m, source='rtabmap'), queue_size=1)
@@ -506,6 +571,49 @@ class NavTfNode:
         # itself; the sanity bound + slew caps remain the wrong-match guards.
         self._tracker_dock_grace_s = float(
             rospy.get_param('~tracker_dock_grace_s', 8.0))
+        # --- DOCKFIX-2026-08-29 ------------------------------------------------
+        # A2 CONTINUOUS DOCK HOLD. Owner's requirement: "robot docked => the pose
+        # IS the 'docked' waypoint, rock stable". The old design pulsed the anchor
+        # from dock_localization_seed every 5-6 s once the pose had already
+        # drifted 10 cm off; between pulses odom drift owned the pose, and the
+        # pulse itself raced a second writer. Instead, while DOCKED (debounced)
+        # navi_transform recomputes map->odom from the docked waypoint composed
+        # with the LIVE odom->base every 30 Hz tick — one writer, no pulses, no
+        # drift. Released the instant dock_status leaves 0.
+        self._dock_anchor_enable = bool(
+            rospy.get_param('~dock_anchor_enable', True))
+        self._dock_anchor_debounce_s = float(
+            rospy.get_param('~dock_anchor_debounce_s', 2.0))
+        # sanity: a docked robot cannot need a metres-scale hold. Above this the
+        # hold REFUSES and shouts (wrong map / lying dock status) rather than
+        # teleporting the pose — degrade to "reject", never to "confidently wrong".
+        self._dock_anchor_max_hold_m = float(
+            rospy.get_param('~dock_anchor_max_hold_m', 3.0))
+        self._dock_anchor_point = rospy.get_param('~dock_anchor_point', 'docked')
+        self._dock_anchor_refresh_s = float(
+            rospy.get_param('~dock_anchor_refresh_s', 30.0))
+        self._dock_anchor_pose = None      # (x, y, yaw) of the "docked" waypoint
+        self._dock_anchor_fetch_t = 0.0
+        self._dock_anchor_map = None       # active map the cached anchor belongs to
+        self._docked_since = None          # time of the dock_status==0 edge
+        self._dock_hold_active = False
+        self._dock_hold_refusals = 0
+        # A3: while the dock owns the pose NO non-dock source may write map->odom.
+        # A genuinely tiny refinement is still allowed (micro-allowance) so a
+        # well-aligned lidar can nudge, but nothing that could move the robot.
+        self._dock_gate_non_dock = bool(
+            rospy.get_param('~dock_gate_non_dock', True))
+        self._dock_micro_m = float(rospy.get_param('~dock_micro_m', 0.05))
+        self._dock_micro_deg = float(rospy.get_param('~dock_micro_deg', 1.0))
+        # FAIL-CLOSED dock status: an absent or stale dock feed used to mean
+        # "corrections allowed". The feed is a 10 Hz latched Int8 — if it goes
+        # quiet we no longer know whether we are docked, and the safe answer is
+        # to keep the near-dock suppression ON.
+        self._dock_status_fail_closed = bool(
+            rospy.get_param('~dock_status_fail_closed', True))
+        self._dock_status_stale_s = float(
+            rospy.get_param('~dock_status_stale_s', 5.0))
+        self._dock_status_rx_t = 0.0
         from std_msgs.msg import Int8 as _Int8
         self.dock_status_sub = rospy.Subscriber(
             "/dock_smach/dock_status", _Int8, self.callback_dock_status,
@@ -648,7 +756,14 @@ class NavTfNode:
         val = int(msg.data)
         prev = self._dock_status_val
         self._dock_status_val = val
+        self._dock_status_rx_t = rospy.get_time()   # DOCKFIX: staleness clock
         self._docked = (val == 0)
+        # DOCKFIX-2026-08-29 (A2): debounce clock for the continuous dock hold.
+        if val == 0:
+            if prev != 0 or self._docked_since is None:
+                self._docked_since = rospy.get_time()
+        else:
+            self._docked_since = None
         if prev in (0, 1, 2) and val not in (0, 1, 2):
             self._dock_free_since = rospy.get_time()
         if prev == 0 and val != 0:
@@ -665,7 +780,28 @@ class NavTfNode:
         while the robot is docked / undocking / docking — near-dock indoor
         geometry gives the EDT tracker confident-but-wrong minima (incident
         2026-08-09 19:09: rms 0.09 matches dragged map->odom 2.5 m during an
-        undock) — nor for a grace window after the manoeuvre ends."""
+        undock) — nor for a grace window after the manoeuvre ends.
+
+        DOCKFIX-2026-08-29: FAIL CLOSED and applies to EVERY non-dock source.
+        The old version returned False (= corrections allowed) whenever the dock
+        feed had never arrived, and never looked at its age at all. The feed is a
+        latched 10 Hz Int8; silence means we no longer know where we are relative
+        to the dock, and the safe degradation is "reject the correction"."""
+        if self._dock_status_val is None:
+            if self._dock_status_fail_closed:
+                rospy.logwarn_throttle(
+                    30.0, '[navi_transform] no /dock_smach/dock_status yet — '
+                    'map-pose corrections SUPPRESSED (fail-closed)')
+                return True
+            return False
+        if self._dock_status_fail_closed and self._dock_status_rx_t and (
+                rospy.get_time() - self._dock_status_rx_t
+                > self._dock_status_stale_s):
+            rospy.logwarn_throttle(
+                30.0, '[navi_transform] /dock_smach/dock_status STALE (%.1fs, '
+                'expected 10 Hz) — map-pose corrections SUPPRESSED (fail-closed)',
+                rospy.get_time() - self._dock_status_rx_t)
+            return True
         if self._dock_status_val in (0, 1, 2):
             return True
         if self._dock_free_since and (
@@ -673,6 +809,153 @@ class NavTfNode:
                 < self._tracker_dock_grace_s):
             return True
         return False
+
+    # ---- DOCKFIX-2026-08-29: continuous dock hold (A2) ----------------------
+
+    def _clear_slew_target(self):
+        """A5: a REJECTED correction must ALSO cancel any pending slew target.
+        Every reject path in callback_set_map_pose used to leave _map_pose_target
+        set, so slew_map_pose() in the 30 Hz loop kept dragging map->odom toward
+        the very correction we had just refused."""
+        with self._map_odom_lock:
+            self._map_pose_target = None
+
+    def _dock_hold_engaged(self):
+        """True while the continuous dock hold owns map->odom: dock feed FRESH,
+        status == docked, held for ~dock_anchor_debounce_s."""
+        if not self._dock_anchor_enable:
+            return False
+        if self._dock_status_val != 0 or self._docked_since is None:
+            return False
+        if self._dock_status_rx_t and (rospy.get_time() - self._dock_status_rx_t
+                                       > self._dock_status_stale_s):
+            return False    # stale feed: hold nothing, but suppression stays on
+        return (rospy.get_time() - self._docked_since) >= self._dock_anchor_debounce_s
+
+    def refresh_dock_anchor(self):
+        """1 Hz: keep the "docked" waypoint for THIS map cached for the 30 Hz
+        hold (no service calls in the hot loop). Cleared on a map change."""
+        if not self._dock_anchor_enable:
+            return
+        if self._dock_status_val not in (0, 1, 2):
+            return              # only needed around the dock
+        now = rospy.get_time()
+        # backoff: refresh a known anchor slowly, retry a missing one every 5 s
+        interval = (self._dock_anchor_refresh_s
+                    if self._dock_anchor_pose is not None else 5.0)
+        if self._dock_anchor_fetch_t and (now - self._dock_anchor_fetch_t) < interval:
+            return
+        self._dock_anchor_fetch_t = now   # stamp first so failures back off too
+        try:
+            rospy.wait_for_service('/navi_manager/get_point_pose', timeout=1.0)
+            srv = rospy.ServiceProxy('/navi_manager/get_point_pose', Point_pose)
+            resp = srv(self._dock_anchor_point)
+        except (rospy.ROSException, rospy.ServiceException) as e:
+            rospy.logwarn_throttle(60.0, '[dock_hold] get_point_pose("%s") '
+                                   'unavailable: %s', self._dock_anchor_point, e)
+            return
+        if not resp.result:
+            self._dock_anchor_pose = None
+            rospy.logerr_throttle(
+                60.0, '[dock_hold] ACTION NEEDED: waypoint "%s" is missing from '
+                'the current map — the continuous dock hold is INACTIVE. Dock the '
+                'robot, verify it is well localized, then save the "%s" waypoint.',
+                self._dock_anchor_point, self._dock_anchor_point)
+            return
+        p = resp.point_pose.pose
+        self._dock_anchor_pose = (
+            p.position.x, p.position.y,
+            euler_from_quaternion([p.orientation.x, p.orientation.y,
+                                   p.orientation.z, p.orientation.w])[2])
+
+    def cb_active_map(self, msg):
+        """A new map has its OWN "docked" waypoint — drop the cached anchor.
+        Only on an actual CHANGE: /navi_manager/active_map is republished
+        periodically, and clearing on every message left the anchor unavailable
+        between the 5 s refetches — the hold then never held."""
+        if msg.data == self._dock_anchor_map:
+            return
+        self._dock_anchor_map = msg.data
+        self._dock_anchor_pose = None
+        self._dock_anchor_fetch_t = 0.0
+        # a different map places the dock somewhere else entirely — the next
+        # engage is an initial PLACEMENT again, not creep (see dock_anchor_hold)
+        self._dock_hold_active = False
+        rospy.loginfo('[dock_hold] active map -> "%s": re-fetching the "%s" '
+                      'waypoint', msg.data, self._dock_anchor_point)
+
+    def dock_anchor_hold(self):
+        """A2 (30 Hz): while docked, map->odom == docked_waypoint (.) inv(odom->base)
+        recomputed every tick. Single writer, no pulses, no drift between pulses.
+        Refuses a metres-scale hold (sanity) and releases instantly on undock."""
+        if not self._dock_hold_engaged():
+            if self._dock_hold_active:
+                self._dock_hold_active = False
+                rospy.logwarn('[dock_hold] RELEASED (dock_status=%s) — pose '
+                              'returns to the normal arbiter',
+                              self._dock_status_val)
+            return
+        anchor = self._dock_anchor_pose
+        if anchor is None:
+            rospy.logwarn_throttle(
+                30.0, '[dock_hold] docked but the "%s" waypoint is not available '
+                '— dock hold INACTIVE (pose runs on odometry)',
+                self._dock_anchor_point)
+            return
+        ob = self.get_base_link_transform()
+        if ob is None:
+            rospy.logwarn_throttle(10.0, '[dock_hold] no odom->base TF — hold skipped')
+            return
+        q = ob.transform.rotation
+        odom_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        tx, ty, m = dock_hold_map_odom(
+            anchor, (ob.transform.translation.x, ob.transform.translation.y,
+                     odom_yaw))
+        # The sanity bound guards against CREEP while the hold is engaged. The
+        # very FIRST engage of an episode is the initial placement (after a node
+        # restart map->odom is still identity, so the legitimate first correction
+        # is the whole dock offset — several metres on a map whose origin is far
+        # from the dock). That placement is the same unconditional ground-truth
+        # snap the old one-shot dock seed did; it is logged loudly instead.
+        first_engage = not self._dock_hold_active
+        with self._map_odom_lock:
+            cur = self.map_odom_transform.transform.translation
+            hold_m = math.hypot(tx - cur.x, ty - cur.y)
+            refuse = (not first_engage) and hold_m > self._dock_anchor_max_hold_m
+            if not refuse:
+                cur.x = tx
+                cur.y = ty
+                self.map_odom_yaw = m
+                self._map_pose_target = None   # dock owns it; drop any slew
+        if refuse:
+            self._dock_hold_refusals += 1
+            rospy.logerr_throttle(
+                10.0, '[dock_hold] REFUSED: holding to "%s" would move map->odom '
+                '%.2f m (> sanity %.2f m) while dock_status says DOCKED. Wrong map '
+                'or a lying dock status — NOT snapping (refusals=%d).',
+                self._dock_anchor_point, hold_m, self._dock_anchor_max_hold_m,
+                self._dock_hold_refusals)
+            return
+        if not self._dock_hold_active:
+            self._dock_hold_active = True
+            # The dock is a TRUSTED ABSOLUTE heading reference. The dock seed no
+            # longer pokes /nav_tf/set_heading (R2 double-count), so clear the
+            # first-anchor flag here instead — otherwise the first GNSS heading
+            # anchor after an undock would SNAP rather than slew.
+            self.init = False
+            rospy.logwarn('[dock_hold] ENGAGED — map->odom held to "%s" '
+                          '(%.3f, %.3f, %.1fdeg) at 30 Hz; initial placement '
+                          'moved map->odom %.3f m (sanity bound %.2f m applies '
+                          'from here on)',
+                          self._dock_anchor_point, anchor[0], anchor[1],
+                          math.degrees(anchor[2]), hold_m,
+                          self._dock_anchor_max_hold_m)
+        # dock owns the pose for the arbiter + the drift budget restarts here
+        self._map_pose_last_accept['dock'] = rospy.get_time()
+        self._budget_path_m = 0.0
+        self._budget_rot_deg = 0.0
+        self._budget_used_m = 0.0
+        self._budget_used_deg = 0.0
 
     def callback_set_map_pose(self, msg, source='legacy'):
         """Drive the live map->odom from an external map-frame robot pose (rtabmap lidar
@@ -707,13 +990,15 @@ class NavTfNode:
                 rospy.loginfo_throttle(
                     5.0, "[set_map_pose] source '%s' rejected — higher-priority "
                     "'%s' fresh within %.1fs", source, higher, self._map_pose_hold_s)
+                self._clear_slew_target()   # A5
                 return
-        # UNDOCK-2026-08-15: hard-suppress tracker corrections around dock ops
-        if source == 'tracker' and self._tracker_pose_suppressed():
-            rospy.loginfo_throttle(
-                5.0, "[set_map_pose] tracker correction suppressed near dock "
-                "(dock_status=%s)", self._dock_status_val)
-            return
+        # UNDOCK-2026-08-15 + DOCKFIX-2026-08-29 (A3): hard-suppress EVERY
+        # non-dock source around dock operations (was: 'tracker' only, so the
+        # rtabmap/legacy channels could still write map->odom in the dock bay).
+        # The micro-allowance below still lets a sub-5 cm / sub-1 deg refinement
+        # through — it cannot move the robot, only sharpen it.
+        _dock_suppressed = (source != 'dock' and self._dock_gate_non_dock
+                            and self._tracker_pose_suppressed())
         # AUDIT P0-2 (2026-08-08): pair with odom->base AT THE MESSAGE STAMP
         # (gloc tracker stamps its pose with the scan time) — composing a
         # past-time map pose with the LATEST odometry put a v*latency error
@@ -721,6 +1006,7 @@ class NavTfNode:
         odom_base = self.get_base_link_transform(stamp=msg.header.stamp)
         if odom_base is None:
             rospy.logwarn_throttle(5.0, "[set_map_pose] no odom->base_link TF yet — skipping")
+            self._clear_slew_target()   # A5
             return
         # Rotation guard: the external pose (rtabmap localization) is measured
         # slightly in the past; applying it while spinning smears the pose.
@@ -729,6 +1015,7 @@ class NavTfNode:
         if wz > self._set_map_pose_max_wz:
             rospy.loginfo_throttle(5.0, "[set_map_pose] rotating (%.2f rad/s) — deferring "
                                         "external correction", wz)
+            self._clear_slew_target()   # A5
             return
         # Full 2D correction: map->base = R(map_odom_yaw) * odom->base + t.
         # Yaw first (t depends on it): map yaw = map_odom_yaw + odom->base yaw.
@@ -741,6 +1028,32 @@ class NavTfNode:
         ob_y = odom_base.transform.translation.y
         tx = msg.pose.position.x - (math.cos(m) * ob_x - math.sin(m) * ob_y)
         ty = msg.pose.position.y - (math.sin(m) * ob_x + math.cos(m) * ob_y)
+        # DOCKFIX-2026-08-29 (A3): dock suppression, now that the requested
+        # map->odom delta is known. Anything above the micro-allowance is
+        # REJECTED (and any pending slew cancelled) while the dock owns the pose.
+        if _dock_suppressed:
+            with self._map_odom_lock:
+                _c = self.map_odom_transform.transform.translation
+                _sd = math.hypot(tx - _c.x, ty - _c.y)
+                _sy = abs(math.atan2(math.sin(m - self.map_odom_yaw),
+                                     math.cos(m - self.map_odom_yaw)))
+                if (_sd > self._dock_micro_m or
+                        _sy > math.radians(self._dock_micro_deg)):
+                    self._map_pose_target = None    # A5: cancel pending slew
+                    _rej = True
+                else:
+                    _rej = False
+            if _rej:
+                rospy.loginfo_throttle(
+                    5.0, "[set_map_pose] '%s' correction %.2f m / %.1f deg "
+                    "REJECTED — dock owns the pose (dock_status=%s, micro "
+                    "allowance %.2f m / %.1f deg)", source, _sd,
+                    math.degrees(_sy), self._dock_status_val,
+                    self._dock_micro_m, self._dock_micro_deg)
+                return
+            rospy.loginfo_throttle(
+                10.0, "[set_map_pose] '%s' micro-correction %.3f m / %.2f deg "
+                "allowed near dock", source, _sd, math.degrees(_sy))
         # SMOOTH (2026-07-12): a slewed source records the TARGET; slew_map_pose()
         # in the 30 Hz loop walks the live map->odom toward it at bounded speed so
         # the pose no longer snaps to each 1 Hz tracker minimum. A big mismatch
@@ -760,11 +1073,16 @@ class NavTfNode:
                 # while no wheel-odom sample has arrived yet.
                 if source == 'tracker':
                     if self._budget_prev is not None:
-                        lim_m = (self._budget_c0_m
-                                 + self._budget_per_m * self._budget_path_m
-                                 + self._budget_per_rot_m * self._budget_rot_deg)
-                        lim_deg = (self._budget_yaw0_deg
-                                   + self._budget_yaw_per_rot * self._budget_rot_deg)
+                        # DOCKFIX-2026-08-29 RATCHET: the limit now also
+                        # subtracts what previous tracker corrections already
+                        # consumed since the last TRUSTED anchor — without it
+                        # each accepted correction financed the next one.
+                        lim_m, lim_deg = tracker_budget_limits(
+                            self._budget_c0_m, self._budget_per_m,
+                            self._budget_per_rot_m, self._budget_yaw0_deg,
+                            self._budget_yaw_per_rot, self._budget_path_m,
+                            self._budget_rot_deg, self._budget_used_m,
+                            self._budget_used_deg, self._budget_ratchet)
                     else:
                         lim_m = self._tracker_reject_above_m
                         lim_deg = self._tracker_reject_above_deg
@@ -772,11 +1090,16 @@ class NavTfNode:
                         rospy.logwarn_throttle(
                             5.0, "[set_map_pose] tracker correction %.2f m / "
                             "%.1f deg exceeds DRIFT BUDGET (%.2f m / %.1f deg; "
-                            "path %.1f m, rot %.0f deg since anchor) — "
-                            "REJECTED (map aliasing?)", dist,
+                            "path %.1f m, rot %.0f deg, used %.2f m / %.1f deg "
+                            "since anchor) — REJECTED (map aliasing?)", dist,
                             math.degrees(dyaw), lim_m, lim_deg,
-                            self._budget_path_m, self._budget_rot_deg)
+                            self._budget_path_m, self._budget_rot_deg,
+                            self._budget_used_m, self._budget_used_deg)
+                        self._map_pose_target = None   # A5 (already under lock)
                         return
+                    if self._budget_ratchet:
+                        self._budget_used_m += dist
+                        self._budget_used_deg += math.degrees(dyaw)
                 if (dist > self._map_pose_slew_snap_m or
                         dyaw > math.radians(self._map_pose_slew_snap_deg)):
                     self.map_odom_yaw = m
@@ -806,10 +1129,15 @@ class NavTfNode:
         # WP2: correction ACCEPTED and applied — stamp this source for arbitration.
         if source in self._map_pose_last_accept:
             self._map_pose_last_accept[source] = rospy.get_time()
-        # DRIFT-BUDGET: an accepted external correction re-anchors the pose —
-        # the odometry drift budget restarts from its base.
-        self._budget_path_m = 0.0
-        self._budget_rot_deg = 0.0
+        # DRIFT-BUDGET: only a TRUSTED ABSOLUTE anchor re-anchors the pose and
+        # restarts the budget (DOCKFIX-2026-08-29 ratchet — see __init__). A
+        # tracker/rtabmap correction is a consumer, not an anchor: it has already
+        # been charged to _budget_used_* above.
+        if (not self._budget_ratchet) or source in self._budget_reset_sources:
+            self._budget_path_m = 0.0
+            self._budget_rot_deg = 0.0
+            self._budget_used_m = 0.0
+            self._budget_used_deg = 0.0
         rospy.loginfo_throttle(5.0,
             "[set_map_pose] map->odom target from external map pose (%.2f, %.2f, %.1fdeg) -> "
             "t=(%.2f, %.2f) yaw=%.2fdeg src=%s%s",
@@ -989,9 +1317,12 @@ class NavTfNode:
                 # identity-rotation broadcast).
                 self.map_odom_yaw = 0.0
             # DRIFT-BUDGET: GPS georef is a trusted absolute anchor — restart
-            # the odometry drift budget for tracker corrections.
+            # the odometry drift budget (and the DOCKFIX ratchet) for tracker
+            # corrections.
             self._budget_path_m = 0.0
             self._budget_rot_deg = 0.0
+            self._budget_used_m = 0.0
+            self._budget_used_deg = 0.0
         self.map_coords_msg = msg
 
     def callback_base_odom(self, msg):
@@ -1435,6 +1766,14 @@ class NavTfNode:
                     and (time.time() - self._ha_frozen_since) > 3.0),
                 'map_pose_sources': sources,
                 'drift_report': self._drift_report,
+                # DOCKFIX-2026-08-29 observability
+                'dock_status': self._dock_status_val,
+                'dock_hold_active': bool(self._dock_hold_active),
+                'dock_hold_refusals': self._dock_hold_refusals,
+                'dock_anchor_ok': self._dock_anchor_pose is not None,
+                'dock_suppressing': bool(self._tracker_pose_suppressed()),
+                'budget_used_m': round(self._budget_used_m, 3),
+                'budget_used_deg': round(self._budget_used_deg, 2),
             }
             self._last_published_owner = owner    # FIX4: keep edge detector in sync
             self.loc_status_pub.publish(String(data=json.dumps(status)))
@@ -2542,6 +2881,9 @@ class NavTfNode:
         node_gnss.print_info()
         node_gnss.publish_status()
         node_gnss.maybe_apply_site_datum()
+        # DOCKFIX-2026-08-29 (A2): keep the "docked" waypoint cached for the
+        # 30 Hz hold (service call at 1 Hz max, never in the hot loop).
+        node_gnss.refresh_dock_anchor()
         node_gnss.publish_loc_status()
         # FIX-8: silent no-TF trap watchdog. If is_indoor is still True 30 s after
         # start, nothing (navi_man map load) flipped us outdoor — transform_map_to_odom
@@ -2684,6 +3026,13 @@ class NavTfNode:
         self.publish_odom_for_gps()
         self.transform_odom_to_base_link()
         self.slew_map_pose()
+        # DOCKFIX-2026-08-29 (A2): the continuous dock hold runs AFTER the slew
+        # (so it overrides any leftover slew step) and BEFORE the broadcast, so
+        # the transform published this tick is the held one.
+        try:
+            self.dock_anchor_hold()
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[dock_hold] %s" % e)
         self.transform_map_to_odom()
         self.fused_nav_time = (int(str(rospy.Time.now())) - int(str(self.nav_last_fused_time))) / 1000000000
         self.fused_fix_time = (int(str(rospy.Time.now())) - int(str(self.fix_last_fused_time))) / 1000000000

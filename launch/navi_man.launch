@@ -14,6 +14,30 @@
                  (sigma 1.2-1.6 deg) — 1.5 deg okno NIKDY neproslo (vecny freeze).
                  6 deg = ~2.5 sigma; multipath rampu (>1 deg/s) chyti i tak. -->
             <param name="heading_anchor_spread_max_deg" value="6.0"/>
+            <!-- DOCKFIX-2026-08-29 — dock localization hardening.
+                 A2 continuous dock hold: while docked (debounced) map->odom is
+                 recomputed every 30 Hz tick from the "docked" waypoint composed
+                 with the live odom->base, so the docked pose IS the waypoint and
+                 cannot drift between the old 5 s re-anchor pulses.
+                 ROLLBACK: dock_anchor_enable:=false (back to pulse re-anchor). -->
+            <param name="dock_anchor_enable" value="true"/>
+            <param name="dock_anchor_debounce_s" value="2.0"/>
+            <param name="dock_anchor_max_hold_m" value="3.0"/>
+            <!-- A3: no non-dock source may write map->odom around dock ops
+                 (was tracker-only); micro refinements still pass.
+                 ROLLBACK: dock_gate_non_dock:=false -->
+            <param name="dock_gate_non_dock" value="true"/>
+            <param name="dock_micro_m" value="0.05"/>
+            <param name="dock_micro_deg" value="1.0"/>
+            <!-- Fail-closed dock feed: absent/stale 10 Hz dock_status keeps the
+                 suppression ON instead of opening the gates.
+                 ROLLBACK: dock_status_fail_closed:=false -->
+            <param name="dock_status_fail_closed" value="true"/>
+            <param name="dock_status_stale_s" value="5.0"/>
+            <!-- Drift-budget ratchet: only dock/GPS anchors reset the budget; a
+                 tracker correction consumes it (it used to refill it).
+                 ROLLBACK: tracker_budget_ratchet:=false -->
+            <param name="tracker_budget_ratchet" value="true"/>
         </node>
         <!-- lidar global localization scorer (passive; apply is margin-gated) -->
         <node name="gloc_server" pkg="vitulus_navi" type="gloc_server" respawn="true" respawn_delay="2" output="log">
@@ -32,6 +56,22 @@
                  Flip to true for the courtyard kidnap field test; keep false
                  until that test passes. -->
             <param name="relock_enable" value="false"/>
+            <!-- DOCKFIX-2026-08-29 — MAP-STALENESS GATES ON THE APPLY PATH.
+                 (A) the minimum must sit on mapped structure; (B) a correction
+                 above prior_margin_above_m must beat the BEST-KNOWN pose by
+                 prior_margin_frac in rms without losing overlap. A changed
+                 garden then degrades to "reject correction" instead of
+                 "confidently wrong".
+                 ROLLBACK: track_overlap_apply_gate:=false and/or
+                           track_prior_margin_enable:=false -->
+            <param name="track_overlap_apply_gate" value="true"/>
+            <param name="track_overlap_min_apply" value="0.5"/>
+            <param name="track_prior_margin_enable" value="true"/>
+            <param name="track_prior_margin_frac" value="0.8"/>
+            <param name="track_prior_margin_above_m" value="0.15"/>
+            <!-- R5: relock + manual /gloc/apply get their own, budget-exempt
+                 source tag instead of masquerading as the tracker. -->
+            <param name="relock_pose_topic" value="/nav_tf/set_map_pose_relock"/>
         </node>
         <!-- AUDIT dock-idle (2026-08-01): pauses VO+ICP odometry while docked
              (load avg 15.9 in the dock, VO alone >1 core in the dark); resumes

@@ -45,6 +45,32 @@ from std_srvs.srv import Trigger, TriggerResponse
 from tf.transformations import quaternion_from_euler, euler_from_quaternion
 
 
+# ---- DOCKFIX-2026-08-29: pure helper (unit-tested offline, see
+#      vitulus_navi/tools/test_dockfix_gates.py) -----------------------------
+
+def prior_margin_verdict(rms_min, rms_prior, ov_min, ov_prior, frac, eps):
+    """PRIOR-REFERENCED MARGIN: is the EDT minimum genuinely a better
+    explanation of the live scan than the BEST-KNOWN pose we already hold?
+
+    Returns (rms_better, overlap_ok). A correction is accepted only when BOTH
+    are true:
+      rms_better  — rms at the minimum < frac x rms at the prior. A changed
+                    garden (removed obstacle) produces a confident minimum
+                    that is NOT better than the prior, so it is rejected
+                    instead of being applied as truth.
+      overlap_ok  — the minimum must not explain LESS of the scan than the
+                    prior does (a slide onto unmapped space lowers rms while
+                    quietly dropping overlap).
+    Missing metrics fail open on overlap only (it may be unavailable) and fail
+    CLOSED on rms (no prior rms => no evidence => not better)."""
+    if rms_min is None or rms_prior is None:
+        return False, True
+    rms_better = rms_min < frac * rms_prior
+    if ov_min is None or ov_prior is None:
+        return rms_better, True
+    return rms_better, (ov_min >= ov_prior - eps)
+
+
 class GlocServer(object):
     def __init__(self):
         self.pos_stride_m = rospy.get_param('~pos_stride_m', 0.30)
@@ -293,6 +319,42 @@ class GlocServer(object):
             '~track_overlap_dist_m', 1.0))
         self.track_overlap_min = float(rospy.get_param(
             '~track_overlap_min', 0.5))
+        # ---- DOCKFIX-2026-08-29: MAP-STALENESS GATES ON THE **APPLY** PATH ----
+        # Until now overlap_frac gated only the baseline capture and the relock
+        # candidate quality — a NORMAL tracker correction was applied without ever
+        # asking whether the scan still corresponds to the map. The EDT is capped
+        # at track_overlap_dist_m (1.0 m), so a REMOVED obstacle (moved car,
+        # trimmed hedge, new pile) lowers nothing in rms: the align happily slides
+        # to a different, equally "good" minimum and reports high confidence.
+        # That is the "changed garden -> confidently wrong" failure mode. Two
+        # gates now stand between the minimum and the apply:
+        #  (A) OVERLAP ON APPLY: at the minimum the scan must actually sit on
+        #      mapped structure (>= track_overlap_min_apply).
+        #  (B) PRIOR-REFERENCED MARGIN: a correction bigger than
+        #      track_prior_margin_above_m must PROVE the minimum is genuinely
+        #      better than where we already believe we are — rms at the minimum
+        #      < track_prior_margin_frac x rms at the PRIOR, and the minimum must
+        #      not explain LESS of the scan than the prior does. Below that
+        #      threshold the claim is within odometry-drift scale and
+        #      navi_transform's drift budget governs it (gating small routine
+        #      nudges on a 20 % rms improvement would disable tracking outright —
+        #      near convergence rms_min ~= rms_prior by construction).
+        # The PRIOR here is pose0 = map->base_link at the scan stamp, which IS the
+        # best-known pose: while docked it is the dock-held "docked" waypoint
+        # (navi_transform A2), under GPS it is the GPS anchor, otherwise the
+        # odometry-propagated last accepted pose.
+        self.track_overlap_apply_gate = bool(rospy.get_param(
+            '~track_overlap_apply_gate', True))
+        self.track_overlap_min_apply = float(rospy.get_param(
+            '~track_overlap_min_apply', 0.5))
+        self.track_prior_margin_enable = bool(rospy.get_param(
+            '~track_prior_margin_enable', True))
+        self.track_prior_margin_frac = float(rospy.get_param(
+            '~track_prior_margin_frac', 0.8))
+        self.track_prior_margin_above_m = float(rospy.get_param(
+            '~track_prior_margin_above_m', 0.15))
+        self.track_prior_overlap_eps = float(rospy.get_param(
+            '~track_prior_overlap_eps', 0.02))
         # ---- PER-MAP BASELINE PERSISTENCE (PROTOCOL 2026-07-19) ---------------
         # After a fresh baseline stabilises over baseline_publish_after_n DOCKED
         # captures on the served raster, publish it (latched, JSON) on
@@ -404,6 +466,19 @@ class GlocServer(object):
         # Tracker gating (gps_good / track_defer_to_rtabmap / gates) is unchanged.
         self.pub_track_pose = rospy.Publisher('/nav_tf/set_map_pose_tracker',
                                               PoseStamped, queue_size=1)
+        # DOCKFIX-2026-08-29 (R5): RELOCK / manual apply get their OWN source tag.
+        # They used to share the 'tracker' channel, so navi_transform's drift
+        # budget — sized for continuous small tracking corrections — rejected the
+        # very jumps that constitute a GENUINE recovery. The relock channel is
+        # budget-EXEMPT (a relock is not odometry drift) but it is not a free
+        # pass: auto-relock only reaches it after RELOCK V2 motion probation, the
+        # manual path only through the margin/yaw gates in cb_apply, and
+        # navi_transform still ranks it BELOW the dock and suppresses it entirely
+        # around dock operations.
+        self.relock_pose_topic = rospy.get_param(
+            '~relock_pose_topic', '/nav_tf/set_map_pose_relock')
+        self.pub_relock_pose = rospy.Publisher(self.relock_pose_topic,
+                                               PoseStamped, queue_size=1)
         self.pub_track_status = rospy.Publisher('/gloc/track_status', String,
                                                 queue_size=1, latch=True)
         # PER-MAP BASELINE PERSISTENCE: publish a stabilised docked baseline for
@@ -776,6 +851,7 @@ class GlocServer(object):
         x, y, th = pose0
         n_used = 0
         best = None            # (rms, pose, overlap) — return the best iterate: near
+        rms0 = ov0 = None      # rms/overlap AT THE PRIOR (iteration 0) — DOCKFIX
         first_eigs = None      # convergence the on-ridge EDT gradients
         first_evecs = None     # matching eigenvectors (weak-axis projection)
         #                        collapse and a raw GN step OSCILLATES
@@ -800,6 +876,11 @@ class GlocServer(object):
             # does not correspond to the map (nothing to match); near 1 = the
             # scan sits on mapped geometry. Gates the baseline capture.
             ov = float(np.mean(r < self.track_overlap_dist_m))
+            # DOCKFIX-2026-08-29: iteration 0 evaluates the PRIOR pose itself, so
+            # keep its rms/overlap — the prior-referenced staleness gate compares
+            # the minimum against it without a second alignment pass.
+            if it == 0:
+                rms0, ov0 = rms, ov
             if best is None or rms < best[0]:
                 best = (rms, (x, y, th), ov)
             dth = gx * (-s * px - c * py) + gy * (c * px - s * py)
@@ -831,6 +912,7 @@ class GlocServer(object):
         rms, pose, overlap_frac = best
         return {'pose': pose, 'rms': rms, 'n': n_used,
                 'overlap_frac': overlap_frac,
+                'rms_prior': rms0, 'overlap_prior': ov0,
                 'eig_min': float(first_eigs[0]), 'eig_max': float(first_eigs[1]),
                 'eig_vec': first_evecs}
 
@@ -1127,7 +1209,9 @@ class GlocServer(object):
         q = quaternion_from_euler(0, 0, pyaw)
         ps.pose.orientation.x, ps.pose.orientation.y = q[0], q[1]
         ps.pose.orientation.z, ps.pose.orientation.w = q[2], q[3]
-        self.pub_track_pose.publish(ps)
+        # DOCKFIX-2026-08-29 (R5): probation-PASSED relock goes out on the
+        # dedicated relock channel — budget-exempt, still dock-suppressed.
+        self.pub_relock_pose.publish(ps)
         self._relock_probe = None
         self._lost_since = None
         self._bigcorr_reset()
@@ -1136,8 +1220,8 @@ class GlocServer(object):
         self._reject_reason = None
         self._reject_streak = 0
         rospy.logwarn('[gloc-track] RELOCK APPLIED after probation (%d ticks, '
-                      '%.2f m) -> /nav_tf/set_map_pose_tracker (%.2f, %.2f, '
-                      '%.1fdeg)', pr['ticks_ok'], travel, px, py,
+                      '%.2f m) -> %s (%.2f, %.2f, %.1fdeg)',
+                      pr['ticks_ok'], travel, self.relock_pose_topic, px, py,
                       math.degrees(pyaw))
         self._set_status('RELOCK APPLIED (%.2f, %.2f) po probaci' % (px, py))
         info['state'] = 'relock'
@@ -1245,6 +1329,15 @@ class GlocServer(object):
             self._last_overlap_frac = overlap_frac
             info['overlap_frac'] = (None if overlap_frac is None
                                     else round(overlap_frac, 3))
+            # DOCKFIX-2026-08-29: prior-referenced metrics are published on EVERY
+            # tick (not only when the staleness gate runs) so the field test can
+            # read how much better the minimum claims to be than the best-known
+            # pose, whatever state the tick ends in.
+            rms_prior = out.get('rms_prior')
+            ov_prior = out.get('overlap_prior')
+            info['rms_prior'] = None if rms_prior is None else round(rms_prior, 3)
+            info['overlap_prior'] = (None if ov_prior is None
+                                     else round(ov_prior, 3))
             # (1) SELF-CALIBRATING RMS BASELINE: while a TRUSTED anchor holds the
             # pose (gps_good OR docked) and the match is healthy (eig ok, the
             # align did NOT run off toward an alias), capture this raster's
@@ -1295,6 +1388,50 @@ class GlocServer(object):
                 self._persist_dirs = []
                 self._ema_pose = None
                 return
+            # ---- DOCKFIX-2026-08-29 MAP-STALENESS GATES (see __init__) --------
+            # (A) OVERLAP ON APPLY: the minimum must sit on mapped structure.
+            if self.track_overlap_apply_gate and (
+                    overlap_frac is None
+                    or overlap_frac < self.track_overlap_min_apply):
+                info['state'] = 'map_stale_overlap'
+                info['overlap_min_apply'] = self.track_overlap_min_apply
+                rospy.logwarn_throttle(
+                    10.0, '[gloc-track] correction REJECTED map_stale_overlap: '
+                    'only %s of the scan sits on mapped structure at the minimum '
+                    '(need >= %.2f) — the map no longer describes this place, '
+                    'so a confident minimum here would be an alias.',
+                    ('%.2f' % overlap_frac) if overlap_frac is not None else 'n/a',
+                    self.track_overlap_min_apply)
+                self._bigcorr_reset()
+                self._persist_dirs = []
+                self._ema_pose = None
+                return
+            # (B) PRIOR-REFERENCED MARGIN for corrections that would actually MOVE
+            # the robot. Small nudges stay governed by the drift budget.
+            if (self.track_prior_margin_enable and rms_prior is not None
+                    and dx > self.track_prior_margin_above_m):
+                better, ov_ok = prior_margin_verdict(
+                    out['rms'], rms_prior, overlap_frac, ov_prior,
+                    self.track_prior_margin_frac, self.track_prior_overlap_eps)
+                if not (better and ov_ok):
+                    info['state'] = 'map_stale_prior'
+                    info['prior_margin_ok'] = bool(better)
+                    info['prior_overlap_ok'] = bool(ov_ok)
+                    rospy.logwarn_throttle(
+                        10.0, '[gloc-track] %.2f m correction REJECTED '
+                        'map_stale_prior: rms %.3f at the minimum vs %.3f at the '
+                        'BEST-KNOWN pose (need < %.0f%%, better=%s) / overlap '
+                        '%s vs %s (need >=, ok=%s) — the minimum does not explain '
+                        'the scan better than where we already are.',
+                        dx, out['rms'], rms_prior,
+                        self.track_prior_margin_frac * 100.0, better,
+                        ('%.2f' % overlap_frac) if overlap_frac is not None else 'n/a',
+                        ('%.2f' % ov_prior) if ov_prior is not None else 'n/a',
+                        ov_ok)
+                    self._bigcorr_reset()
+                    self._persist_dirs = []
+                    self._ema_pose = None
+                    return
             # BIG-CORR RECOVERY: normally reject an over-cap correction, but if it
             # persists (match otherwise healthy: rms + eig already passed) the
             # tracker would deadlock — after track_bigcorr_recover_s, SLEW toward
@@ -1765,16 +1902,22 @@ class GlocServer(object):
         ps.pose.orientation.y = qy
         ps.pose.orientation.z = qz
         ps.pose.orientation.w = qw
-        self.pub_track_pose.publish(ps)
+        # DOCKFIX-2026-08-29 (R5): the manual/force apply is a deliberate operator
+        # recovery, not odometry drift — route it on the relock channel so the
+        # drift budget cannot silently swallow it. navi_transform still ranks it
+        # below the dock and suppresses it around dock operations.
+        self.pub_relock_pose.publish(ps)
         out = PoseWithCovarianceStamped()
         out.header = ps.header
         out.pose.pose = ps.pose
         out.pose.covariance = self._apply_cov
         self.pub_initialpose.publish(out)
-        self._set_status('APPLIED (%s) -> set_map_pose_tracker (%.2f, %.2f, %.1fdeg)'
-                         % (why, r['best']['x'], r['best']['y'], r['best']['yaw_deg']))
-        rospy.loginfo('[gloc] APPLIED (%s) -> /nav_tf/set_map_pose_tracker (%.2f, %.2f, %.1fdeg)',
-                      why, r['best']['x'], r['best']['y'], r['best']['yaw_deg'])
+        self._set_status('APPLIED (%s) -> %s (%.2f, %.2f, %.1fdeg)'
+                         % (why, self.relock_pose_topic, r['best']['x'],
+                            r['best']['y'], r['best']['yaw_deg']))
+        rospy.loginfo('[gloc] APPLIED (%s) -> %s (%.2f, %.2f, %.1fdeg)',
+                      why, self.relock_pose_topic, r['best']['x'],
+                      r['best']['y'], r['best']['yaw_deg'])
 
 
 if __name__ == '__main__':

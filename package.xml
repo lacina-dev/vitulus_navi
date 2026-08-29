@@ -24,6 +24,11 @@
     <exec_depend>move_base_flex</exec_depend>
   <exec_depend>move_base</exec_depend>
   <exec_depend>costmap_2d</exec_depend>
+  <!-- global costmap uses the memoryless obstacle layer; the plugin name
+       costmap_2d::NonPersistentVoxelLayer is REGISTERED by this package
+       (SteveMacenski/nonpersistent_voxel_layer, released to Noetic):
+       sudo apt install ros-noetic-nonpersistent-voxel-layer -->
+  <exec_depend>nonpersistent_voxel_layer</exec_depend>
   <exec_depend>weather_alert</exec_depend>
   <exec_depend>vitulus_msgs</exec_depend>
 

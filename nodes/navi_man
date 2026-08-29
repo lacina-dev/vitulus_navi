@@ -234,6 +234,12 @@ class Node:
         rospy.Subscriber("/navi_manager/load_map_rtabmap", String, self.callback_load_map_rtabmap)
         rospy.Subscriber("/navi_manager/new_map", String, self.callback_new_map)
         rospy.Subscriber("/navi_manager/speed", String, self.callback_speed)
+        # speed persistence (2026-08-15): latched so a late-joining UI still
+        # sees the restored value; the publish also re-enters callback_speed,
+        # which applies the TEB parameters exactly like a manual selection.
+        self.pub_speed_restore = rospy.Publisher(
+            "/navi_manager/speed", String, latch=True, queue_size=1)
+        threading.Thread(target=self._speed_restore_worker, daemon=True).start()
         rospy.Subscriber("/navi_manager/save_waypoint", String, self.callback_save_waypoint)
         rospy.Subscriber("/navi_manager/save_waypoint_at", String, self.callback_save_waypoint_at)
         rospy.Subscriber("/navi_manager/publish_point", String, self.callback_publish_point)
@@ -1202,7 +1208,56 @@ class Node:
         except Exception:
             pass
 
+    # --- speed persistence (2026-08-15) -----------------------------------
+    # The UI/smach speed selection (/navi_manager/speed) only lived in TEB's
+    # dynamic-reconfigure state, so every stack restart silently fell back to
+    # the launch-file defaults. Remember the last selection in
+    # ~/.vitulus/navi_manager/settings.json and re-publish it once MBF is up,
+    # so the restored value takes the exact same path as a manual UI click
+    # (TEB params applied + UI buttons sync from the topic echo).
+    SPEED_PERSIST_FILE = os.path.expanduser('~/.vitulus/navi_manager/settings.json')
+
+    def _persist_speed(self, speed):
+        try:
+            d = os.path.dirname(self.SPEED_PERSIST_FILE)
+            if not os.path.isdir(d):
+                os.makedirs(d)
+            tmp = self.SPEED_PERSIST_FILE + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump({'speed': speed}, f)
+            os.replace(tmp, self.SPEED_PERSIST_FILE)
+        except Exception as e:
+            rospy.logwarn("navi_man: speed persist failed: {}".format(e))
+
+    def _speed_restore_worker(self):
+        try:
+            with open(self.SPEED_PERSIST_FILE) as f:
+                speed = json.load(f).get('speed')
+        except Exception:
+            return          # nothing persisted yet
+        if speed not in ("SLOW", "MEDIUM", "FAST"):
+            return
+        # Wait for TEB dyn-reconfigure so the restored speed actually applies;
+        # give the stack plenty of time to boot. If it never shows up we still
+        # publish so the UI reflects the remembered choice (callback_speed
+        # logs + skips the parameter set gracefully).
+        deadline = time.time() + 300.0
+        while not rospy.is_shutdown() and time.time() < deadline:
+            try:
+                rospy.wait_for_service(
+                    "/move_base_flex/TebLocalPlannerROS/set_parameters", timeout=5.0)
+                break
+            except rospy.ROSException:
+                continue
+        if rospy.is_shutdown():
+            return
+        time.sleep(2.0)     # let MBF finish loading its param defaults first
+        self.pub_speed_restore.publish(String(speed))
+        rospy.loginfo("navi_man: restored persisted speed '{}'.".format(speed))
+
     def callback_speed(self, msg):
+        if msg.data in ("SLOW", "MEDIUM", "FAST"):
+            self._persist_speed(msg.data)
         if msg.data == "SLOW":
             try:
                 rospy.wait_for_service("/move_base_flex/TebLocalPlannerROS/set_parameters", timeout=5.0)  # AUDIT A12: bounded

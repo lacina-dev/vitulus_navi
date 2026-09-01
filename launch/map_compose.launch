@@ -1,0 +1,13 @@
+<launch>
+  <!-- Služba /navi/compose_map: složí mapu robota (libovolné vrstvy) do PNG.
+
+       Samostatný launch schválně: uzel jen čte topicy a TF, nic nepublikuje
+       a nic neřídí, takže nemá co dělat v navigačním řetězci, kde by jeho
+       restart byl restartem navigace.  Pouštět zvlášť nebo přiincludovat.
+
+       Bez tohohle uzlu funguje totéž přes CLI:
+         rosrun vitulus_navi map_compose --layers grid,lidar,robot --out /tmp/mc.png
+  -->
+  <node pkg="vitulus_navi" type="map_compose_server" name="map_compose_server"
+        output="screen" respawn="true" respawn_delay="10"/>
+</launch>

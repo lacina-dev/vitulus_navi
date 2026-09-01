@@ -58,6 +58,7 @@ catkin_python_setup()
 add_service_files(
   FILES
   Point_pose.srv
+  ComposeMap.srv
 )
 
 ## Generate actions in the 'action' folder
@@ -211,6 +212,8 @@ catkin_install_python(PROGRAMS
   nodes/navi_transform
   nodes/gloc_server
   nodes/odom_cov_fix
+  nodes/map_compose_server
+  scripts/map_compose
 
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

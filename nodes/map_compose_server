@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Uzel se službou `/navi/compose_map` — složí mapu robota do PNG na vyžádání.
+
+Proč služba, když je CLI
+------------------------
+CLI si pokaždé postaví vlastní uzel, počká na TF buffer a zase zmizí; to je
+u interaktivního dotazu v pořádku, ale zaplatí se to ~1,5 s čekáním na TF
+pokaždé.  Uzel drží buffer i odběry naživu, takže druhé a další složení mapy
+je jen o kreslení.  Obojí volá tentýž `vitulus_navi.map_compose`, takže se
+nemůžou rozejít.
+
+Volání:
+    rosservice call /navi/compose_map '{request: "{\"layers\":\"grid,lidar,robot\"}"}'
+
+Když ještě není vygenerovaný `vitulus_navi/ComposeMap.srv` (workspace se
+nepřebuildoval), uzel se nezastaví: nabídne totéž přes dvojici topiců
+`/navi/compose_map/request` a `/navi/compose_map/result` (oboje std_msgs/String
+s tímtéž JSONem).  Nefunkční nástroj je horší než ošklivé rozhraní.
+"""
+import json
+import os
+import sys
+
+import rospy
+from std_msgs.msg import String
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PKG_SRC = os.path.join(os.path.dirname(_HERE), 'src', 'vitulus_navi')
+try:
+    from vitulus_navi import map_compose
+except ImportError:
+    import vitulus_navi as _vn
+    if _PKG_SRC not in list(getattr(_vn, '__path__', [])):
+        _vn.__path__.append(_PKG_SRC)
+    from vitulus_navi import map_compose
+
+SERVICE = '/navi/compose_map'
+
+
+def _run(raw):
+    """JSON požadavku -> (ok, JSON odpovědi).  Nikdy nevyhazuje."""
+    try:
+        payload = json.loads(raw) if str(raw or '').strip() else {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception as exc:                            # noqa: BLE001
+        return False, json.dumps({'error': 'požadavek není platný JSON: %s' % exc},
+                                 ensure_ascii=False)
+    try:
+        result = map_compose.compose(
+            layers=payload.get('layers'),
+            size=payload.get('size', map_compose.DEFAULT_WIDTH),
+            center=payload.get('center', 'robot'),
+            radius=payload.get('radius', map_compose.DEFAULT_RADIUS_M),
+            out=payload.get('out'),
+            timeout_s=payload.get('timeout', map_compose.DEFAULT_TIMEOUT_S),
+            keep=payload.get('keep', map_compose.DEFAULT_KEEP),
+            site=payload.get('site'))
+    except Exception as exc:                            # noqa: BLE001
+        return False, json.dumps({'error': 'render selhal: %s' % exc},
+                                 ensure_ascii=False)
+    result['summary'] = map_compose.summary(result)
+    return bool(result.get('ok')), json.dumps(result, ensure_ascii=False, default=str)
+
+
+def main():
+    rospy.init_node('map_compose_server', anonymous=False)
+    # Uzel už běží, takže `map_compose` nesmí zakládat vlastní.
+    map_compose._node['inited'] = True
+    map_compose._prime_tf(2.0)
+
+    try:
+        from vitulus_navi.srv import ComposeMap, ComposeMapResponse
+    except Exception as exc:                            # noqa: BLE001
+        rospy.logwarn('map_compose_server: srv ComposeMap není vygenerovaný '
+                      '(%s) — jedu přes topicy %s/request a %s/result',
+                      exc, SERVICE, SERVICE)
+        publisher = rospy.Publisher(SERVICE + '/result', String,
+                                    queue_size=2, latch=True)
+
+        def on_request(msg):
+            ok, body = _run(getattr(msg, 'data', ''))
+            publisher.publish(String(data=body))
+            rospy.loginfo('map_compose: %s', 'hotovo' if ok else 'nepovedlo se')
+
+        rospy.Subscriber(SERVICE + '/request', String, on_request, queue_size=2)
+        rospy.loginfo('map_compose_server: topicové rozhraní na %s/request', SERVICE)
+        rospy.spin()
+        return 0
+
+    def handle(req):
+        ok, body = _run(getattr(req, 'request', ''))
+        return ComposeMapResponse(ok=ok, result=body)
+
+    rospy.Service(SERVICE, ComposeMap, handle)
+    rospy.loginfo('map_compose_server: služba %s je nahoře (vrstvy: %s)',
+                  SERVICE, ','.join(map_compose.LAYERS))
+    rospy.spin()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

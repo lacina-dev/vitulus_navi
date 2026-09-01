@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""CLI nad `vitulus_navi.map_compose` — slož mapu robota do jednoho PNG.
+
+    rosrun vitulus_navi map_compose --layers grid,lidar,robot --out /tmp/mc.png
+    rosrun vitulus_navi map_compose --layers all --center map --size 1400
+    rosrun vitulus_navi map_compose --list-layers
+
+Na stdout jde JSON s výsledkem (cesta, vrstvy, co chybělo, varování), takže
+volající — agent, Hermes přes `vitulus_bridge`, web UI, člověk — nemusí nic
+parsovat z lidského textu.  `--quiet` vypíše jen cestu k PNG.
+
+Návratový kód: 0 = obrázek vznikl, 1 = nevznikl (důvod je v JSONu i na stderr).
+"""
+import argparse
+import json
+import os
+import sys
+
+# Balíček `vitulus_navi` zatím není v setup.py vyjmenovaný — v devel space
+# existuje jen ta jeho půlka, kterou vyrábí generátor zpráv (`srv`).  Proto se
+# k NAJITÉMU balíčku přidá `src/vitulus_navi` do `__path__` místo strkání
+# `src` na začátek `sys.path`: tím zůstane `vitulus_navi.srv` z devel space
+# dál importovatelný (potřebuje ho uzel se službou) a jen se doplní moduly,
+# které se zatím neinstalují.  Až se setup.py doplní, tenhle krok nic nedělá.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PKG_SRC = os.path.join(os.path.dirname(_HERE), 'src', 'vitulus_navi')
+try:
+    from vitulus_navi import map_compose
+except ImportError:
+    import vitulus_navi as _vn
+    if _PKG_SRC not in list(getattr(_vn, '__path__', [])):
+        _vn.__path__.append(_PKG_SRC)
+    from vitulus_navi import map_compose
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description='Slož mapu robota (libovolné vrstvy) do jednoho PNG.')
+    parser.add_argument('--layers', default=None,
+                        help='čárkou oddělené vrstvy, nebo "all"; výchozí: %s'
+                             % ','.join(map_compose.DEFAULT_LAYERS))
+    parser.add_argument('--out', default=None,
+                        help='cílový PNG soubor (výchozí: %s s razítkem)'
+                             % map_compose.output_dir())
+    parser.add_argument('--size', type=int, default=map_compose.DEFAULT_WIDTH,
+                        help='šířka mapové části v pixelech (výška z poměru obsahu)')
+    parser.add_argument('--center', choices=('robot', 'map'), default='robot',
+                        help='"robot" = výřez kolem robota, "map" = celý obsah')
+    parser.add_argument('--radius', type=float, default=map_compose.DEFAULT_RADIUS_M,
+                        help='poloměr výřezu v metrech pro --center robot')
+    parser.add_argument('--timeout', type=float, default=map_compose.DEFAULT_TIMEOUT_S,
+                        help='limit na jedno čtení ROSu v sekundách')
+    parser.add_argument('--site', default=None,
+                        help='site bundle (výchozí: ten, který robot obsluhuje)')
+    parser.add_argument('--keep', type=int, default=map_compose.DEFAULT_KEEP,
+                        help='kolik obrázků nechat ve výchozím adresáři')
+    parser.add_argument('--quiet', action='store_true',
+                        help='na stdout jen cesta k PNG, žádný JSON')
+    parser.add_argument('--list-layers', action='store_true',
+                        help='vypiš názvy vrstev a aliasy a skonči')
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if args.list_layers:
+        print(json.dumps({'layers': list(map_compose.LAYERS),
+                          'default': list(map_compose.DEFAULT_LAYERS),
+                          'aliases': map_compose.ALIASES,
+                          'refused': map_compose.REFUSED},
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    result = map_compose.compose(
+        layers=args.layers, size=args.size, center=args.center,
+        radius=args.radius, out=args.out, timeout_s=args.timeout,
+        keep=args.keep, site=args.site)
+    result['summary'] = map_compose.summary(result)
+
+    if args.quiet:
+        if result.get('ok'):
+            print(result['path'])
+        else:
+            sys.stderr.write((result.get('error') or 'mapa se nesložila') + '\n')
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        if not result.get('ok'):
+            sys.stderr.write((result.get('error') or 'mapa se nesložila') + '\n')
+    return 0 if result.get('ok') else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

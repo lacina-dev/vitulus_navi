@@ -1,0 +1,15 @@
+# Slož mapu robota (libovolné vrstvy) do jednoho PNG a vrať cestu k němu.
+#
+# Požadavek je JSON, ne pevná pole: vrstvy přibývají (lidar_objects vznikl
+# později než tahle služba) a měnit kvůli každé nové volbě tvar zprávy by
+# znamenalo rebuild všeho, co službu volá.  Prázdný řetězec = výchozí pohled.
+#
+#   {"layers": "grid,lidar,robot", "out": "/tmp/mc.png", "size": 1024,
+#    "center": "robot", "radius": 15, "timeout": 3.0, "site": null}
+string request
+---
+# Vždy vyplněné, i když se obrázek nesložil — důvod je pak v `result.error`.
+bool ok
+# JSON: {"path": ..., "layers": [...], "empty": [...], "missing": [...],
+#        "summary": "...", "warnings": [...]} nebo {"error": "..."}
+string result

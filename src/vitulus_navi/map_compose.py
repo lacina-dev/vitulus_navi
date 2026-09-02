@@ -1113,12 +1113,16 @@ def _legend_lines(status, requested, proj, stamp, site, robot):
 # ---------------------------------------------------------------------------
 # veřejné API
 # ---------------------------------------------------------------------------
+UNKNOWN_SEEN = []   # neznámá jména z posledního `normalise_layers` (pro `unknown` ve výsledku)
+
+
 def normalise_layers(layers):
     """(vrstvy, stížnosti).  Bere seznam, n-tici i 'a,b,c'.
 
     Neznámé jméno render nikdy neshodí — stane se z něj varování, protože
     překlep v chatu nesmí stát obrázek.
     """
+    del UNKNOWN_SEEN[:]
     if layers is None:
         return list(DEFAULT_LAYERS), []
     if isinstance(layers, str):
@@ -1135,7 +1139,9 @@ def normalise_layers(layers):
         if name in REFUSED:
             complaints.append('vrstva %r se nekreslí — %s' % (name, REFUSED[name]))
         elif name not in LAYERS:
-            complaints.append('neznámá vrstva %r — ignoruji ji' % name)
+            complaints.append('neznámá vrstva %r — ignoruji ji (platné: %s)'
+                              % (name, ', '.join(LAYERS)))
+            UNKNOWN_SEEN.append(name)
         elif name not in wanted:
             wanted.append(name)
     if not wanted:
@@ -1474,6 +1480,7 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp):
         'site': site,
         'layers': drawn,
         'requested': requested,
+        'unknown': list(UNKNOWN_SEEN),
         'empty': empty,
         'missing': missing,
         'center': center,

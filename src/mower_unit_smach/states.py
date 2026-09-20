@@ -8,6 +8,7 @@ Bug fixes applied:
   - Unified direction_angle (removed GetPathData.direction duplicate)
   - Fixed duplicate input_keys
 """
+import json
 import math
 import rospy
 import smach
@@ -119,10 +120,17 @@ class WaitForMowerStatus(smach.State):
 
 
 class WaitForTopic(smach.State):
-    """Generic timeout-bounded wait for a single message that satisfies *predicate*."""
+    """Generic timeout-bounded wait for a single message that satisfies *predicate*.
+
+    With *pubs* and *wait_label* set, a long wait is made visible in the UI:
+    every STATUS_INTERVAL seconds the state publishes e.g.
+    "Waiting for GPS fix (42 s / 600 s)" on /mower_smach/status (and once on
+    the UI log), and a timeout is reported on the UI log as well.
+    """
+    STATUS_INTERVAL = 10.0
 
     def __init__(self, topic, msg_type, predicate, timeout=30.0,
-                 output_keys=None, on_match=None):
+                 output_keys=None, on_match=None, pubs=None, wait_label=None):
         smach.State.__init__(self,
                              outcomes=['received', 'timeout', 'preempted'],
                              input_keys=[],
@@ -132,9 +140,23 @@ class WaitForTopic(smach.State):
         self.predicate = predicate
         self.timeout = float(timeout)
         self.on_match = on_match
+        self.pubs = pubs
+        self.wait_label = wait_label
+
+    def _report_waiting(self, elapsed, first):
+        if self.pubs is None or not self.wait_label:
+            return
+        text = "Waiting for {} ({:.0f} s / {:.0f} s)".format(
+            self.wait_label, elapsed, self.timeout)
+        self.pubs.smach_status.publish(String(text))
+        if first:
+            self.pubs.log_info.publish(String(text))
 
     def execute(self, userdata):
-        deadline = rospy.Time.now() + rospy.Duration(self.timeout)
+        start = rospy.Time.now()
+        deadline = start + rospy.Duration(self.timeout)
+        last_report = start
+        reported = False
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
             if self.preempt_requested():
                 self.service_preempt()
@@ -142,6 +164,11 @@ class WaitForTopic(smach.State):
             remaining = (deadline - rospy.Time.now()).to_sec()
             if remaining <= 0:
                 break
+            if (rospy.Time.now() - last_report).to_sec() >= self.STATUS_INTERVAL:
+                self._report_waiting((rospy.Time.now() - start).to_sec(),
+                                     first=not reported)
+                last_report = rospy.Time.now()
+                reported = True
             try:
                 msg = rospy.wait_for_message(self.topic, self.msg_type,
                                              timeout=min(1.0, remaining))
@@ -155,6 +182,10 @@ class WaitForTopic(smach.State):
                         rospy.logwarn('[WaitForTopic %s] on_match raised: %s', self.topic, e)
                 return 'received'
         rospy.logwarn('[WaitForTopic] timeout (%.1fs) on %s', self.timeout, self.topic)
+        if self.pubs is not None and self.wait_label:
+            self.pubs.log_info.publish(String(
+                "Timed out waiting for {} ({:.0f} s)".format(
+                    self.wait_label, self.timeout)))
         return 'timeout'
 
 
@@ -197,6 +228,10 @@ class PreStartCheck(smach.State):
     statuses count, the horizon and a full bypass are configurable
     (see helpers.get_weather_config).
     Rule 1 (battery): reject if battery_capacity < 40% (hysteresis).
+
+    Rejections go through reject_mission (same log/status/stop_reason strings
+    as before; the status then returns to "Ready", which master_controller
+    needs to act on rejected:rain / rejected:battery).
     """
 
     def __init__(self, pubs):
@@ -220,30 +255,24 @@ class PreStartCheck(smach.State):
                     '/weather_alert/rain_alert', RainAlert, timeout=5.0)
 
                 if rain.rain_now == 1:
-                    self.pubs.log_info.publish(String("Start rejected: raining now"))
-                    self.pubs.smach_status.publish(String("Rejected: rain"))
-                    self.pubs.stop_reason.publish(String("rejected:rain"))
-                    return 'rejected'
+                    return reject_mission(self, self.pubs, "Start rejected: raining now",
+                                          "Rejected: rain", "rain")
 
                 past = [rain.status_past60m, rain.status_past50m, rain.status_past40m,
                         rain.status_past30m, rain.status_past20m, rain.status_past10m,
                         rain.status_now]
                 for s in past:
                     if s == 'RAIN':
-                        self.pubs.log_info.publish(String("Start rejected: recent rain"))
-                        self.pubs.smach_status.publish(String("Rejected: recent rain"))
-                        self.pubs.stop_reason.publish(String("rejected:recent_rain"))
-                        return 'rejected'
+                        return reject_mission(self, self.pubs, "Start rejected: recent rain",
+                                              "Rejected: recent rain", "recent_rain")
 
                 nowcast = rain_forecast_steps(rain, cfg['n_steps'])
                 if any(s in cfg['reject_statuses'] for s in nowcast):
                     rospy.logwarn("[PRE_START_CHECK] Rain (%s) in forecast (<=%d min): %s",
                                   "/".join(cfg['reject_statuses']), cfg['horizon_min'],
                                   nowcast)
-                    self.pubs.log_info.publish(String("Start rejected: rain forecast"))
-                    self.pubs.smach_status.publish(String("Rejected: forecast"))
-                    self.pubs.stop_reason.publish(String("rejected:forecast"))
-                    return 'rejected'
+                    return reject_mission(self, self.pubs, "Start rejected: rain forecast",
+                                          "Rejected: forecast", "forecast")
 
             except rospy.ROSException:
                 rospy.logwarn("[PRE_START_CHECK] Weather data unavailable, proceeding")
@@ -253,12 +282,11 @@ class PreStartCheck(smach.State):
         try:
             pm = rospy.wait_for_message('/pm/power_status', Power_status, timeout=5.0)
             if pm.battery_capacity < min_start_pct:
-                self.pubs.log_info.publish(String(
+                return reject_mission(
+                    self, self.pubs,
                     "Start rejected: battery {}% < {}%".format(
-                        pm.battery_capacity, min_start_pct)))
-                self.pubs.smach_status.publish(String("Rejected: low battery"))
-                self.pubs.stop_reason.publish(String("rejected:battery"))
-                return 'rejected'
+                        pm.battery_capacity, min_start_pct),
+                    "Rejected: low battery", "battery")
         except rospy.ROSException:
             rospy.logwarn("[PRE_START_CHECK] Power status unavailable, proceeding")
 
@@ -1421,45 +1449,404 @@ class WaitForMowerOff(smach.State):
 # Dock-related states
 # ===========================================================================
 
+REJECTED_HOLD_S = 5.0
+_rejected_hold = {'token': 0}
+
+
+def cancel_rejected_hold():
+    """A new program arrived: a pending "Rejected ..." -> "Ready" restore must
+    not overwrite the new mission's status."""
+    _rejected_hold['token'] += 1
+
+
+def publish_mission_rejected(pubs, text, status, reason):
+    """Report a refused mission: log + status + stop_reason "rejected:<reason>".
+
+    NON-BLOCKING: the SM is back in WAIT_FOR_PROGRAM at once (a Run pressed
+    right after a rejection is not lost, and no preempt can arrive during a
+    sleep nobody services). A one-shot timer puts the status back to "Ready"
+    after REJECTED_HOLD_S - that is what the SM really is, and what
+    master_controller waits for before it consumes the stop_reason.
+    """
+    rospy.logwarn('[MISSION_REJECTED] %s (%s)', text, reason)
+    pubs.log_info.publish(String(text))
+    pubs.smach_status.publish(String(status))
+    pubs.stop_reason.publish(String("rejected:{}".format(reason)))
+    pubs.active_program.publish(String(" "))
+    pubs.pm_play_melody.publish(Int16(1))
+    _rejected_hold['token'] += 1
+    token = _rejected_hold['token']
+
+    def _restore_ready(_event):
+        if _rejected_hold['token'] == token:
+            pubs.smach_status.publish(String("Ready"))
+
+    rospy.Timer(rospy.Duration(REJECTED_HOLD_S), _restore_ready, oneshot=True)
+
+
+def reject_mission(state, pubs, text, status, reason):
+    """Outcome for a state that refuses the mission. A preempt (STOP, battery,
+    weather, temp monitor) that arrived meanwhile wins and is SERVICED - an
+    unserviced flag would stick to the child SM and kill the next mission."""
+    if state.preempt_requested():
+        state.service_preempt()
+        return 'preempted'
+    publish_mission_rejected(pubs, text, status, reason)
+    return 'rejected'
+
+
+class RejectMissionState(smach.State):
+    """Refuse the mission with a fixed message (see reject_mission)."""
+
+    def __init__(self, pubs, text, status, reason):
+        smach.State.__init__(self, outcomes=['rejected', 'preempted'])
+        self.pubs = pubs
+        self._args = (text, status, reason)
+
+    def execute(self, userdata):
+        return reject_mission(self, self.pubs, *self._args)
+
+
 class CheckIfDockedState(smach.State):
+    """Decide whether the mission has to undock first.
+
+    FAIL SAFE: 'skip_undocking' (-> LOAD_MAP -> navigation) is returned only
+    when the robot is known to be OFF the charger. An unknown or busy dock
+    state never falls through to navigation; it ends as 'rejected'.
+    """
     MAX_WAITS = 5
+    MAX_BUSY_WAITS = 60   # x 1 s: dock busy (docking/undocking) or unknown
 
     def __init__(self, pubs):
         smach.State.__init__(self,
-                             outcomes=['proceed_to_undock', 'skip_undocking', 'wait', 'preempted'])
+                             outcomes=['proceed_to_undock', 'skip_undocking', 'wait',
+                                       'rejected', 'preempted'])
         self.pubs = pubs
         self._wait_count = 0
+        self._busy_count = 0
+
+    def _reject(self, text, status, reason):
+        self._wait_count = 0
+        self._busy_count = 0
+        return reject_mission(self, self.pubs, text, status, reason)
 
     def execute(self, userdata):
         if self.preempt_requested():
+            self._wait_count = 0
+            self._busy_count = 0
             self.service_preempt()
             return 'preempted'
         try:
             msg = rospy.wait_for_message('/dock_smach/dock_status', Int8, timeout=5.0)
             self._wait_count = 0
             if msg.data == 3:  # Undocked
+                self._busy_count = 0
                 self.pubs.log_info.publish(String("Mower is already undocked."))
                 return 'skip_undocking'
             elif msg.data == 0:  # Docked
+                self._busy_count = 0
                 self.pubs.log_info.publish(String("Mower is docked, starting undock."))
                 return 'proceed_to_undock'
             else:
-                self.pubs.log_info.publish(String(
-                    "Waiting for dock status, current: {}".format(msg.data)))
+                # 1 undocking, 2 docking, 4 failed, 5 unknown: the topic is
+                # latched, so pace the re-check and give up after a while.
+                self._busy_count += 1
+                if self._busy_count >= self.MAX_BUSY_WAITS:
+                    return self._reject(
+                        "Start rejected: dock is busy or its state is unknown",
+                        "Rejected: dock state", "dock_state")
+                if self._busy_count == 1:
+                    self.pubs.log_info.publish(String(
+                        "Waiting for dock status, current: {}".format(msg.data)))
+                    self.pubs.smach_status.publish(String("Waiting for dock status"))
+                rospy.sleep(1.0)
                 return 'wait'
         except rospy.ROSException:
             self._wait_count += 1
             rospy.logwarn("Timeout /dock_smach/dock_status (%d/%d)",
                           self._wait_count, self.MAX_WAITS)
             if self._wait_count >= self.MAX_WAITS:
-                self.pubs.log_info.publish(String(
-                    "No dock_status, assuming undocked."))
                 self._wait_count = 0
-                return 'skip_undocking'
+                # No dock_status at all: ask the charger directly. Only a robot
+                # that is positively OFF the charger may skip undocking.
+                try:
+                    pm = rospy.wait_for_message('/pm/power_status', Power_status,
+                                                timeout=5.0)
+                except rospy.ROSException:
+                    pm = None
+                if pm is not None and pm.supply_status != "ONLINE":
+                    self.pubs.log_info.publish(String(
+                        "No dock status, robot is off the charger."))
+                    return 'skip_undocking'
+                return self._reject(
+                    "Start rejected: dock status unavailable, cannot tell if the robot is docked",
+                    "Rejected: dock state", "dock_state")
             return 'wait'
 
 
+class CheckMotorsOnState(smach.State):
+    """Gate for a mission that starts OFF the dock (no undock will run).
+
+    Drive motors are OFF after every boot / stack restart and are enabled only
+    by the operator or by dock_smach while undocking - NEVER by the mission.
+    So here the mission only LOOKS at /base/motor_power_state (Bool, 50 Hz,
+    True = controllers active): no fresh True within CHECK_TIME -> the mission
+    is refused with a clear message instead of driving into dead motors.
+    ~require_motor_power_state:=false disables the gate.
+    """
+    CHECK_TIME = 2.0
+
+    def __init__(self, pubs):
+        smach.State.__init__(self, outcomes=['motors_on', 'rejected', 'preempted'])
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        if not bool(rospy.get_param('~require_motor_power_state', True)):
+            rospy.logwarn("[CHECK_MOTORS_ON] gate disabled by config")
+            return 'motors_on'
+        deadline = rospy.Time.now() + rospy.Duration(self.CHECK_TIME)
+        heard = False
+        while not rospy.is_shutdown():
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            remaining = (deadline - rospy.Time.now()).to_sec()
+            if remaining <= 0:
+                break
+            try:
+                msg = rospy.wait_for_message('/base/motor_power_state', Bool,
+                                             timeout=min(0.5, remaining))
+                heard = True
+                if msg.data:
+                    return 'motors_on'
+                rospy.sleep(0.2)
+            except rospy.ROSException:
+                pass
+        if not heard:
+            # No /base/motor_power_state at all: the base is not up.
+            return reject_mission(
+                self, self.pubs,
+                "Start rejected: drive base not ready (no motor state)",
+                "Rejected: base not ready", "base_not_ready")
+        return reject_mission(
+            self, self.pubs,
+            "Start rejected: motors are OFF - turn motors on, or start the program from the dock",
+            "Rejected: motors off", "motors_off")
+
+
+class WaitForUndockedState(smach.State):
+    """Wait for the result of the undock program sent to dock_smach.
+
+    /dock_smach/dock_status: 0 docked, 1 undocking, 2 docking, 3 undocked,
+    4 failed, 5 unknown. dock_smach shows 4 only for a few seconds before it
+    goes back to 0/3 (charger state), so a persistent subscriber is used and a
+    Failed seen at any time wins.
+
+    FAIL SAFE: only 'undocking' (1) FOLLOWED BY 'undocked' (3) lets the mission
+    continue to LOAD_MAP. Everything else ends the mission with an UNDOCK_*
+    error_reason (routed to TERMINAL_ERROR without a docking attempt - see
+    CriticalErrorState). Whenever this state leaves while dock_smach is still
+    busy (failure, cap, PREEMPT) dock_smach is cancelled first, so nothing
+    keeps driving behind the mission's back.
+
+    No fixed wall while dock_smach works: its own per-stage timeouts (sum
+    > 1200 s incl. a 600 s GPS wait) end a stuck undock with Failed. While the
+    status stays 1 and dock_smach is alive (it does not republish the status
+    while busy, so alive = its publisher is still connected) the wait goes on,
+    up to the absolute cap ~undock_timeout (default 1800 s).
+    """
+    UNDOCK_TIMEOUT = 1800.0  # absolute cap, override with ~undock_timeout
+    START_GRACE = 15.0       # dock_smach must report 'undocking' within this
+    DEAD_GRACE = 15.0        # dock_smach publisher gone for this long -> failed
+    CANCEL_WAIT = 5.0        # after a cancel: wait for status to leave 1/2
+    STATUS_INTERVAL = 10.0
+
+    def __init__(self, pubs):
+        smach.State.__init__(self,
+                             outcomes=['undocked', 'failed', 'timeout', 'preempted'],
+                             input_keys=['error_reason'],
+                             output_keys=['error_reason'])
+        self.pubs = pubs
+        self._status = None
+        self._seen_failed = False
+        self._seen_busy = False
+
+    def _status_cb(self, msg):
+        self._status = msg.data
+        if msg.data == 4:
+            self._seen_failed = True
+        elif msg.data == 1:
+            self._seen_busy = True
+
+    def _dock_smach_done(self):
+        """dock_smach has finished with our program (result seen)."""
+        return self._seen_failed or (self._seen_busy and self._status in (0, 3))
+
+    def _cancel_dock_smach(self):
+        """Stop dock_smach unless it has already finished, and give it
+        CANCEL_WAIT to confirm, so a following RETURN_TO_DOCK finds it idle.
+        Also sent when the program was handed over but 'undocking' has not
+        shown up yet - otherwise dock_smach would start driving a moment after
+        the mission has gone."""
+        if self._dock_smach_done():
+            return
+        self.pubs.dock_cancel.publish(Bool(data=True))
+        deadline = rospy.Time.now() + rospy.Duration(self.CANCEL_WAIT)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self._dock_smach_done():
+                return
+            rospy.sleep(0.2)
+        rospy.logwarn('[WAIT_FOR_UNDOCKED] dock_smach did not confirm the cancel '
+                      '(dock_status=%s)', self._status)
+
+    def _fail(self, userdata, outcome, reason, text):
+        rospy.logerr('[WAIT_FOR_UNDOCKED] %s (dock_status=%s)', text, self._status)
+        self._cancel_dock_smach()
+        self.pubs.log_info.publish(String(text))
+        self.pubs.smach_status.publish(String("Undocking failed"))
+        userdata.error_reason = reason
+        return outcome
+
+    def execute(self, userdata):
+        self._status = None
+        self._seen_failed = False
+        self._seen_busy = False
+        cap = float(rospy.get_param('~undock_timeout', self.UNDOCK_TIMEOUT))
+        sub = rospy.Subscriber('/dock_smach/dock_status', Int8, self._status_cb)
+        try:
+            start = rospy.Time.now()
+            last_report = start
+            dead_since = None
+            while not rospy.is_shutdown():
+                if self.preempt_requested():
+                    # Battery / weather / temp / STOP mid-undock: never leave
+                    # dock_smach driving on its own.
+                    self._cancel_dock_smach()
+                    self.service_preempt()
+                    return 'preempted'
+                now = rospy.Time.now()
+                elapsed = (now - start).to_sec()
+                # Results first, the clock last: a result that arrives together
+                # with the cap is still a result.
+                if self._seen_failed:
+                    return self._fail(userdata, 'failed', 'UNDOCK_FAILED',
+                                      "Undocking failed")
+                if self._status == 2:
+                    return self._fail(
+                        userdata, 'failed', 'UNDOCK_FAILED',
+                        "Undocking failed: the saved UNDOCK program runs as a "
+                        "docking program - fix it in the Dock tab")
+                if self._status == 3 and self._seen_busy:
+                    self.pubs.log_info.publish(String("Mower undocked."))
+                    return 'undocked'
+                if self._status == 0 and self._seen_busy:
+                    return self._fail(
+                        userdata, 'failed', 'UNDOCK_FAILED',
+                        "Undocking failed: robot is still in the dock")
+                if not self._seen_busy and elapsed >= self.START_GRACE:
+                    # Never reported 'undocking': no status at all (dock_smach
+                    # down), still 0, or a 3 that is only a charger glitch.
+                    if self._status is None:
+                        text = "Undocking failed: dock controller not responding"
+                    else:
+                        text = "Undocking failed: undocking did not start"
+                    return self._fail(userdata, 'failed', 'UNDOCK_FAILED', text)
+                if self._seen_busy and sub.get_num_connections() == 0:
+                    dead_since = dead_since or now
+                    if (now - dead_since).to_sec() >= self.DEAD_GRACE:
+                        return self._fail(
+                            userdata, 'failed', 'UNDOCK_FAILED',
+                            "Undocking failed: dock controller not responding")
+                else:
+                    dead_since = None
+                if elapsed >= cap:
+                    return self._fail(userdata, 'timeout', 'UNDOCK_TIMEOUT',
+                                      "Undocking timed out")
+                if (now - last_report).to_sec() >= self.STATUS_INTERVAL:
+                    self.pubs.smach_status.publish(String(
+                        "Undocking ({:.0f} s)".format(elapsed)))
+                    last_report = now
+                rospy.sleep(0.2)
+            return 'preempted'   # rospy shutdown
+        finally:
+            sub.unregister()
+
+
+def is_site_native_program(program):
+    """Legacy programs carry "<name>***env*<ENV>" in map_name; a site-native
+    program carries the constant 'SITE' (no marker) and runs on whatever site
+    mapping_manager currently serves."""
+    return '***env*' not in (getattr(program, 'map_name', '') or '')
+
+
+def get_served_site():
+    """(known, site) from the latched /mapping_manager/status (JSON serving.site).
+    known=False: no status message at all; site=None: nothing is served."""
+    try:
+        msg = rospy.wait_for_message('/mapping_manager/status', String, timeout=1.0)
+        serving = json.loads(msg.data).get('serving') or {}
+        site = serving.get('site') if isinstance(serving, dict) else None
+        return True, (site or None)
+    except (rospy.ROSException, ValueError, AttributeError):
+        return False, None
+
+
+NO_ACTIVE_MAP_TEXT = "Start rejected: no map is active - activate a map first"
+
+
+class CheckActiveMapState(smach.State):
+    """First mission state: a site-native program needs a served site. Checked
+    BEFORE undocking so a robot without an active map never leaves the dock.
+    Legacy programs pass straight through.
+
+    A null 'serving' is tolerated for NO_SITE_GRACE: a respawned
+    mapping_manager latches serving:null while it rebuilds, before it
+    auto-serves the last site."""
+    NO_SITE_GRACE = 10.0
+
+    def __init__(self, pubs):
+        smach.State.__init__(self, outcomes=['ok', 'rejected', 'preempted'],
+                             input_keys=['program'])
+        self.pubs = pubs
+
+    def execute(self, userdata):
+        if not is_site_native_program(userdata.program):
+            return 'ok'
+        deadline = rospy.Time.now() + rospy.Duration(self.NO_SITE_GRACE)
+        while not rospy.is_shutdown():
+            if self.preempt_requested():
+                self.service_preempt()
+                return 'preempted'
+            known, site = get_served_site()
+            if known and site:
+                return 'ok'
+            if rospy.Time.now() >= deadline:
+                break
+            if known:
+                rospy.sleep(0.5)   # latched topic answers at once: pace the re-check
+        return reject_mission(self, self.pubs, NO_ACTIVE_MAP_TEXT,
+                              "Rejected: no active map", "no_active_map")
+
+
 class WaitForPlannerLoaded(smach.State):
+    """Wait until the planner has loaded the data the program runs on.
+
+    Legacy program (map_name "<name>***env*<ENV>"): /web_plan/planner_loaded
+    must equal map_name - unchanged.
+    Site-native program (map_name is the constant 'SITE', no ***env* marker):
+    the planner publishes the SERVED SITE NAME on planner_loaded, never 'SITE',
+    so the target is the site currently served by mapping_manager (latched
+    /mapping_manager/status, JSON serving.site).
+
+    The robot has ALREADY undocked here, so "no site served" is never a quiet
+    rejection: it is waited out (mapping_manager respawn latches serving:null
+    for a while) and, if it persists, ends as the normal 'timeout' -> aborted
+    -> CRITICAL_ERROR -> RETURN_TO_DOCK like every other failure in the field.
+    """
+
     def __init__(self, pubs, timeout=120.0):
         smach.State.__init__(self,
                              outcomes=['received', 'timeout', 'preempted'],
@@ -1469,25 +1856,51 @@ class WaitForPlannerLoaded(smach.State):
 
     def execute(self, userdata):
         userdata.program.last_result = 'failed: on_planner'
-        deadline = rospy.Time.now() + rospy.Duration(self.timeout)
+        start = rospy.Time.now()
+        deadline = start + rospy.Duration(self.timeout)
+        last_report = start
         target = userdata.program.map_name
+        site_native = is_site_native_program(userdata.program)
+        no_site = False
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
             if self.preempt_requested():
                 self.service_preempt()
                 return 'preempted'
+            if (rospy.Time.now() - last_report).to_sec() >= 10.0:
+                what = "an active map" if no_site else "planner map"
+                self.pubs.smach_status.publish(String(
+                    "Waiting for {} ({:.0f} s / {:.0f} s)".format(
+                        what, (rospy.Time.now() - start).to_sec(), self.timeout)))
+                last_report = rospy.Time.now()
+            expected = target
+            if site_native:
+                known, expected = get_served_site()
+                no_site = not expected
+                if no_site:
+                    if known:
+                        rospy.sleep(0.5)   # latched null: pace the re-check
+                    continue
             try:
                 msg = rospy.wait_for_message(
                     '/web_plan/planner_loaded', String, timeout=1.0)
             except rospy.ROSException:
                 continue
-            if msg.data == target:
+            if msg.data == expected:
                 self.pubs.show_map_layer.publish(String("SMACH|MAP|FULL"))
                 self.pubs.log_info.publish(String("Map is ready"))
                 self.pubs.smach_status.publish(String("Map ready"))
                 self.pubs.pm_play_melody.publish(Int16(1))
                 rospy.sleep(2.0)
                 return 'received'
+            if site_native:
+                rospy.sleep(0.5)   # latched topics answer at once: pace the re-check
         rospy.logwarn('WAIT_FOR_PLANNER timeout (%.1fs) for map=%s', self.timeout, target)
+        if no_site:
+            self.pubs.log_info.publish(String(
+                "No map is active - activate a map first ({:.0f} s)".format(self.timeout)))
+        else:
+            self.pubs.log_info.publish(String(
+                "Timed out waiting for planner map ({:.0f} s)".format(self.timeout)))
         return 'timeout'
 
 

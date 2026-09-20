@@ -67,12 +67,37 @@ CHECK_IF_DOCKED → UNDOCK → LOAD_MAP → WAIT_FOR_GPS/RTABMAP → WAIT_FOR_PL
 
 #### Vyjíždění z doku
 
+0. **CHECK_ACTIVE_MAP** — site-native program (`map_name` = konstanta `SITE`, bez `***env*`)
+   potřebuje servírovaný site (`/mapping_manager/status` → `serving.site`, `null` se toleruje 10 s); bez něj je mise
+   odmítnuta ještě PŘED undockem (`rejected:no_active_map`). Legacy program projde rovnou.
+   Pozn.: site-native LOAD_MAP nic nenahrává (mapa = servírovaný site) a WAIT_FOR_PLANNER
+   čeká na `/web_plan/planner_loaded` == servírovaný site (ne na `SITE`).
 1. **CHECK_IF_DOCKED** — zjistí stav z `/dock_smach/dock_status`
    - `0` (docked) → spustí undocking
-   - `3` (undocked) → přeskočí na nahrání mapy
-   - Timeout (5× bez odpovědi) → předpokládá undocked
-2. **GET/SEND_UNDOCK_PROGRAM** — pošle undock příkaz do dock_smach
-3. **WAIT_FOR_UNDOCKED** — čeká až dock_smach nahlásí status 3 nebo 4 (max 180 s)
+   - `3` (undocked) → **CHECK_MOTORS_ON** → nahrání mapy
+   - jiný stav (1/2/4/5) déle než 60 s → mise odmítnuta (`rejected:dock_state`)
+   - Timeout (5× bez odpovědi) → rozhodne `/pm/power_status`: jen robot prokazatelně
+     mimo nabíječku pokračuje jako undocked, jinak `rejected:dock_state`
+2. **CHECK_MOTORS_ON** (jen start mimo dok, i resume) — mise motory NIKDY nezapíná;
+   bez čerstvého `True` na `/base/motor_power_state` do 2 s → `rejected:motors_off`
+   (topic úplně chybí → `rejected:base_not_ready`)
+   (vypnutelné `~require_motor_power_state:=false`)
+3. **GET/SEND_UNDOCK_PROGRAM** — pošle undock příkaz do dock_smach; chybějící undock
+   program (latched topic, 10 s) → mise odmítnuta (`rejected:no_undock_program`)
+4. **WAIT_FOR_UNDOCKED** — na LOAD_MAP pokračuje jen status `1` následovaný `3`; status `4`,
+   `2`, návrat na `0`, undock se do 15 s nerozběhl, dock_smach neodpovídá / spadl →
+   `UNDOCK_FAILED`; absolutní strop `~undock_timeout` (1800 s, jinak se čeká, dokud
+   dock_smach žije a hlásí `1`) → `UNDOCK_TIMEOUT`. Obojí → CRITICAL_ERROR → TERMINAL_ERROR
+   (bez pokusu o dokování). Při selhání, stropu i PREEMPTU (baterie/počasí/teplota/STOP) se
+   běžící dock_smach nejdřív zruší (`/dock_smach/stop`, čeká se až 5 s na potvrzení).
+
+Odmítnutá mise (`rejected`) → MISSION_CONCURRENCE `mission_rejected` → WAIT_FOR_PROGRAM
+(nic se nepohnulo, není to chyba). Odmítnutí neblokuje: SM je hned zpět ve WAIT_FOR_PROGRAM,
+status se po 5 s vrátí na `Ready` (časovač; totéž nově i pro PRE_START_CHECK rain/battery,
+aby master_controller `rejected:*` vůbec zpracoval). Start mise maže latched `stop_reason`
+a na startu každé mise se uklidí zapomenuté preempt příznaky v MISSION_CHILD.
+Po undocku už se NEODMÍTÁ: zmizí-li servírovaný site, WAIT_FOR_PLANNER čeká do timeoutu
+a končí běžnou cestou `aborted` → RETURN_TO_DOCK. LOAD_MAP je dosažitelný jen z robota mimo nabíječku.
 
 #### Nahrání mapy
 

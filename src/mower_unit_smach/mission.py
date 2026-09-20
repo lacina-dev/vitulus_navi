@@ -28,6 +28,8 @@ from .states import (
     GetZoneData, GetPathData, CheckDistance, WindowPlannerPath, TrimAndRetry,
     ExecutePathWithFeedback, WaitForRpmReached, WaitForMowerOff,
     CheckIfDockedState, WaitForPlannerLoaded, WaitForDockedState,
+    WaitForUndockedState, CheckMotorsOnState, CheckActiveMapState,
+    is_site_native_program, RejectMissionState, cancel_rejected_hold,
     CheckForDockPoint, DetourAroundObstacle, RemowSkippedSpans)
 from .monitors import (
     weather_monitor_cb, battery_monitor_cb, mower_temp_monitor_cb, stop_monitor_cb)
@@ -55,7 +57,15 @@ def build_wait_for_program(pubs):
         userdata.consecutive_nav_failures = 0
         userdata.skipped_spans = []
 
+    def mission_start():
+        # A pending "Rejected ..." -> "Ready" restore must not overwrite this
+        # mission's status, and master_controller must never consume the
+        # previous mission's (latched) stop_reason.
+        cancel_rejected_hold()
+        pubs.stop_reason.publish(String(""))
+
     def callback_program(userdata, msg):
+        mission_start()
         reinit_userdata(userdata)
         userdata.program = msg
         userdata.program.last_result = 'failed: on_init'
@@ -69,6 +79,7 @@ def build_wait_for_program(pubs):
         return False  # 'invalid' outcome → triggers Concurrence exit
 
     def callback_program_unfinished(userdata, msg):
+        mission_start()
         reinit_userdata(userdata)
         userdata.program = msg
         rospy.loginfo('[MONITOR_PROGRAM_UNFINISHED] Resume: %s last_result=%s',
@@ -154,10 +165,12 @@ def build_mission_child_sm(pubs):
     Outcomes:
       - 'succeeded': all zones mowed, mower powered off
       - 'aborted': critical error (error_reason set in userdata)
+      - 'rejected': mission refused before anything moved (e.g. docked and
+        no undock program); reported to the UI, back to idle
       - 'preempted': external preemption from monitors
     """
     sm = smach.StateMachine(
-        outcomes=['succeeded', 'aborted', 'preempted'],
+        outcomes=['succeeded', 'aborted', 'rejected', 'preempted'],
         input_keys=['program', 'prg_start_time', 'unfinished_active',
                     'unfinished_zone', 'unfinished_path', 'unfinished_window',
                     'path_window_start_index', 'path_chunk', 'error_reason',
@@ -192,11 +205,34 @@ def build_mission_child_sm(pubs):
 
         # ==================== UNDOCK ====================
 
+        # Site-native program without a served site: refuse before undocking.
+        smach.StateMachine.add('CHECK_ACTIVE_MAP', CheckActiveMapState(pubs),
+                               transitions={
+                                   'ok': 'CHECK_IF_DOCKED',
+                                   'rejected': 'rejected',
+                                   'preempted': 'preempted'
+                               })
+
+        # SAFETY: LOAD_MAP (and the navigation behind it) is reachable ONLY
+        # from a robot that is off the charger: 'skip_undocking' (already
+        # undocked, motors on) or WAIT_FOR_UNDOCKED 'undocked'. A docked robot without an
+        # undock program, or with a failed/timed-out undock, never proceeds.
         smach.StateMachine.add('CHECK_IF_DOCKED', CheckIfDockedState(pubs),
                                transitions={
                                    'proceed_to_undock': 'GET_UNDOCK_PROGRAM',
-                                   'skip_undocking': 'LOAD_MAP',
+                                   'skip_undocking': 'CHECK_MOTORS_ON',
                                    'wait': 'CHECK_IF_DOCKED',
+                                   'rejected': 'rejected',
+                                   'preempted': 'preempted'
+                               })
+
+        # Started off the dock (new program or a resume): no undock will run,
+        # so nobody powers the motors. The mission never does that itself - it
+        # only refuses to start while they are off.
+        smach.StateMachine.add('CHECK_MOTORS_ON', CheckMotorsOnState(pubs),
+                               transitions={
+                                   'motors_on': 'LOAD_MAP',
+                                   'rejected': 'rejected',
                                    'preempted': 'preempted'
                                })
 
@@ -205,16 +241,28 @@ def build_mission_child_sm(pubs):
             pubs.log_info.publish(String("Received undock program."))
             pubs.smach_status.publish(String("Undocking"))
 
+        # /dock_manager/undock_program is latched: a saved program arrives at
+        # once, so a short timeout means "no undock program saved".
         smach.StateMachine.add('GET_UNDOCK_PROGRAM',
                                WaitForTopic('/dock_manager/undock_program',
                                             DockProgram,
                                             predicate=lambda m: True,
-                                            timeout=30.0,
+                                            timeout=10.0,
                                             output_keys=['undock_program'],
                                             on_match=_on_undock_program),
                                transitions={'received': 'SEND_UNDOCK_PROGRAM',
-                                            'timeout': 'LOAD_MAP',
+                                            'timeout': 'REJECT_NO_UNDOCK_PROGRAM',
                                             'preempted': 'preempted'})
+
+        # Docked and nothing to undock with: a setup problem, not an error.
+        # Nothing has moved, so refuse the mission and go back to idle.
+        smach.StateMachine.add(
+            'REJECT_NO_UNDOCK_PROGRAM',
+            RejectMissionState(
+                pubs,
+                "Start rejected: no UNDOCK program saved - create one in the Dock tab",
+                "Rejected: no undock program", "no_undock_program"),
+            transitions={'rejected': 'rejected', 'preempted': 'preempted'})
 
         @smach.cb_interface(input_keys=['undock_program'], outcomes=['done', 'preempted'])
         def send_undock_cb(ud):
@@ -229,14 +277,11 @@ def build_mission_child_sm(pubs):
                                transitions={'done': 'WAIT_FOR_UNDOCKED',
                                             'preempted': 'preempted'})
 
-        def _undocked_pred(m):
-            return m.data in (3, 4)  # Undocked or Failed
-
-        smach.StateMachine.add('WAIT_FOR_UNDOCKED',
-                               WaitForTopic('/dock_smach/dock_status', Int8,
-                                            predicate=_undocked_pred, timeout=180.0),
-                               transitions={'received': 'LOAD_MAP',
-                                            'timeout': 'LOAD_MAP',
+        # Failed / timed-out undock ends the mission (error_reason UNDOCK_*).
+        smach.StateMachine.add('WAIT_FOR_UNDOCKED', WaitForUndockedState(pubs),
+                               transitions={'undocked': 'LOAD_MAP',
+                                            'failed': 'aborted',
+                                            'timeout': 'aborted',
                                             'preempted': 'preempted'})
 
         # ==================== LOAD MAP ====================
@@ -252,6 +297,17 @@ def build_mission_child_sm(pubs):
             except (IndexError, AttributeError):
                 rospy.logwarn('[LOAD_MAP] Cannot parse env type from map_name=%r; defaulting to outdoor',
                               ud.program.map_name)
+            if is_site_native_program(ud.program):
+                # Site-native program (map_name is the constant 'SITE'): the
+                # map is the site mapping_manager already serves. There is no
+                # legacy map to load - navi_man would only reject the request
+                # ("Legacy map load rejected") - and the planner reloads by
+                # itself on every served-site change (WAIT_FOR_PLANNER checks).
+                rospy.loginfo('[LOAD_MAP] site-native program (map=%s): using the served site',
+                              ud.program.map_name)
+                pubs.log_info.publish(String("Using the active map"))
+                pubs.smach_status.publish(String("Loading map"))
+                return 'success_outdoor'
             if indoor:
                 pub = rospy.Publisher('/navi_manager/load_map_rtabmap',
                                       String, latch=True, queue_size=1)
@@ -288,7 +344,9 @@ def build_mission_child_sm(pubs):
 
         smach.StateMachine.add('WAIT_FOR_RTABMAP',
                                WaitForTopic('/rtabmap/info', Info,
-                                            predicate=_rtabmap_pred, timeout=180.0),
+                                            predicate=_rtabmap_pred, timeout=180.0,
+                                            pubs=pubs,
+                                            wait_label='map localization'),
                                transitions={
                                    'received': 'WAIT_FOR_PLANNER',
                                    'timeout': 'aborted',
@@ -328,7 +386,8 @@ def build_mission_child_sm(pubs):
         smach.StateMachine.add('WAIT_FOR_GPS_FIX',
                                WaitForTopic('/nav_tf/odom_status',
                                             Navi_transform,
-                                            predicate=_gps_pred, timeout=600.0),
+                                            predicate=_gps_pred, timeout=600.0,
+                                            pubs=pubs, wait_label='GPS fix'),
                                transitions={
                                    'received': 'WAIT_FOR_PLANNER',
                                    'timeout': 'aborted',
@@ -1022,6 +1081,27 @@ def _build_process_path_sm(pubs, path_it):
 # MISSION_CONCURRENCE (mission child + monitors)
 # ===========================================================================
 
+def clear_stale_preempt(container):
+    """Recall every preempt flag left inside *container* (recursively).
+
+    smach's Concurrence recalls unserviced child preempts only when the
+    concurrence ITSELF was preempted. Here the monitors preempt MISSION_CHILD
+    through child_termination_cb, so a child that ends at that very moment
+    without servicing the request keeps the flag - and the NEXT mission would
+    return 'preempted' at once (-> TERMINAL_ERROR). Called at every mission
+    start, before the children run, when no legitimate preempt can be pending.
+    """
+    if getattr(container, '_preempted_state', None) is not None:
+        container._preempted_state = None
+        container._preempted_label = None
+    container.recall_preempt()
+    get_children = getattr(container, 'get_children', None)
+    if get_children is None:
+        return
+    for child in get_children().values():
+        clear_stale_preempt(child)
+
+
 def build_mission_concurrence(pubs, parent_sm):
     """Wrap the mission child SM with concurrent monitors.
 
@@ -1032,6 +1112,8 @@ def build_mission_concurrence(pubs, parent_sm):
       - 'temp_preempt': motor overtemperature
       - 'stop_preempt': external stop signal
       - 'critical_error': critical failure from within mission
+      - 'mission_rejected': mission refused before anything moved (stop_reason
+        "rejected:*" already published by the rejecting state)
       - 'preempted': generic preemption
     """
 
@@ -1061,6 +1143,8 @@ def build_mission_concurrence(pubs, parent_sm):
         if mission_out == 'aborted':
             pubs.stop_reason.publish(String("critical:mission_aborted"))
             return 'critical_error'
+        if mission_out == 'rejected':
+            return 'mission_rejected'
         return 'preempted'
 
     all_keys = ['program', 'prg_start_time', 'unfinished_active',
@@ -1071,7 +1155,8 @@ def build_mission_concurrence(pubs, parent_sm):
 
     cc = smach.Concurrence(
         outcomes=['mission_complete', 'weather_preempt', 'battery_preempt',
-                  'temp_preempt', 'stop_preempt', 'critical_error', 'preempted'],
+                  'temp_preempt', 'stop_preempt', 'critical_error',
+                  'mission_rejected', 'preempted'],
         default_outcome='preempted',
         child_termination_cb=child_term_cb,
         outcome_cb=outcome_cb,
@@ -1079,6 +1164,9 @@ def build_mission_concurrence(pubs, parent_sm):
         output_keys=['program', 'prg_start_time', 'error_reason']
     )
     cc.userdata = parent_sm.userdata
+    # Runs at the start of every execute(), before the children are started.
+    cc.register_start_cb(lambda ud, labels: clear_stale_preempt(mission_child),
+                         cb_args=[])
 
     with cc:
         smach.Concurrence.add('MISSION_CHILD', mission_child)

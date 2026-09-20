@@ -6,10 +6,51 @@ import smach
 import smach_ros
 
 from std_msgs.msg import Bool, String, Int16, Int8
-from vitulus_msgs.msg import DockProgram
+from vitulus_msgs.msg import DockProgram, PlannerProgram
 
 from .helpers import safe_blade_shutdown
 from .states import WaitForTopic, WaitForDockedState, CheckForDockPoint
+
+
+# ===========================================================================
+# Run-request notifier for the states that only leave on Reset
+# ===========================================================================
+
+class RunRequestNotifier(object):
+    """Tell the user why Run does nothing while the SM waits for Reset.
+
+    STOPPED and TERMINAL_ERROR leave only on /mower_smach/reset, so a program
+    sent meanwhile (/web_plan/program_active[_unfinished]) used to be dropped
+    without a word. This only REPORTS the request on the UI log; it never
+    starts anything.
+    """
+    TOPICS = ('/web_plan/program_active', '/web_plan/program_active_unfinished')
+    MIN_INTERVAL = 2.0
+
+    def __init__(self, pubs, text):
+        self.pubs = pubs
+        self.text = text
+        self._subs = []
+        self._last = None
+
+    def _cb(self, msg):
+        now = rospy.Time.now()
+        if self._last is not None and (now - self._last).to_sec() < self.MIN_INTERVAL:
+            return
+        self._last = now
+        rospy.logwarn("Run request for '%s' ignored: %s", msg.name, self.text)
+        self.pubs.log_info.publish(String(self.text))
+        self.pubs.pm_play_melody.publish(Int16(1))
+
+    def start(self):
+        self._last = None
+        self._subs = [rospy.Subscriber(t, PlannerProgram, self._cb, queue_size=1)
+                      for t in self.TOPICS]
+
+    def stop(self):
+        for sub in self._subs:
+            sub.unregister()
+        self._subs = []
 
 
 # ===========================================================================
@@ -22,12 +63,14 @@ class CriticalErrorState(smach.State):
     If the error reason is a DOCKING_* failure (meaning a docking attempt
     already failed — couldn't dock, no DOCK point, no dock program), skip
     docking and go terminal to avoid an endless loop.
+    UNDOCK_* (undocking failed / timed out) goes terminal as well: the robot is
+    in or right at the dock with an unknown pose, so stay put, never navigate.
     For all other reasons (BLOCKED_FAILED, NAVIGATION_ABORTED, ...), attempt a
     return to dock first — a single un-mowable line must NOT strand the robot in
     the field. If that docking attempt also fails, the RETURN_TO_DOCK sub-SM
     sets a DOCKING_* reason and we come back here, which then routes to terminal.
     """
-    NO_DOCK_PREFIX = 'DOCKING_'
+    NO_DOCK_PREFIX = ('DOCKING_', 'UNDOCK_')
 
     def __init__(self, pubs):
         smach.State.__init__(self,
@@ -77,7 +120,7 @@ class TerminalErrorState(smach.State):
         reason = userdata.error_reason or 'UNKNOWN'
         rospy.logerr("[TERMINAL_ERROR] Quarantine. Reason: %s", reason)
         self.pubs.log_info.publish(String(
-            "TERMINAL: {}. Reset via /mower_smach/reset".format(reason)))
+            "Mission ended with an error ({}). Press Reset to continue.".format(reason)))
         self.pubs.smach_status.publish(String("TERMINAL ERROR"))
         self.pubs.stop_reason.publish(String("terminal:{}".format(reason.lower())))
 
@@ -89,26 +132,33 @@ class TerminalErrorState(smach.State):
         self.pubs.pm_play_melody.publish(Int16(1))
         last_buzzer = rospy.Time.now()
 
-        while not rospy.is_shutdown():
-            if self.preempt_requested():
-                self.service_preempt()
-                return 'preempted'
-            # Check for reset
-            try:
-                msg = rospy.wait_for_message('/mower_smach/reset', Bool, timeout=1.0)
-                if msg.data:
-                    rospy.loginfo("[TERMINAL_ERROR] Reset received")
-                    self.pubs.log_info.publish(String("Reset accepted. Returning to idle."))
-                    self.pubs.smach_status.publish(String("Ready"))
-                    userdata.error_reason = ''
-                    return 'reset'
-            except rospy.ROSException:
-                pass
+        # A Run pressed now is not executed - say so instead of staying silent.
+        notifier = RunRequestNotifier(
+            self.pubs, "Mission ended with an error - press Reset before Run")
+        notifier.start()
+        try:
+            while not rospy.is_shutdown():
+                if self.preempt_requested():
+                    self.service_preempt()
+                    return 'preempted'
+                # Check for reset
+                try:
+                    msg = rospy.wait_for_message('/mower_smach/reset', Bool, timeout=1.0)
+                    if msg.data:
+                        rospy.loginfo("[TERMINAL_ERROR] Reset received")
+                        self.pubs.log_info.publish(String("Reset accepted. Returning to idle."))
+                        self.pubs.smach_status.publish(String("Ready"))
+                        userdata.error_reason = ''
+                        return 'reset'
+                except rospy.ROSException:
+                    pass
 
-            # Periodic buzzer
-            if (rospy.Time.now() - last_buzzer).to_sec() >= self.BUZZER_INTERVAL:
-                self.pubs.pm_play_melody.publish(Int16(1))
-                last_buzzer = rospy.Time.now()
+                # Periodic buzzer
+                if (rospy.Time.now() - last_buzzer).to_sec() >= self.BUZZER_INTERVAL:
+                    self.pubs.pm_play_melody.publish(Int16(1))
+                    last_buzzer = rospy.Time.now()
+        finally:
+            notifier.stop()
 
         # rospy shutdown
         return 'preempted'
@@ -145,7 +195,7 @@ class StoppedState(smach.State):
     def execute(self, userdata):
         rospy.logwarn("[STOPPED] Paused by STOP signal. Holding position.")
         self.pubs.log_info.publish(String(
-            "Stopped. Resume via /mower_smach/reset."))
+            "Mission stopped. Press Reset, then Run to continue."))
         self.pubs.smach_status.publish(String("Stopped"))
         self.pubs.stop_reason.publish(String("stopped:user_stop"))
 
@@ -153,27 +203,34 @@ class StoppedState(smach.State):
         safe_blade_shutdown(source='STOPPED', pubs=self.pubs)
         self.pubs.mower_set_power.publish(Bool(False))
 
+        # A Run pressed now is not executed - say so instead of staying silent.
+        notifier = RunRequestNotifier(
+            self.pubs, "Mission is stopped - press Reset before Run")
+        notifier.start()
         last_status = rospy.Time.now()
-        while not rospy.is_shutdown():
-            if self.preempt_requested():
-                self.service_preempt()
-                return 'preempted'
-            try:
-                msg = rospy.wait_for_message('/mower_smach/reset', Bool, timeout=1.0)
-                if msg.data:
-                    rospy.loginfo("[STOPPED] Reset received -> re-arming")
-                    # Clear any stuck STOP so the restarted mission is not
-                    # immediately preempted again.
-                    self._stop_pub.publish(Bool(False))
-                    self.pubs.log_info.publish(String("Resumed from stop."))
-                    self.pubs.smach_status.publish(String("Ready"))
-                    return 'resume'
-            except rospy.ROSException:
-                pass
+        try:
+            while not rospy.is_shutdown():
+                if self.preempt_requested():
+                    self.service_preempt()
+                    return 'preempted'
+                try:
+                    msg = rospy.wait_for_message('/mower_smach/reset', Bool, timeout=1.0)
+                    if msg.data:
+                        rospy.loginfo("[STOPPED] Reset received -> re-arming")
+                        # Clear any stuck STOP so the restarted mission is not
+                        # immediately preempted again.
+                        self._stop_pub.publish(Bool(False))
+                        self.pubs.log_info.publish(String("Reset accepted. Ready for Run."))
+                        self.pubs.smach_status.publish(String("Ready"))
+                        return 'resume'
+                except rospy.ROSException:
+                    pass
 
-            if (rospy.Time.now() - last_status).to_sec() >= self.STATUS_INTERVAL:
-                self.pubs.smach_status.publish(String("Stopped"))
-                last_status = rospy.Time.now()
+                if (rospy.Time.now() - last_status).to_sec() >= self.STATUS_INTERVAL:
+                    self.pubs.smach_status.publish(String("Stopped"))
+                    last_status = rospy.Time.now()
+        finally:
+            notifier.stop()
 
         return 'preempted'
 
@@ -252,7 +309,8 @@ def build_return_to_dock_sm(pubs):
                                             predicate=lambda m: True,
                                             timeout=30.0,
                                             output_keys=['dock_program'],
-                                            on_match=_on_dock_program),
+                                            on_match=_on_dock_program,
+                                            pubs=pubs, wait_label='dock program'),
                                transitions={
                                    'received': 'SEND_DOCK_PROGRAM',
                                    'timeout': 'SET_NO_DOCK_PROGRAM',

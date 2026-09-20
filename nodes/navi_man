@@ -42,6 +42,56 @@ from navi_man import mapdata
 sys.modules['mapdata'] = mapdata
 from mapdata import MapPoint, MapData, MapPath
 
+# Warm cache of running_map_data. A module constant, not a literal at three call
+# sites, so a test can point it somewhere harmless: opening it 'wb' TRUNCATES it
+# before anything is written, so a test that merely stubs pickle.dump still
+# empties the live file (it did, 2026-08-30).
+MAPDATA_PKL = '/home/vitulus/.ros/mapdata.pkl'
+
+# Source-tree locations are resolved from the package, not from a fixed
+# workspace name (a second workspace silently ran another tree's launch files
+# and config). The historical layout stays as the fallback, so on a standard
+# ~/catkin_ws/src/vitulus/<pkg> checkout every path resolves exactly as before.
+_LEGACY_WS_SRC = '/home/vitulus/catkin_ws/src'
+
+
+def _pkg_path(pkg):
+    """Source dir of ROS package *pkg* (rospkg), else the historical path."""
+    try:
+        import rospkg
+        return rospkg.RosPack().get_path(pkg)
+    except Exception:
+        return os.path.join(_LEGACY_WS_SRC, 'vitulus', pkg)
+
+
+NAVI_PKG_DIR = _pkg_path('vitulus_navi')
+
+
+def rtabmap_docker_dir():
+    """Host dir bind-mounted as /rtabmap_docker into the rtabmap containers.
+
+    ~rtabmap_docker_dir overrides; default is the sibling of src/vitulus in this
+    workspace (<ws>/src/rtabmap_docker), else the historical path.
+    """
+    try:
+        override = rospy.get_param('~rtabmap_docker_dir', '')
+    except Exception:
+        override = ''
+    if override:
+        return override
+    cand = os.path.join(os.path.dirname(os.path.dirname(NAVI_PKG_DIR)), 'rtabmap_docker')
+    if os.path.isdir(cand):
+        return cand
+    return os.path.join(_LEGACY_WS_SRC, 'rtabmap_docker')
+
+
+def is_map_db_filename(fname):
+    """True for a legacy map file "<name>***env*<INDOOR|OUTDOOR>.db"."""
+    if not fname.endswith('.db'):
+        return False
+    parts = fname[:-3].split('***env*')
+    return len(parts) == 2 and parts[0] != '' and parts[1] in ('INDOOR', 'OUTDOOR')
+
 # --- site-bundle (mapping-v3 unification, WP-B) ---------------------------
 # Canonical per-garden waypoint/path store in ~/.vitulus/mapping_v3/<site>/ (UTM).
 # navi_man dual-writes to it on save and imports-if-newer on load; a total import
@@ -50,7 +100,7 @@ try:
     from vitulus_mapping import bundle as _bundle, geo as _geo
 except Exception:
     try:
-        sys.path.append('/home/vitulus/catkin_ws/src/vitulus/vitulus_mapping/src')
+        sys.path.append(os.path.join(_pkg_path('vitulus_mapping'), 'src'))
         from vitulus_mapping import bundle as _bundle, geo as _geo
     except Exception as _e:
         _bundle = _geo = None
@@ -101,7 +151,7 @@ class DockerConnection:
         self.cont = self.client.containers.run("vitulus/rtabmap_ros:noetic-latest", auto_remove=False, detach=True,
                                     environment=["ROS_HOME=/tmp/.ros"],
                                     command=self.cont_command,
-                                    volumes={"/home/vitulus/catkin_ws/src/rtabmap_docker": {"bind": "/rtabmap_docker", "mode": "rw"}, "/home/vitulus/.ros": {"bind": "/tmp/.ros", "mode": "rw"}},
+                                    volumes={rtabmap_docker_dir(): {"bind": "/rtabmap_docker", "mode": "rw"}, "/home/vitulus/.ros": {"bind": "/tmp/.ros", "mode": "rw"}},
                                     entrypoint="/ros_entrypoint.sh",
                                     user="vitulus", network_mode="host", privileged=True,
                                     name=self.cont_name)
@@ -169,6 +219,11 @@ class Node:
         # status. None until a site is served. Drives the bundle site resolution
         # + waypoint import in site-native mode. Set by callback_mapping_status.
         self._served_site = None
+        # Site the in-memory waypoints/paths BELONG TO. None = they belong to no
+        # site yet (the dock 'docked' seed can land before anything is served).
+        # A map with no waypoints must show no waypoints, so points are dropped
+        # the moment the served site stops matching this (2026-08-30).
+        self._points_site = None
         self._served_site_warned = False   # one-time "no site served at boot" warn
         self._nomap_coords_warned = False  # one-time "no georef -> map_coords muted"
 
@@ -1380,14 +1435,14 @@ class Node:
         return
 
     def save_running_map_data(self):
-        with open('/home/vitulus/.ros/mapdata.pkl', 'wb') as output:
+        with open(MAPDATA_PKL, 'wb') as output:
             pickle.dump(self.running_map_data, output, pickle.HIGHEST_PROTOCOL)
         # site-bundle dual-write (WP-B): mirror waypoints/paths to the linked site
         # bundle in canonical UTM. NEVER let a bundle failure break the legacy save.
         self._export_bundle()
 
     def load_running_map_data(self):
-        with open('/home/vitulus/.ros/mapdata.pkl', 'rb') as input:
+        with open(MAPDATA_PKL, 'rb') as input:
             loaded = pickle.load(input)
         with self._map_data_lock:   # AUDIT M8
             self.running_map_data = loaded
@@ -1487,6 +1542,9 @@ class Node:
             paths = _bsync.map_paths_to_paths(rmd.paths, datum)
             _bundle.save_waypoints(site, wps)
             _bundle.save_paths(site, paths)
+            # Written to this site -> they are now this site's points (a dock
+            # seed placed before anything was served gets its owner here).
+            self._points_site = site
             rospy.loginfo_throttle(10.0, "navi_man bundle: exported %d waypoints + "
                                    "%d paths to site '%s'.",
                                    len(wps), len(paths), site)
@@ -1697,6 +1755,27 @@ class Node:
         if self._legacy_maps:
             return                       # legacy path owns the map; do not touch
         if site:
+            # Body jsou majetkem mapy, ze které přišly. Při přepnutí na jinou
+            # mapu se zahodí VŽDY — i když nová mapa žádné waypointy nemá:
+            # prázdná mapa musí zůstat prázdná, ne zdědit cizí body (ty by navíc
+            # s novým datem ukazovaly na úplně jiné místo a první uložení by je
+            # do nové mapy natvrdo zapsalo). Výjimka jsou body, které ještě k
+            # žádné mapě nepatří (_points_site is None) — tj. dock seed nasazený
+            # dřív, než se cokoli servírovalo; ty si nová mapa převezme, pokud
+            # vlastní waypointy nemá (jinak vyhraje její soubor při importu).
+            if self._points_site is not None and self._points_site != site:
+                with self._map_data_lock:   # AUDIT M8
+                    dropped = len(self.running_map_data.points)
+                    dropped_paths = len(self.running_map_data.paths)
+                    self.running_map_data.points = []
+                    self.running_map_data.paths = []
+                if dropped or dropped_paths:
+                    rospy.logwarn("navi_man site-native: dropped %d waypoint(s) + "
+                                  "%d path(s) belonging to site %r — now serving "
+                                  "%r.", dropped, dropped_paths,
+                                  self._points_site, site)
+                self._points_site = None
+                self._republish_map_lists()
             self._import_served_site_bundle()
         else:
             # site un-served (e.g. fresh site being mapped): drop waypoints so we
@@ -1707,6 +1786,7 @@ class Node:
                 self.running_map_data.utm_x = 0
                 self.running_map_data.utm_y = 0
                 self.running_map_data.utm_z = 0
+            self._points_site = None
             rospy.logwarn("navi_man site-native: no site served now — cleared "
                           "waypoints/paths + datum (odom-frame only).")
             self._republish_map_lists()
@@ -1747,24 +1827,41 @@ class Node:
                 rmd.utm_orientation_y = 0.0
                 rmd.utm_orientation_z = q[2]
                 rmd.utm_orientation_w = q[3]
-            # MISSING FILE = NO INFORMATION (2026-07-19 night fix): a fresh
-            # site has no waypoints/paths.geojson yet — wiping the in-memory
-            # points here is what erased the freshly auto-saved 'docked'
-            # waypoint. Replace only when the file actually exists.
+            # A MISSING FILE MEANS NO WAYPOINTS (2026-08-30). The site's file is
+            # the whole truth about the site's waypoints: present -> it replaces
+            # what we hold, absent -> the site simply has none and we show none.
+            # The 2026-07-19 exception that kept whatever was in memory is gone,
+            # because it let one map's points show up (and get saved) on another.
+            # The single case it existed for survives: the dock 'docked' seed
+            # placed before ANY site was served is not yet owned by a site
+            # (_points_site is None), so it is kept for a site that has no
+            # waypoints file of its own — that seed is what first fills it.
             wp_file = os.path.join(_bundle.site_dir(site), 'waypoints.geojson')
             pa_file = os.path.join(_bundle.site_dir(site), 'paths.geojson')
+            unowned = self._points_site is None
             if os.path.exists(wp_file):
                 pt_specs = _bsync.waypoints_to_point_specs(
                     _bundle.load_waypoints(site), datum)
                 rmd.points = [self._build_map_point_from_spec(s) for s in pt_specs]
-            else:
+            elif unowned and rmd.points:
                 rospy.loginfo("navi_man site-native: site '%s' has no "
-                              "waypoints.geojson yet — keeping %d in-memory "
-                              "point(s).", site, len(rmd.points))
+                              "waypoints.geojson yet — keeping %d point(s) not "
+                              "yet owned by any site (dock seed).",
+                              site, len(rmd.points))
+            else:
+                if rmd.points:
+                    rospy.logwarn("navi_man site-native: site '%s' has no "
+                                  "waypoints.geojson — dropping %d stale "
+                                  "point(s).", site, len(rmd.points))
+                rmd.points = []
             if os.path.exists(pa_file):
                 pa_specs = _bsync.paths_to_path_specs(
                     _bundle.load_paths(site), datum)
                 rmd.paths = [self._build_map_path_from_spec(s) for s in pa_specs]
+            elif not (unowned and rmd.paths):
+                rmd.paths = []
+            # Whatever we now hold belongs to this site.
+            self._points_site = site
             rospy.loginfo("navi_man site-native: imported %d waypoints + %d paths "
                           "from served site '%s' (datum utm=(%.2f, %.2f) yaw=%.4f). "
                           "Waypoints: %s", len(rmd.points), len(rmd.paths), site,
@@ -1774,7 +1871,7 @@ class Node:
             # serving keeps the last state. Bare pickle dump (NOT save_running_map_data
             # — that would re-export the bundle we just imported).
             try:
-                with open('/home/vitulus/.ros/mapdata.pkl', 'wb') as out:
+                with open(MAPDATA_PKL, 'wb') as out:
                     pickle.dump(rmd, out, pickle.HIGHEST_PROTOCOL)
             except Exception as e:
                 rospy.logwarn("navi_man site-native: warm-cache pickle write "
@@ -1840,7 +1937,7 @@ class Node:
             #     roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
             #     self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
             # else:
-            cli_args = ['/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_indoor.launch',
+            cli_args = [os.path.join(NAVI_PKG_DIR, 'launch', 'vitulus_navi_indoor.launch'),
                         'map_topic:=/navi_manager/map']
             roslaunch_args = cli_args[1:]
             roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
@@ -1853,7 +1950,7 @@ class Node:
             #     roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
             #     self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
             # else:
-            cli_args = ['/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_outdoor.launch',
+            cli_args = [os.path.join(NAVI_PKG_DIR, 'launch', 'vitulus_navi_outdoor.launch'),
                         'map_topic:=/navi_manager/map']
             roslaunch_args = cli_args[1:]
             roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
@@ -2077,10 +2174,14 @@ class Node:
         # only when it exists.
         db_src = "/home/vitulus/.ros/rtabmap.db"
         pkl_src = "/home/vitulus/.vitulus/saves/maps_data/" + str(self.active_map) + ".pkl"
+        # Same backup name as callback_new_map ("BACKUP_LAST***env*<ENV>"): a
+        # bare "BACKUP_LAST.db" in saves/maps ends up in map_str_list as an
+        # entry without the ***env* marker, which the UI cannot parse.
+        ind_outd = "***env*INDOOR" if self.indoor else "***env*OUTDOOR"
         if os.path.exists(db_src):
-            shutil.copyfile(db_src, "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST.db")
+            shutil.copyfile(db_src, "/home/vitulus/.vitulus/saves/maps/BACKUP_LAST" + ind_outd + ".db")
         if os.path.exists(pkl_src):
-            shutil.copyfile(pkl_src, "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST.pkl")
+            shutil.copyfile(pkl_src, "/home/vitulus/.vitulus/saves/maps_data/BACKUP_LAST" + ind_outd + ".pkl")
         
         if self.edit_map_msg == "localize":
             self.status_msg_pub.publish("Current map is in localization mode.")
@@ -2311,8 +2412,16 @@ class Node:
 
     def get_maplist(self):
         mypath = "/home/vitulus/.vitulus/saves/maps/"
+        # Only real map files "<name>***env*<INDOOR|OUTDOOR>.db" are listed;
+        # anything else (old bare BACKUP_LAST.db, stray files) would reach the
+        # UI as an entry it cannot parse.
+        allfiles = [f for f in listdir(mypath) if isfile(join(mypath, f))]
+        mapfiles = [f for f in allfiles if is_map_db_filename(f)]
+        if len(mapfiles) != len(allfiles):
+            rospy.logwarn_throttle(600, "get_maplist: ignoring non-map file(s) in %s: %s" % (
+                mypath, sorted(set(allfiles) - set(mapfiles))))
         onlyfiles = ["{} ({:.2f} GB)".format(f, float(os.path.getsize(join(mypath, f))) / 1000000000).replace(".db", "")
-                     for f in listdir(mypath) if isfile(join(mypath, f))]
+                     for f in mapfiles]
         onlyfiles.sort(key=lambda x: x.lower())
         onlyfilesStr = '---'.join(onlyfiles)
         self.map_list_pub.publish(onlyfilesStr)
@@ -2429,7 +2538,7 @@ class Node:
             self.map_path_pub.publish(path.message)
 
     def load_manager_config(self):
-        with open(r'/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/config/navi_manager.yaml') as file:
+        with open(os.path.join(NAVI_PKG_DIR, 'config', 'navi_manager.yaml')) as file:
             self.params = yaml.load(file, Loader=yaml.Loader)
             # print(self.params)
 

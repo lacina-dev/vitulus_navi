@@ -32,6 +32,19 @@ from visualization_msgs.msg import Marker, MarkerArray
 from collections import deque
 
 
+def _navi_pkg_dir():
+    """vitulus_navi source dir from rospkg (not a fixed workspace name); the
+    historical path is the fallback, so a standard checkout resolves as before."""
+    try:
+        import rospkg
+        return rospkg.RosPack().get_path('vitulus_navi')
+    except Exception:
+        return '/home/vitulus/catkin_ws/src/vitulus/vitulus_navi'
+
+
+NAVI_PKG_DIR = _navi_pkg_dir()
+
+
 def cart2pol(x, y):
     rho = np.sqrt(x ** 2 + y ** 2)
     phi = np.arctan2(y, x)
@@ -664,14 +677,14 @@ class NavTfNode:
     def roslaunch_ekf(self):
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
         roslaunch.configure_logging(uuid)
-        self.launch_ekf = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_ekf_outdoor.launch"])
+        self.launch_ekf = roslaunch.parent.ROSLaunchParent(uuid, [os.path.join(NAVI_PKG_DIR, "launch", "vitulus_ekf_outdoor.launch")])
         self.launch_ekf.start()
         rospy.loginfo("<{}> EKF launched.".format(rospy.get_caller_id()))
 
     def roslaunch_navsat(self):
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
         roslaunch.configure_logging(uuid)
-        self.launch_navsat = roslaunch.parent.ROSLaunchParent(uuid, ["/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navsat.launch"])
+        self.launch_navsat = roslaunch.parent.ROSLaunchParent(uuid, [os.path.join(NAVI_PKG_DIR, "launch", "vitulus_navsat.launch")])
         self.launch_navsat.start()
         rospy.loginfo("<{}> Navsat launched.".format(rospy.get_caller_id()))
 

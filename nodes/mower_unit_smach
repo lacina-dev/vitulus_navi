@@ -103,6 +103,7 @@ def main():
                                    'temp_preempt': 'RETURN_TO_DOCK',
                                    'stop_preempt': 'STOPPED',
                                    'critical_error': 'CRITICAL_ERROR',
+                                   'mission_rejected': 'WAIT_FOR_PROGRAM',
                                    'preempted': 'TERMINAL_ERROR'
                                })
 

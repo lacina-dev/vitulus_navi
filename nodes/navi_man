@@ -224,6 +224,9 @@ class Node:
         # A map with no waypoints must show no waypoints, so points are dropped
         # the moment the served site stops matching this (2026-08-30).
         self._points_site = None
+        # (site, datum.yaml mtime) of the last import retry from the slow loop
+        # (served_site_import_tick) - one retry per state of the datum file.
+        self._import_retry_key = None
         self._served_site_warned = False   # one-time "no site served at boot" warn
         self._nomap_coords_warned = False  # one-time "no georef -> map_coords muted"
 
@@ -1881,6 +1884,33 @@ class Node:
             rospy.logwarn("navi_man site-native: import from served site '%s' "
                           "failed — keeping current running_map_data: %s", site, e)
 
+    def served_site_import_tick(self):
+        """Retry the served site's import until its waypoints are in memory.
+        Called from the slow loop. The import runs on boot and on a serving-site
+        change only; when datum.yaml did not exist at that moment nothing ever
+        retried it, although the import's own warning promises it
+        (vitulus-field#42: the waypoints are in map coordinates, they belong in
+        memory from the moment the map is served). One retry per state of the
+        datum file, so a site that cannot be imported does not flood the log."""
+        if self._legacy_maps or not _BUNDLE_OK:
+            return
+        site = self._served_site
+        if not site or self._points_site == site:
+            return
+        try:
+            dp = os.path.join(_bundle.site_dir(site), 'datum.yaml')
+            if not os.path.exists(dp):
+                return                   # still nothing to place the waypoints by
+            key = (site, os.path.getmtime(dp))
+        except Exception:
+            return
+        if key == self._import_retry_key:
+            return
+        self._import_retry_key = key
+        rospy.loginfo("navi_man site-native: datum.yaml of served site '%s' is "
+                      "there now — importing its waypoints/paths.", site)
+        self._import_served_site_bundle()
+
     def save_map_utm_pose(self):
         if not self.running_map_data.is_utm():
             # trans = tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
@@ -2323,6 +2353,17 @@ class Node:
 
     def callback_new_map(self, msg):
         if msg.data != "":
+            # Site-native gate (same as callback_load_map): there is ONE map,
+            # the served site. A legacy new map would restart the navi launch
+            # in mapping mode and replace running_map_data (waypoints, paths
+            # AND datum) with an empty one - a program started from the dock
+            # then lost its DOCK point (vitulus-field#42). The legacy boot
+            # ("INIT") only runs with legacy_maps=true, so no init bypass.
+            if not self._legacy_maps:
+                rospy.logwarn("navi_man: new_map('%s') REJECTED — "
+                              "legacy_maps=false (site-native).", msg.data)
+                self.status_msg_pub.publish("New map rejected (site-native).")
+                return
             # self.map_status = "Loading"
             ind_outd = "***env*INDOOR"
             if not self.indoor:
@@ -2579,6 +2620,7 @@ if __name__ == '__main__':
                 node.pub_map_status.publish(String(node.map_status))
                 node.set_map_status()
                 node.octomap_serve_tick()
+                node.served_site_import_tick()
                 node.publish_map()
                 node.rtabmap_settings_publish()
                 node.container_watchdog()

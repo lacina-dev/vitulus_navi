@@ -25,6 +25,10 @@ import threading
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAVI_MAN = os.path.join(HERE, '..', 'nodes', 'navi_man')
 
+sys.path.insert(0, HERE)
+import _ros_env  # noqa: E402
+_ros_env.ensure()
+
 
 def load(name, path):
     spec = importlib.util.spec_from_loader(

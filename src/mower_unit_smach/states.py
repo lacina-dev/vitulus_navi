@@ -1777,8 +1777,8 @@ class WaitForUndockedState(smach.State):
 
 def is_site_native_program(program):
     """Legacy programs carry "<name>***env*<ENV>" in map_name; a site-native
-    program carries the constant 'SITE' (no marker) and runs on whatever site
-    mapping_manager currently serves."""
+    program carries its owner site (older data: the constant 'SITE'), no
+    marker, and runs on the site mapping_manager currently serves."""
     return '***env*' not in (getattr(program, 'map_name', '') or '')
 
 
@@ -1795,6 +1795,17 @@ def get_served_site():
 
 
 NO_ACTIVE_MAP_TEXT = "Start rejected: no map is active - activate a map first"
+
+
+def no_active_map_text(program):
+    """Rejection text naming the map the program belongs to. The planner puts
+    the owner site into map_name (vitulus-field#46); programs saved before
+    that carry 'SITE' / 'New' and get the generic text."""
+    site = (getattr(program, 'map_name', '') or '').strip()
+    if not site or site in ('SITE', 'New') or '***env*' in site:
+        return NO_ACTIVE_MAP_TEXT
+    return ("Start rejected: no map is active - activate map '{}' "
+            "first".format(site))
 
 
 class CheckActiveMapState(smach.State):
@@ -1827,7 +1838,8 @@ class CheckActiveMapState(smach.State):
                 break
             if known:
                 rospy.sleep(0.5)   # latched topic answers at once: pace the re-check
-        return reject_mission(self, self.pubs, NO_ACTIVE_MAP_TEXT,
+        return reject_mission(self, self.pubs,
+                              no_active_map_text(userdata.program),
                               "Rejected: no active map", "no_active_map")
 
 

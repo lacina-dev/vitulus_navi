@@ -369,6 +369,21 @@ def test_site_native_planner():
         check('no active map (%s): stop_reason' % label,
               'rejected:no_active_map' in W.texts('/mower_smach/stop_reason'))
 
+    # vitulus-field#46: the program names its map -> the rejection names it too
+    out, vis, reason, dur = run_mission({DOCK: status_script([(0, 0)]), UNDOCK_PRG: PRG,
+                                         MAPSTAT: lambda t: serving(None)}, map_name='BACK')
+    check('no active map, program of BACK -> rejected, never undocks',
+          out == 'rejected' and vis == ['CHECK_ACTIVE_MAP'], (out, vis))
+    check('no active map, program of BACK: message names the map',
+          "Start rejected: no map is active - activate map 'BACK' first"
+          in W.texts('/nextion/log_info'), W.texts('/nextion/log_info'))
+    for tag in ('SITE', 'New', '', None, 'G***env*OUTDOOR'):
+        check('rejection text for map_name %r stays generic' % (tag,),
+              states.no_active_map_text(PlannerProgram(name='T1', map_name=tag or ''))
+              == states.NO_ACTIVE_MAP_TEXT)
+    check('rejection text without a program object stays generic',
+          states.no_active_map_text(None) == states.NO_ACTIVE_MAP_TEXT)
+
     # mapping_manager respawn: serving:null for a while, then the site is back
     out, vis, reason, dur = run_mission({DOCK: status_script([(0, 0)]),
                                          MAPSTAT: lambda t: serving('Nmap' if t >= 5.0 else None)})

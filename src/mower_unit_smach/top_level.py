@@ -147,6 +147,9 @@ class TerminalErrorState(smach.State):
                     if msg.data:
                         rospy.loginfo("[TERMINAL_ERROR] Reset received")
                         self.pubs.log_info.publish(String("Reset accepted. Returning to idle."))
+                        # The program is over: its latched name must not
+                        # outlive it (readers take it as "a program runs").
+                        self.pubs.active_program.publish(String(" "))
                         self.pubs.smach_status.publish(String("Ready"))
                         userdata.error_reason = ''
                         return 'reset'
@@ -221,6 +224,9 @@ class StoppedState(smach.State):
                         # immediately preempted again.
                         self._stop_pub.publish(Bool(False))
                         self.pubs.log_info.publish(String("Reset accepted. Ready for Run."))
+                        # The stopped program is over (Run sets the name
+                        # again): its latched name must not outlive it.
+                        self.pubs.active_program.publish(String(" "))
                         self.pubs.smach_status.publish(String("Ready"))
                         return 'resume'
                 except rospy.ROSException:

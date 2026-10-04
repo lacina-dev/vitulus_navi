@@ -23,6 +23,7 @@ Covers
   * MISSION_CONCURRENCE maps 'rejected' -> 'mission_rejected'
   * CRITICAL_ERROR routes UNDOCK_* to terminal (no docking attempt)
   * STOPPED / TERMINAL_ERROR report a Run request instead of dropping it
+  * Reset in STOPPED / TERMINAL_ERROR clears the latched active_program
   * WaitForTopic publishes periodic "Waiting for ..." status
 
 Run:  python3 test_mission_undock_gate.py   (needs the ROS python env: rospy,
@@ -682,6 +683,18 @@ def test_run_request_notice():
         check('%s: no developer-speak' % cls.__name__,
               not any('/mower_smach/reset' in s for s in logs), logs)
         check('%s: subscribers released' % cls.__name__, not W.subs, W.subs)
+        # Reset ends the program: the latched name must not outlive it (it is
+        # what "a program is running" means to master_controller, the agent
+        # and the field kit), and it is cleared before "Ready" is announced.
+        topics = [t for t, m in W.published]
+        check('%s: Reset clears active_program' % cls.__name__,
+              W.texts('/mower_smach/active_program')[-1:] == [' '],
+              W.texts('/mower_smach/active_program'))
+        check('%s: active_program cleared before Ready' % cls.__name__,
+              '/mower_smach/active_program' in topics and
+              topics.index('/mower_smach/active_program') <
+              max(i for i, (t, m) in enumerate(W.published)
+                  if t == '/mower_smach/status' and m.data == 'Ready'))
 
 
 def test_wait_status():

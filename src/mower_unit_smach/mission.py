@@ -26,7 +26,7 @@ from rtabmap_msgs.msg import Info
 from .helpers import (
     classify_mbf_result, safe_blade_shutdown, wait_for_mbf, MOWER_ERROR_STATES)
 from .states import (
-    VerifyAtPose, WaitForMowerStatus, WaitForTopic, RetryLimitedAction,
+    VerifyAtPose, WaitForMowerStatus, WaitForTopic, WaitForGpsFixState, RetryLimitedAction,
     GetZoneData, GetPathData, CheckDistance, WindowPlannerPath, TrimAndRetry,
     ExecutePathWithFeedback, WaitForRpmReached, WaitForMowerOff,
     CheckIfDockedState, WaitForPlannerLoaded, WaitForDockedState,
@@ -400,11 +400,11 @@ def build_mission_child_sm(pubs):
                 rospy.logwarn('[WAIT_FOR_GPS_FIX] Error parsing odom_status: %s', e)
             return False
 
+        # Adaptive budget (gps_wait.py): after a cold start the heading
+        # receiver reaches RTK only ~15-17 min after boot. Timeout sets
+        # GPS_NOT_READY -> CRITICAL_ERROR returns the robot to the dock.
         smach.StateMachine.add('WAIT_FOR_GPS_FIX',
-                               WaitForTopic('/nav_tf/odom_status',
-                                            Navi_transform,
-                                            predicate=_gps_pred, timeout=600.0,
-                                            pubs=pubs, wait_label='GPS fix'),
+                               WaitForGpsFixState(Navi_transform, _gps_pred, pubs),
                                transitions={
                                    'received': 'WAIT_FOR_PLANNER',
                                    'timeout': 'aborted',

@@ -25,6 +25,10 @@ Covers
   * STOPPED / TERMINAL_ERROR report a Run request instead of dropping it
   * Reset in STOPPED / TERMINAL_ERROR clears the latched active_program
   * WaitForTopic publishes periodic "Waiting for ..." status
+  * WAIT_FOR_GPS_FIX adaptive budget (gps_wait.py): base 600 s, extension on
+    receiver progress, cap since first GNSS data, progress every 30 s,
+    timeout -> GPS_NOT_READY; dock_smach GPS failure -> GPS_NOT_READY ->
+    CRITICAL_ERROR try_dock + stop_reason critical:gps_not_ready
 
 Run:  python3 test_mission_undock_gate.py   (needs the ROS python env: rospy,
       smach, vitulus_msgs ... importable; does NOT need a ROS master)
@@ -41,7 +45,8 @@ import smach
 import actionlib
 import json
 from std_msgs.msg import Int8, Bool, String
-from vitulus_msgs.msg import DockProgram, PlannerProgram, Power_status, Navi_transform
+from vitulus_msgs.msg import (DockProgram, PlannerProgram, Power_status, Navi_transform,
+                              Device_icon_status)
 
 
 # ---------------------------------------------------------------------------
@@ -491,12 +496,13 @@ def test_review_findings():
     check('F2: returns as soon as dock_smach confirms', out == 'preempted' and dur < 4.0,
           (out, '%.1fs' % dur))
 
-    # F3. slow but healthy undock (25 min) is NOT killed; the cap is a param
+    # F3. slow but healthy undock (cold-start GPS wait up to ~25 min + the
+    # undock drive) is NOT killed; the cap is a param
     out, vis, reason, dur = run_mission({
-        DOCK: status_script([(0, 0), (2, 1), (1500, 3)]), UNDOCK_PRG: PRG, MOTORS: MOTORS_ON})
-    check('F3: 1500 s undock still succeeds', 'LOAD_MAP' in vis and not cancelled(), vis)
+        DOCK: status_script([(0, 0), (2, 1), (2000, 3)]), UNDOCK_PRG: PRG, MOTORS: MOTORS_ON})
+    check('F3: 2000 s undock still succeeds', 'LOAD_MAP' in vis and not cancelled(), vis)
     out, vis, reason, dur = run_mission({DOCK: status_script([(0, 0), (2, 1)]), UNDOCK_PRG: PRG})
-    check('F3: absolute cap 1800 s', reason == 'UNDOCK_TIMEOUT' and 1800 <= dur < 1830,
+    check('F3: absolute cap 2400 s', reason == 'UNDOCK_TIMEOUT' and 2400 <= dur < 2430,
           (reason, dur))
     out, vis, reason, dur = run_mission({DOCK: status_script([(0, 0), (2, 1)]), UNDOCK_PRG: PRG},
                                         params={'~undock_timeout': 100.0})
@@ -716,6 +722,82 @@ def test_wait_status():
     check('WaitForTopic without label stays silent', not W.published, W.published)
 
 
+ICON = '/device_state_pub/icon_status'
+
+
+def gps_fix_pred(msg):
+    return msg.status == 'SAT'
+
+
+def run_gps_wait(icon_script, params=None, boot_to_entry=420.0, fused=None):
+    """GNSS data from t=0 (boot), the wait starts boot_to_entry later.
+    fused(t): odom_status SAT (default: both receivers RTK)."""
+    W.__init__()
+    W.params = dict(params or {})
+    fused = fused or (lambda t: icon_script(t) == ('RTK', 'RTK'))
+    W.script = {ICON: lambda t: Device_icon_status(**dict(zip(('gnss', 'gnss_nav'),
+                                                              icon_script(t))))}
+    W.script[GPS] = lambda t: (Navi_transform(status='SAT', info='0.5s,0.5s') if fused(t)
+                               else Navi_transform(status='ODOM', info='inf,inf'))
+    st = states.WaitForGpsFixState(Navi_transform, gps_fix_pred, MowerPublishers())
+    W.advance(1.0)                      # first GNSS data right after boot
+    W.advance(boot_to_entry - 1.0)
+    ud = smach.UserData()
+    ud.error_reason = ''
+    t0 = W.elapsed()
+    out = st.execute(ud)
+    return out, W.elapsed() - t0, ud.error_reason
+
+
+def test_gps_fix_wait():
+    out, dur, reason = run_gps_wait(lambda t: ('3DFIX', '3DFIX'))
+    check('GPS wait: no progress -> timeout at base 600 s',
+          out == 'timeout' and abs(dur - 600) < 2, (out, dur))
+    check('GPS wait: timeout -> GPS_NOT_READY', reason == 'GPS_NOT_READY', reason)
+    check('GPS wait: timeout told on the display',
+          any(s.startswith('RTK not ready in time') for s in W.texts('/nextion/log_info')))
+    prog = [s for s in W.texts('/mower_smach/status') if s.startswith('Waiting for RTK:')]
+    check('GPS wait: progress every 30 s (19-20x in 600 s)', 19 <= len(prog) <= 20, len(prog))
+    check('GPS wait: progress text', prog and prog[0].startswith(
+        'Waiting for RTK: main 3DFIX, heading 3DFIX - 0:30 / 10:00'), prog[:1])
+    # cold start: main RTK at 7 min, heading at 17 min after boot
+    out, dur, reason = run_gps_wait(
+        lambda t: ('RTK' if t >= 420 else '3DFIX', 'RTK' if t >= 1020 else '3DFIX'))
+    check('GPS wait: cold start (heading RTK at 17 min) -> received',
+          out == 'received' and dur > 600, (out, dur))
+    # main RTK only: extended to entry + 900 s
+    out, dur, reason = run_gps_wait(lambda t: ('RTK', '3DFIX'))
+    check('GPS wait: main RTK extends to 900 s', out == 'timeout' and abs(dur - 900) < 2,
+          (out, dur))
+    # heading flicker at 20 min: capped at boot + 1500 s
+    out, dur, reason = run_gps_wait(lambda t: ('RTK', 'RTK' if 1200 <= t < 1202 else '3DFIX'),
+                                    fused=lambda t: False)
+    check('GPS wait: cap = first GNSS data + 1500 s',
+          out == 'timeout' and abs(dur - (1500 - 420)) < 3, (out, dur))
+    # GNSS up for hours: no extension
+    out, dur, reason = run_gps_wait(lambda t: ('RTK', '3DFIX'), boot_to_entry=7200.0)
+    check('GPS wait: long uptime stays at base', abs(dur - 600) < 2, dur)
+    out, dur, reason = run_gps_wait(lambda t: ('3DFIX', '3DFIX'),
+                                    params={'~gps_wait_base_s': 120.0})
+    check('GPS wait: ~gps_wait_base_s param', abs(dur - 120) < 2, dur)
+
+    # dock_smach failed in UNDOCK_WAIT_FOR_GPS -> mission returns to dock
+    out, vis, reason, dur = run_mission({
+        DOCK: status_script([(0, 0), (2, 1), (20, 4), (21, 3)]), UNDOCK_PRG: PRG},
+        params={'/dock_smach/last_failure': 'gps_not_ready'})
+    check('dock_smach GPS failure -> GPS_NOT_READY', out == 'aborted' and
+          reason == 'GPS_NOT_READY' and 'LOAD_MAP' not in vis, (out, reason))
+    W.__init__()
+    st = top_level.CriticalErrorState(MowerPublishers())
+    ud = smach.UserData()
+    ud.error_reason = 'GPS_NOT_READY'
+    out = st.execute(ud)
+    check('CRITICAL_ERROR GPS_NOT_READY -> try_dock', out == 'try_dock', out)
+    check('stop_reason critical:gps_not_ready (master: recovery sleep, retry)',
+          W.texts('/mower_smach/stop_reason')[-1:] == ['critical:gps_not_ready'],
+          W.texts('/mower_smach/stop_reason'))
+
+
 if __name__ == '__main__':
     test_mission()
     test_site_native_planner()
@@ -725,6 +807,7 @@ if __name__ == '__main__':
     test_critical_routing()
     test_run_request_notice()
     test_wait_status()
+    test_gps_fix_wait()
     print('\n%s' % ('ALL PASSED' if not FAILS else 'FAILED: %s' % FAILS))
     sys.stdout.flush()
     os._exit(1 if FAILS else 0)   # smach_ros action states leave helper threads

@@ -2319,7 +2319,13 @@ class NavTfNode:
         self.imu_yaw = yaw
         self.publish_fused_navheading()
 
-    def transform_odom_to_base_link(self):
+    def transform_odom_to_base_link(self, stamp=None):
+        """Build odom->base_link for this tick and return it (None indoors).
+        TF-ATOMIC (2026-10-18): NOT broadcast here any more — loop30hz sends it
+        together with map->odom in ONE /tf message with the SAME stamp, see
+        loop30hz."""
+        if stamp is None:
+            stamp = rospy.Time.now()
         if not self.is_indoor:
             # msg = self.base_odom_msg
             # msg = self.filtered_wheel_odom_msg
@@ -2331,7 +2337,7 @@ class NavTfNode:
             msg = self.ekf_wheel_nav_odom_msg
             # msg = self.odom_fused_msg
             static_transformStamped = TransformStamped()
-            static_transformStamped.header.stamp = rospy.Time.now()
+            static_transformStamped.header.stamp = stamp
             static_transformStamped.header.frame_id = "odom"
             static_transformStamped.child_frame_id = "base_link"
             static_transformStamped.transform.translation.x = msg.pose.pose.position.x
@@ -2341,11 +2347,12 @@ class NavTfNode:
             static_transformStamped.transform.rotation.y = msg.pose.pose.orientation.y
             static_transformStamped.transform.rotation.z = msg.pose.pose.orientation.z
             static_transformStamped.transform.rotation.w = msg.pose.pose.orientation.w
-            self.tf2_TransformBroadcaster.sendTransform(static_transformStamped)
             # print(msg.pose.pose)
             msg.header.frame_id = "odom"
             msg.child_frame_id = "base_link"
             self.odometry_odom_pub.publish(msg)
+            return static_transformStamped
+        return None
 
     def get_base_link_transform(self, stamp=None):
         """odom->base_link. With a stamp (AUDIT P0-2, 2026-08-08) the lookup is
@@ -2432,7 +2439,11 @@ class NavTfNode:
             if pos_done and yaw_done:
                 self._map_pose_target = None   # reached target — stop slewing
 
-    def transform_map_to_odom(self):
+    def transform_map_to_odom(self, stamp=None):
+        """Build map->odom for this tick and return it (None indoors).
+        TF-ATOMIC (2026-10-18): broadcast by loop30hz together with odom->base."""
+        if stamp is None:
+            stamp = rospy.Time.now()
         if not self.is_indoor:
             odom_base_tf = self.get_base_link_transform()
             # FIX-7: snapshot (x, y, z, yaw) under the lock, then build + broadcast
@@ -2444,7 +2455,7 @@ class NavTfNode:
                 mx, my, mz = mt.x, mt.y, mt.z
                 myaw = self.map_odom_yaw
             map_odom_tf = TransformStamped()
-            map_odom_tf.header.stamp = rospy.Time.now()
+            map_odom_tf.header.stamp = stamp
             map_odom_tf.header.frame_id = "map"
             map_odom_tf.child_frame_id = "odom"
             map_odom_tf.transform.translation.x = mx
@@ -2462,8 +2473,8 @@ class NavTfNode:
             map_odom_tf.transform.rotation.z = q[2]
             map_odom_tf.transform.rotation.w = q[3]
 
-            self.tf2_TransformBroadcaster.sendTransform(map_odom_tf)
-
+            return map_odom_tf
+        return None
 
     def publish_odom_for_gps(self):
         # navsat_transform consumes this as its odometry input. It uses the
@@ -3037,16 +3048,39 @@ class NavTfNode:
 
     def loop30hz(self, event=None):
         self.publish_odom_for_gps()
-        self.transform_odom_to_base_link()
-        self.slew_map_pose()
-        # DOCKFIX-2026-08-29 (A2): the continuous dock hold runs AFTER the slew
-        # (so it overrides any leftover slew step) and BEFORE the broadcast, so
-        # the transform published this tick is the held one.
+        # TF-ATOMIC (2026-10-18, N1): odom->base and map->odom used to go out as
+        # TWO /tf messages, each stamped with its own rospy.Time.now(), with the
+        # slew + dock hold computed in between. A consumer could therefore see
+        # odom->base of tick N before map->odom of tick N. TEB transforms the
+        # robot pose (stamped = latest odom->base) into the map frame WITHOUT a
+        # timeout -> "Lookup would require extrapolation ~0.03 s into the
+        # future ... from [odom] to [map]" (= one 30 Hz period), the controller
+        # cycle is lost ("Could not transform the global plan"), and under CPU
+        # load the gap widens. Now both transforms carry ONE stamp and go out
+        # in ONE message, map->odom first, so whenever odom->base(t) is in a
+        # listener's buffer, map->odom(t) already is. Values are unchanged.
+        stamp = rospy.Time.now()
+        tf_out = []
+        odom_base_tf = self.transform_odom_to_base_link(stamp)
         try:
-            self.dock_anchor_hold()
-        except Exception as e:
-            rospy.logwarn_throttle(10.0, "[dock_hold] %s" % e)
-        self.transform_map_to_odom()
+            self.slew_map_pose()
+            # DOCKFIX-2026-08-29 (A2): the continuous dock hold runs AFTER the slew
+            # (so it overrides any leftover slew step) and BEFORE the broadcast, so
+            # the transform published this tick is the held one.
+            try:
+                self.dock_anchor_hold()
+            except Exception as e:
+                rospy.logwarn_throttle(10.0, "[dock_hold] %s" % e)
+            map_odom_tf = self.transform_map_to_odom(stamp)
+            if map_odom_tf is not None:
+                tf_out.append(map_odom_tf)
+        finally:
+            # odom->base goes out even if the slew raised (as before, when it
+            # was sent ahead of the slew).
+            if odom_base_tf is not None:
+                tf_out.append(odom_base_tf)
+            if tf_out:
+                self.tf2_TransformBroadcaster.sendTransform(tf_out)
         self.fused_nav_time = (int(str(rospy.Time.now())) - int(str(self.nav_last_fused_time))) / 1000000000
         self.fused_fix_time = (int(str(rospy.Time.now())) - int(str(self.fix_last_fused_time))) / 1000000000
         self.init_navsat()

@@ -27,7 +27,7 @@ from mower_unit_smach.top_level import (
     CriticalErrorState, TerminalErrorState, StoppedState,
     build_return_to_dock_with_stop)
 from mower_unit_smach.mission import (
-    build_wait_for_program, build_mission_concurrence)
+    build_wait_for_program, build_mission_concurrence, UserStopLatch)
 
 
 def main():
@@ -75,6 +75,9 @@ def main():
     pubs.smach_status.publish(String("Ready"))
     pubs.active_program.publish(String(" "))
 
+    # Every STOP re-preempts a running mission (vitulus-field#53).
+    stop_latch = UserStopLatch()
+
     with sm:
 
         # ==================== WAIT_FOR_PROGRAM ====================
@@ -94,7 +97,7 @@ def main():
                                })
 
         # ==================== MISSION_CONCURRENCE ====================
-        mission_cc = build_mission_concurrence(pubs, sm)
+        mission_cc = build_mission_concurrence(pubs, sm, stop_latch)
         smach.StateMachine.add('MISSION_CONCURRENCE', mission_cc,
                                transitions={
                                    'mission_complete': 'RETURN_TO_DOCK',
@@ -170,6 +173,11 @@ def main():
             # RETURN_TO_DOCK handle preemption internally and route to the
             # recoverable STOPPED state. A top-level preempt would bypass
             # STOPPED and kill the node.
+            # STOP_MONITOR fires once per mission; re-preempting only the
+            # mission child keeps every further STOP effective and still
+            # ends in STOPPED (vitulus-field#53).
+            if stop_latch.request():
+                rospy.logwarn("[GLOBAL_STOP] Mission preempt requested")
 
     rospy.Subscriber("/mower_smach/stop", Bool, stop_callback)
 

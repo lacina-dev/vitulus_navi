@@ -215,15 +215,26 @@ def first_lethal_index(check_path_proxy, path, safety_dist=0.10,
 # MBF result classification
 # ---------------------------------------------------------------------------
 def classify_mbf_result(action_name, status, result, log_pub=None):
-    """Map an MBF action result to ``'succeeded'`` / ``'aborted'``.
+    """Map an MBF action result to ``'succeeded'`` / ``'aborted'`` / ``None``.
 
     Logs the actual MBF outcome and message on failure.
+
+    A PREEMPTED goal returns None: smach_ros.SimpleActionState then decides
+    itself - 'preempted' when the container asked for the preempt (STOP,
+    battery, weather...), 'aborted' otherwise. SimpleActionState services
+    the preempt BEFORE the result_cb outcome replaces its own, so returning
+    'aborted' here swallowed the request and the mission went on to recovery
+    after a user STOP (vitulus-field#53).
     """
     succeeded_status = (status == actionlib.GoalStatus.SUCCEEDED)
     outcome = getattr(result, 'outcome', None) if result is not None else None
     message = getattr(result, 'message', '') if result is not None else ''
     if succeeded_status and outcome == 0:
         return 'succeeded'
+    if status == actionlib.GoalStatus.PREEMPTED:
+        rospy.logwarn("[%s] preempted: outcome=%s message=%r",
+                      action_name, outcome, message)
+        return None
     rospy.logwarn("[%s] aborted: status=%s outcome=%s message=%r",
                   action_name, status, outcome, message)
     if log_pub is not None:

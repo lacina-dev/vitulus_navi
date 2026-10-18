@@ -4,6 +4,8 @@ Mission construction: WAIT_FOR_PROGRAM, MISSION_CHILD_SM, and MISSION_CONCURRENC
 This module contains the factory functions that build the main mission flow
 and wrap it with concurrent monitors.
 """
+import threading
+
 import rospy
 import smach
 import smach_ros
@@ -1102,7 +1104,45 @@ def clear_stale_preempt(container):
         clear_stale_preempt(child)
 
 
-def build_mission_concurrence(pubs, parent_sm):
+class UserStopLatch(object):
+    """A user STOP seen while MISSION_CHILD runs (vitulus-field#53).
+
+    STOP_MONITOR reads /mower_smach/stop once per mission: after its first
+    'invalid' nobody in the mission listens any more, so a preempt lost
+    anywhere below MISSION_CHILD let the mission run to its end. The global
+    STOP handler calls request() on every STOP: it re-sends the preempt to
+    MISSION_CHILD and the concurrence outcome becomes 'stop_preempt' even
+    when STOP_MONITOR was preempted before its own callback fired.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._mission_child = None
+        self._requested = False
+
+    def attach(self, mission_child):
+        self._mission_child = mission_child
+
+    def reset(self):
+        with self._lock:
+            self._requested = False
+
+    def requested(self):
+        with self._lock:
+            return self._requested
+
+    def request(self):
+        """Preempt the running mission child; False when no mission runs."""
+        child = self._mission_child
+        if child is None or not child.is_running():
+            return False
+        with self._lock:
+            self._requested = True
+        child.request_preempt()
+        return True
+
+
+def build_mission_concurrence(pubs, parent_sm, stop_latch=None):
     """Wrap the mission child SM with concurrent monitors.
 
     Outcomes:
@@ -1118,6 +1158,9 @@ def build_mission_concurrence(pubs, parent_sm):
     """
 
     mission_child = build_mission_child_sm(pubs)
+    if stop_latch is None:
+        stop_latch = UserStopLatch()
+    stop_latch.attach(mission_child)
 
     def child_term_cb(outcome_map):
         # If ANY child finishes/triggers, terminate all others
@@ -1125,7 +1168,8 @@ def build_mission_concurrence(pubs, parent_sm):
 
     def outcome_cb(outcome_map):
         # Priority: STOP > TEMP > BATTERY > WEATHER > mission
-        if outcome_map.get('STOP_MONITOR') == 'invalid':
+        if (outcome_map.get('STOP_MONITOR') == 'invalid'
+                or stop_latch.requested()):
             pubs.stop_reason.publish(String("terminal:stop_signal"))
             return 'stop_preempt'
         if outcome_map.get('MOWER_TEMP_MONITOR') == 'invalid':
@@ -1165,8 +1209,11 @@ def build_mission_concurrence(pubs, parent_sm):
     )
     cc.userdata = parent_sm.userdata
     # Runs at the start of every execute(), before the children are started.
-    cc.register_start_cb(lambda ud, labels: clear_stale_preempt(mission_child),
-                         cb_args=[])
+    def _on_start(ud, labels):
+        clear_stale_preempt(mission_child)
+        stop_latch.reset()
+
+    cc.register_start_cb(_on_start, cb_args=[])
 
     with cc:
         smach.Concurrence.add('MISSION_CHILD', mission_child)

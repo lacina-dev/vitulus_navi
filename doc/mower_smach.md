@@ -275,7 +275,8 @@ Je idempotentní — opakované volání je bezpečné.
 |---|---|---|
 | `/web_plan/program_active` | ← vstup | Nový sekací program |
 | `/web_plan/program_active_unfinished` | ← vstup | Obnovení po pádu |
-| `/mower_smach/stop` | ← vstup | Nouzové zastavení |
+| `/mower_smach/stop` | ← vstup | Nouzové zastavení (neblokující: nůž off hned; `/dock_smach/stop` + preempt mise hned a jen když běží program; pomalé parkování nože ve vlákně, dávka STOPů = jeden běh — `global_stop.py`, 18. 10. 2026) |
+| `/mower_smach/busy` | → výstup | latched `true`, když automat není v WAIT_FOR_PROGRAM / STOPPED / TERMINAL_ERROR (podle toho supervisor a cmd_vel_mux posílají stop sekačky) |
 | `/mower_smach/reset` | ← vstup | Reset z karantény |
 | `/weather_alert/rain_alert` | ← vstup | Data o dešti |
 | `/pm/power_status` | ← vstup | Stav baterie |

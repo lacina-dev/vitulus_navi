@@ -14,6 +14,10 @@ Architecture:
   TERMINAL_ERROR (quarantine: buzzer + wait for /mower_smach/reset)
   STOPPED (recoverable pause after user STOP: wait for /mower_smach/reset)
 """
+import os
+import threading
+import time
+
 import rospy
 import smach
 import smach_ros
@@ -21,7 +25,8 @@ import smach_ros
 from std_msgs.msg import Bool, String
 
 from mower_unit_smach.publishers import MowerPublishers
-from mower_unit_smach.helpers import wait_for_mbf, safe_blade_shutdown
+from mower_unit_smach.helpers import wait_for_mbf, start_power_watch
+from mower_unit_smach.global_stop import GlobalStop
 from mower_unit_smach.states import PreStartCheck
 from mower_unit_smach.top_level import (
     CriticalErrorState, TerminalErrorState, StoppedState,
@@ -30,10 +35,27 @@ from mower_unit_smach.mission import (
     build_wait_for_program, build_mission_concurrence, UserStopLatch)
 
 
+# Top-level states in which no mowing program runs: a STOP there switches the
+# blade off and nothing else (no /dock_smach/stop) - 18. 10. 2026.
+IDLE_STATES = ('WAIT_FOR_PROGRAM', 'STOPPED', 'TERMINAL_ERROR')
+EXIT_GRACE_S = 3.0
+
+
+def sm_busy(sm):
+    """True while the top-level SM is in a non-idle state (a program runs)."""
+    try:
+        active = [s for s in (sm.get_active_states() or []) if s and s != 'None']
+    except Exception:  # noqa: BLE001 - unknown counts as busy
+        return True
+    return any(s not in IDLE_STATES for s in active)
+
+
 def main():
     rospy.init_node('mower_unit_smach')
     pubs = MowerPublishers()
     pubs.smach_status.publish(String("Starting..."))
+    pubs.busy.publish(Bool(False))
+    start_power_watch()
     wait_for_mbf()
 
     # ===================================================================
@@ -163,23 +185,46 @@ def main():
     # ===================================================================
     # Global STOP handler (for stops outside MISSION_CONCURRENCE)
     # ===================================================================
-    def stop_callback(msg):
-        if msg.data:
-            rospy.logwarn("[GLOBAL_STOP] Signal received, safe shutdown")
-            safe_blade_shutdown(source='GLOBAL_STOP', pubs=pubs)
-            pubs.dock_cancel.publish(Bool(data=True))
-            # NOTE: Do NOT call sm.request_preempt() here.
-            # The STOP MonitorStates inside MISSION_CONCURRENCE and
-            # RETURN_TO_DOCK handle preemption internally and route to the
-            # recoverable STOPPED state. A top-level preempt would bypass
-            # STOPPED and kill the node.
-            # STOP_MONITOR fires once per mission; re-preempting only the
-            # mission child keeps every further STOP effective and still
-            # ends in STOPPED (vitulus-field#53).
-            if stop_latch.request():
-                rospy.logwarn("[GLOBAL_STOP] Mission preempt requested")
+    # NOTE: Do NOT call sm.request_preempt() on STOP.
+    # The STOP MonitorStates inside MISSION_CONCURRENCE and RETURN_TO_DOCK
+    # handle preemption internally and route to the recoverable STOPPED
+    # state. A top-level preempt would bypass STOPPED and kill the node.
+    # STOP_MONITOR fires once per mission; re-preempting only the mission
+    # child (stop_latch) keeps every further STOP effective (vitulus-field#53).
+    # The callback never blocks (global_stop.py, 18. 10. 2026): blade off at
+    # once, /dock_smach/stop + preempt at once and only while a program runs,
+    # the slow blade parking on a worker thread.
+    global_stop = GlobalStop(pubs, stop_latch, lambda: sm_busy(sm))
+    rospy.Subscriber("/mower_smach/stop", Bool, global_stop.on_stop, queue_size=5)
 
-    rospy.Subscriber("/mower_smach/stop", Bool, stop_callback)
+    # /mower_smach/busy (latched) for the supervisor and cmd_vel_mux.
+    busy_state = {'last': None}
+
+    def busy_tick(_event):
+        busy = sm_busy(sm)
+        if busy != busy_state['last']:
+            busy_state['last'] = busy
+            pubs.busy.publish(Bool(data=busy))
+    rospy.Timer(rospy.Duration(0.5), busy_tick)
+
+    # rosnode kill / SIGTERM: blade off, preempt the SM, and if a state still
+    # sits in a blocking wait after EXIT_GRACE_S, end the process anyway (it
+    # used to hang until kill -9).
+    def on_shutdown():
+        try:
+            pubs.mower_set_motor_on.publish(Bool(False))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            sm.request_preempt()
+        except Exception:  # noqa: BLE001
+            pass
+
+        def hard_exit():
+            time.sleep(EXIT_GRACE_S)
+            os._exit(0)
+        threading.Thread(target=hard_exit, daemon=True).start()
+    rospy.on_shutdown(on_shutdown)
 
     # ===================================================================
     # Execute

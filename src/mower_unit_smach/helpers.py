@@ -304,9 +304,97 @@ def segmentize_raw_path(raw_path, segmentize_distance=0.03, outline_start_offset
 
 
 # ---------------------------------------------------------------------------
+# Mower power evidence (18. 10. 2026)
+#
+# A STOP sent to an idle mower with no power waited 5 s for /mower/status,
+# 5 s for the motor and 30 s for the blade height - for a board that cannot
+# answer - and only then went on.  The watch below keeps the latest evidence
+# from persistent subscribers so safe_blade_shutdown can tell "verified
+# unpowered" at once instead of waiting for timeouts.
+# ---------------------------------------------------------------------------
+import threading as _threading
+import time as _time
+
+POWER_EVIDENCE_MAX_AGE_S = 3.0     # /pm/power_status younger than this counts
+STATUS_SILENT_S = 3.0              # no /mower/status this long = silent
+
+
+class MowerPowerWatch(object):
+    """Latest /mower/status and /pm/power_status bat_out_switch (monotonic)."""
+
+    def __init__(self, clock=_time.monotonic):
+        self.clock = clock
+        self.lock = _threading.Lock()
+        self.started = None
+        self.last_status = None          # (t, Mower msg)
+        self.last_bat_out = None         # (t, bool)
+
+    def start(self):
+        self.started = self.clock()
+        rospy.Subscriber('/mower/status', Mower, self.on_status, queue_size=1)
+        try:
+            from vitulus_ups.msg import power_status
+            rospy.Subscriber('/pm/power_status', power_status, self.on_power,
+                             queue_size=1)
+        except ImportError:
+            rospy.logwarn('[MowerPowerWatch] vitulus_ups/power_status unavailable')
+        return self
+
+    def on_status(self, msg):
+        with self.lock:
+            self.last_status = (self.clock(), msg)
+
+    def on_power(self, msg):
+        with self.lock:
+            self.last_bat_out = (self.clock(), bool(getattr(msg, 'bat_out_switch', True)))
+
+    def fresh_status(self, max_age=STATUS_SILENT_S):
+        with self.lock:
+            last = self.last_status
+        if last is not None and self.clock() - last[0] <= max_age:
+            return last[1]
+        return None
+
+    def unpowered(self, program_running=True):
+        """(True, why) when the mower verifiably has no power, else (False, '').
+
+        * /pm/power_status bat_out_switch false (fresh) - always enough.
+        * /mower/status silent for STATUS_SILENT_S - enough only when no
+          mowing program runs (during a program silence may be a comm fault
+          with the blade spinning, so the full shutdown is kept).
+        """
+        now = self.clock()
+        with self.lock:
+            bat = self.last_bat_out
+            status = self.last_status
+        if bat is not None and now - bat[0] <= POWER_EVIDENCE_MAX_AGE_S and not bat[1]:
+            return True, 'bat_out_switch=false'
+        if not program_running and self.started is not None:
+            silent_since = status[0] if status is not None else self.started
+            if now - silent_since >= STATUS_SILENT_S:
+                return True, '/mower/status silent %.0f s' % (now - silent_since)
+        return False, ''
+
+
+_power_watch = {'watch': None}
+
+
+def start_power_watch():
+    """Start the process-wide MowerPowerWatch once (node init)."""
+    if _power_watch['watch'] is None:
+        _power_watch['watch'] = MowerPowerWatch().start()
+    return _power_watch['watch']
+
+
+def power_watch():
+    return _power_watch['watch']
+
+
+# ---------------------------------------------------------------------------
 # Safe blade shutdown
 # ---------------------------------------------------------------------------
-def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0, pubs=None):
+def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0, pubs=None,
+                        program_running=True):
     """Stop the cutting motor and raise the blade to max_height before power-off.
 
     The mower v4 firmware automatically triggers a HOME cycle whenever
@@ -322,10 +410,33 @@ def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0
               pre-existing publishers instead of creating temporary ones
               (avoids publisher leak on repeated calls).
 
+        program_running: False when no mowing program runs (the caller knows).
+              With the power watch running (start_power_watch), a mower that
+              verifiably has no power (MowerPowerWatch.unpowered) gets only
+              set_motor_on(False) and the call returns at once - nothing can
+              spin and nothing can HOME without power.
+
     Returns True on success, False on timeout.
     """
     caller = rospy.get_caller_id()
     log_prefix = '[{}][safe_blade_shutdown:{}]'.format(caller, source)
+
+    if pubs is not None:
+        pub_motor = pubs.mower_set_motor_on
+    else:
+        pub_motor = rospy.Publisher('/mower/set_motor_on', Bool, latch=True, queue_size=1)
+        rospy.sleep(0.1)
+
+    watch = power_watch()
+    s0 = None
+    if watch is not None:
+        off, why = watch.unpowered(program_running=program_running)
+        if off:
+            pub_motor.publish(Bool(False))
+            rospy.loginfo('{} mower unpowered ({}): set_motor_on(False) sent, '
+                          'nothing to wait for'.format(log_prefix, why))
+            return True
+        s0 = watch.fresh_status()
 
     # 1. Snapshot current mower state
     max_height = 80
@@ -333,7 +444,8 @@ def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0
     status0 = 'UNKNOWN'
     rpm0 = -1
     try:
-        s0 = rospy.wait_for_message('/mower/status', Mower, timeout=5.0)
+        if s0 is None:
+            s0 = rospy.wait_for_message('/mower/status', Mower, timeout=5.0)
         max_height = int(s0.max_height) if s0.max_height else 80
         current_height = int(s0.current_height)
         status0 = s0.status
@@ -346,11 +458,6 @@ def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0
         log_prefix, status0, current_height, max_height, rpm0))
 
     # 2. Stop the cutting motor
-    if pubs is not None:
-        pub_motor = pubs.mower_set_motor_on
-    else:
-        pub_motor = rospy.Publisher('/mower/set_motor_on', Bool, latch=True, queue_size=1)
-        rospy.sleep(0.1)
     pub_motor.publish(Bool(False))
     rospy.loginfo('{} published set_motor_on(False)'.format(log_prefix))
 

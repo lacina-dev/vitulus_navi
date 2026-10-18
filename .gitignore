@@ -14,3 +14,7 @@ __pycache__/
 # Backup files
 *.backupworking
 *.backup
+*.bak_*
+*_bak_*
+*.orig
+.claude/

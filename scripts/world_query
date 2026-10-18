@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""CLI nad `vitulus_navi.world_query` — dotazy na svět robota nad mapou.
+
+    rosrun vitulus_navi world_query locate [--goal TEST]
+    rosrun vitulus_navi world_query analyze [--goal TEST] [--radius 8]
+    rosrun vitulus_navi world_query reach --goal TEST [--start UNDOCK]
+    rosrun vitulus_navi world_query points
+
+Na stdout jde JSON (nástroje, agent, UI); `--text` vypíše jen českou větu.
+Jen čtení: odběry topiců, TF a soubory site bundle.  Nic nepublikuje,
+nevolá služby ani akce.  Návratový kód 0 = odpověď, 1 = chyba (v JSONu).
+"""
+import argparse
+import json
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PKG_SRC = os.path.join(os.path.dirname(_HERE), 'src', 'vitulus_navi')
+try:
+    from vitulus_navi import world_query
+except ImportError:
+    import vitulus_navi as _vn
+    if _PKG_SRC not in list(getattr(_vn, '__path__', [])):
+        _vn.__path__.append(_PKG_SRC)
+    from vitulus_navi import world_query
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Dotazy na svět robota nad mapou.')
+    parser.add_argument('query', choices=('locate', 'analyze', 'reach', 'points'))
+    parser.add_argument('--goal', default=None, help='jméno bodu nebo "x,y" v rámu map')
+    parser.add_argument('--start', default=None, help='jen reach: start jiný než robot')
+    parser.add_argument('--radius', type=float, default=8.0)
+    parser.add_argument('--timeout', type=float, default=2.0)
+    parser.add_argument('--site', default=None)
+    parser.add_argument('--text', action='store_true', help='jen česká věta')
+    args = parser.parse_args(argv)
+    world_query.mc.ensure_node('vitulus_world_query')
+    if args.query == 'locate':
+        out = world_query.locate(args.goal, args.timeout, args.site)
+    elif args.query == 'analyze':
+        out = world_query.analyze(args.goal, args.radius, args.timeout, args.site)
+    elif args.query == 'reach':
+        if not args.goal:
+            parser.error('reach potřebuje --goal')
+        out = world_query.reach(args.goal, args.start, args.timeout, args.site)
+    else:
+        out = world_query.points(args.timeout, args.site)
+    if args.text:
+        print(out.get('summary') or out.get('error') or out.get('reason') or '')
+    else:
+        print(json.dumps(out, ensure_ascii=False, indent=1, default=str))
+    return 0 if out.get('ok', True) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

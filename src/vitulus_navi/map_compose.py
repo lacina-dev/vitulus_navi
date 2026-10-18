@@ -130,6 +130,16 @@ C_LOCAL_PLAN = (255, 160, 40)
 C_SCAN = (255, 235, 90)
 C_OBJECT = (255, 70, 70)
 C_ROBOT = (255, 40, 40)
+# Překryv výsledků analýzy (`world_query`): navržená trasa, cíl, objížďka,
+# nová překážka, nejužší místo.  Barvy se nepotkávají s vrstvami výše.
+C_OV_ROUTE = (0, 200, 255)
+C_OV_ALT = (255, 90, 200)
+C_OV_GOAL = (255, 255, 0)
+C_OV_OBSTACLE = (255, 0, 90)
+C_OV_NARROW = (255, 140, 0)
+OVERLAY_COLOURS = {'route': C_OV_ROUTE, 'alt': C_OV_ALT, 'goal': C_OV_GOAL,
+                   'via': C_OV_ALT, 'obstacle': C_OV_OBSTACLE,
+                   'narrow': C_OV_NARROW}
 
 FONT_PATHS = ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
               '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf')
@@ -1054,6 +1064,57 @@ def _wrap(draw, text, font, max_px):
 # ---------------------------------------------------------------------------
 # legenda — všechno, co obrázek nedokáže říct sám za sebe
 # ---------------------------------------------------------------------------
+def _draw_overlay(draw, proj, overlay, font):
+    """Nakresli překryv analýzy; vrať řádky legendy.  Vadná položka se přeskočí."""
+    if not isinstance(overlay, dict):
+        return []
+    rows = []
+    seen = set()
+    for item in overlay.get('paths') or []:
+        try:
+            pts = [(float(a), float(b)) for a, b in item.get('points') or []]
+        except (TypeError, ValueError):
+            continue
+        if len(pts) < 2:
+            continue
+        style = item.get('style') or 'route'
+        colour = OVERLAY_COLOURS.get(style, C_OV_ROUTE)
+        _polyline(draw, proj, pts, (0, 0, 0), width=8)
+        _polyline(draw, proj, pts, colour, width=4)
+        label = str(item.get('label') or style)
+        if label not in seen:
+            rows.append((colour, 'analýza — %s' % label))
+            seen.add(label)
+    for item in overlay.get('markers') or []:
+        try:
+            x, y = float(item['x']), float(item['y'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        kind = item.get('kind') or 'goal'
+        colour = OVERLAY_COLOURS.get(kind, C_OV_GOAL)
+        px, py = proj.px(x, y)
+        if kind == 'obstacle':
+            draw.line([(px - 9, py - 9), (px + 9, py + 9)], fill=(0, 0, 0), width=6)
+            draw.line([(px - 9, py + 9), (px + 9, py - 9)], fill=(0, 0, 0), width=6)
+            draw.line([(px - 9, py - 9), (px + 9, py + 9)], fill=colour, width=3)
+            draw.line([(px - 9, py + 9), (px + 9, py - 9)], fill=colour, width=3)
+        else:
+            _dot(draw, px, py, 8, colour, outline=(0, 0, 0))
+        label = str(item.get('label') or '')
+        if label:
+            draw.text((px + 11, py - 9), label, fill=colour, font=font,
+                      stroke_width=2, stroke_fill=(0, 0, 0))
+        legend = {'goal': 'cíl', 'via': 'mezilehlý bod objížďky',
+                  'obstacle': 'překážka z analýzy (křížek)',
+                  'narrow': 'nejužší místo cesty'}.get(kind, kind)
+        if kind not in seen:
+            rows.append((colour, 'analýza — %s' % legend))
+            seen.add(kind)
+    for note in overlay.get('notes') or []:
+        rows.append((None, str(note)))
+    return rows
+
+
 def _legend_lines(status, requested, proj, stamp, site, robot):
     """Řádky (barva_vzorku nebo None, text) v pořadí čtení."""
     rows = [(None, 'Rám: %s · sever nahoru (+Y), východ vpravo (+X) · '
@@ -1151,7 +1212,7 @@ def normalise_layers(layers):
 
 def compose(layers=None, size=DEFAULT_WIDTH, center='robot',
             radius=DEFAULT_RADIUS_M, out=None, timeout_s=DEFAULT_TIMEOUT_S,
-            keep=DEFAULT_KEEP, site=None):
+            keep=DEFAULT_KEEP, site=None, overlay=None, prefetched=None):
     """Slož požadované vrstvy do jednoho PNG.  Vždy vrací dict, nikdy nevyhazuje.
 
         {ok: True,  path, layers, empty, missing, bbox, scale_m_per_px, size,
@@ -1164,11 +1225,17 @@ def compose(layers=None, size=DEFAULT_WIDTH, center='robot',
     `center`  'robot' = čtverec o straně 2·`radius` kolem robota,
               'map'   = celý obsah všech vrstev.
     `out`     cílový soubor; None = `output_dir()` s razítkem a úklidem.
+    `overlay` volitelný překryv výsledků analýzy (jen kreslení):
+              {'paths': [{'points': [[x, y], ...], 'label', 'style': route|alt}],
+               'markers': [{'x', 'y', 'label', 'kind': goal|via|obstacle|narrow}],
+               'notes': ['věta do legendy', ...]}
+    `prefetched` {vrstva: (payload, chyba)} už jednou přečtených vrstev —
+              volající, který data právě analyzoval, je nemusí číst podruhé.
     """
     stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
     try:
         return _compose(layers, size, center, radius, out, timeout_s,
-                        keep, site, stamp)
+                        keep, site, stamp, overlay, prefetched)
     except Exception as exc:                            # noqa: BLE001
         return {'ok': False, 'stamp': stamp, 'warnings': [],
                 'error': 'Neočekávaná chyba při skládání mapy: %s' % exc}
@@ -1201,7 +1268,8 @@ def _span_bounds(bounds, data, span_m):
     return (cx - half, cy - half, cx + half, cy + half), None
 
 
-def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp):
+def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
+             overlay=None, prefetched=None):
     requested, warnings = normalise_layers(layers)
     warnings = list(warnings)
 
@@ -1257,7 +1325,13 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp):
     if 'geofence' in requested:
         jobs['geofence'] = lambda: _collect_geofence(site, datum)
 
+    for name in list(jobs):
+        if prefetched and name in prefetched:
+            del jobs[name]
     data = _gather(jobs, timeout) if jobs else {}
+    for name, entry in (prefetched or {}).items():
+        if name in requested or (name == 'robot' and want_robot):
+            data[name] = entry
     for name in requested:
         if name not in data:
             data[name] = (None, 'vrstva neodpověděla ve svém limitu')
@@ -1405,6 +1479,8 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp):
                       stroke_width=2, stroke_fill=(0, 0, 0))
         status['lidar_objects']['note'] = 'objektů: %d' % len(objects['objects'])
 
+    overlay_rows = _draw_overlay(draw, proj, overlay, tiny)
+
     robot = payload_of('robot')
     if robot and 'robot' in requested:
         _draw_robot(draw, proj, robot)
@@ -1419,6 +1495,8 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp):
 
     # ---- legenda --------------------------------------------------------
     rows = _legend_lines(status, requested, proj, stamp, site, robot)
+    if overlay_rows:
+        rows = rows[:-1] + [(None, '—')] + overlay_rows + rows[-1:]
     row_h = max(19, _measure(draw, 'Ag', small)[1] + 8)
     wrapped = []
     for colour, text in rows:

@@ -157,6 +157,21 @@ def build_wait_for_program(pubs):
     return cc
 
 
+def set_iterated_state(label, state, loop_outcomes):
+    """smach.Iterator.set_contained_state that survives a preempt.
+
+    smach.Iterator ends the loop when a preempt is pending and returns the
+    LAST outcome of the contained state - a loop outcome ('continue') that is
+    not an outcome of the iterator, so smach raised InvalidTransitionError and
+    the whole mower state machine died with the robot out in the field
+    (vitulus-field#54). A loop outcome can only be final on that preempt
+    break, so map every loop outcome to 'preempted'.
+    """
+    smach.Iterator.set_contained_state(
+        label, state, loop_outcomes=loop_outcomes,
+        final_outcome_map={o: 'preempted' for o in loop_outcomes})
+
+
 # ===========================================================================
 # MISSION_CHILD_SM (the main mission flow)
 # ===========================================================================
@@ -481,9 +496,8 @@ def build_mission_child_sm(pubs):
 
         with zone_it:
             process_zone_sm = _build_process_zone_sm(pubs, zone_it)
-            smach.Iterator.set_contained_state(
-                'PROCESS_ZONE', process_zone_sm,
-                loop_outcomes=['continue'])
+            set_iterated_state('PROCESS_ZONE', process_zone_sm,
+                               loop_outcomes=['continue'])
 
         smach.StateMachine.add('ZONE_IT', zone_it,
                                transitions={
@@ -736,9 +750,8 @@ def _build_process_zone_sm(pubs, zone_it):
 
         with path_it:
             process_path_sm = _build_process_path_sm(pubs, path_it)
-            smach.Iterator.set_contained_state(
-                'PROCESS_PATH', process_path_sm,
-                loop_outcomes=['continue_path', 'aborted_path'])
+            set_iterated_state('PROCESS_PATH', process_path_sm,
+                               loop_outcomes=['continue_path', 'aborted_path'])
 
         smach.StateMachine.add('PATH_IT', path_it,
                                transitions={

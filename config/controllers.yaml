@@ -14,7 +14,8 @@ controllers:
 
 
 
-controller_frequency: 30.0
+# 15 Hz: TEB při zátěži 10–15 nestíhal 30 Hz (18. 10.: medián 51 ms, p90 114 ms proti 33 ms; 42× za jízdu); při 0,4 m/s = 2,7 cm na cyklus
+controller_frequency: 15.0
 controller_patience: 6.0
 
 oscillation_timeout: 10.0

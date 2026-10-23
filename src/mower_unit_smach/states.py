@@ -2046,10 +2046,29 @@ class WaitForDockedState(smach.State):
 class CheckForDockPoint(smach.State):
     """Check if a DOCK waypoint exists in the map point list."""
 
+    # navi_man publishes the (not latched) list every 5 s of ROS time, while
+    # wait_for_message times out on the wall clock: a single 5 s wait missed the
+    # message ~10 % of the time (sim, RTF 1.0). Keep the last list from a
+    # subscription and wait longer than two publish periods only if none is fresh.
+    MAX_AGE = 12.0      # s ROS time, > 2 publish periods
+    WAIT_TIMEOUT = 12.0  # s wall clock, > 2 publish periods
+
     def __init__(self, pubs):
         smach.State.__init__(self,
                              outcomes=['dock_point_found', 'no_dock_point', 'preempted'])
         self.pubs = pubs
+        self._last_msg = None
+        self._last_stamp = None
+        rospy.Subscriber('/navi_manager/map_point_str_list', StringList, self._point_list_cb)
+
+    def _point_list_cb(self, msg):
+        self._last_msg = msg
+        self._last_stamp = rospy.get_time()
+
+    def _fresh_point_list(self):
+        if self._last_msg is None or rospy.get_time() - self._last_stamp > self.MAX_AGE:
+            return None
+        return self._last_msg
 
     def execute(self, userdata):
         if self.preempt_requested():
@@ -2057,8 +2076,10 @@ class CheckForDockPoint(smach.State):
             return 'preempted'
         rospy.loginfo('[CheckForDockPoint] Checking for DOCK point')
         try:
-            msg = rospy.wait_for_message(
-                '/navi_manager/map_point_str_list', StringList, timeout=5.0)
+            msg = self._fresh_point_list()
+            if msg is None:
+                msg = rospy.wait_for_message(
+                    '/navi_manager/map_point_str_list', StringList, timeout=self.WAIT_TIMEOUT)
             if 'DOCK' in msg.string_list:
                 self.pubs.log_info.publish(String("DOCK point found."))
                 return 'dock_point_found'

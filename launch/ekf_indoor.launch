@@ -2,6 +2,8 @@
 
    <!-- Ekf -->
     <node pkg="robot_localization" type="ekf_localization_node" name="ekf_localization_indoor" clear_params="true">
+        <!-- "Received set_pose request" INFO off (WARN/ERROR stay), see the config -->
+        <env name="ROSCONSOLE_CONFIG_FILE" value="$(find vitulus_navi)/config/rosconsole_quiet_ekf.config"/>
         <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base_indoor.yaml" />
         <remap from="/odometry/filtered" to="/odometry/odom" />
     </node>

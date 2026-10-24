@@ -6,7 +6,7 @@
 
 <!--  </node>-->
 
-  <node name="move_base_flex" pkg="mbf_costmap_nav" type="mbf_costmap_nav" respawn="false" output="screen">-->
+  <node name="move_base_flex" pkg="mbf_costmap_nav" type="mbf_costmap_nav" respawn="false" output="log">-->
       <rosparam file="$(find vitulus_navi)/config/costmap_common_params.yaml" command="load" ns="global_costmap" />
       <rosparam file="$(find vitulus_navi)/config/costmap_common_params.yaml" command="load" ns="local_costmap" />
       <rosparam file="$(find vitulus_navi)/config/local_costmap_params.yaml" command="load" />

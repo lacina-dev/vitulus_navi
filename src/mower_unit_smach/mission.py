@@ -109,6 +109,23 @@ def build_wait_for_program(pubs):
                 except (TypeError, ValueError):
                     userdata.unfinished_window = 0
                 userdata.unfinished_active = True
+                # The checkpoint may belong to an older path set (zones are
+                # regenerated after a map change): resume only where it exists.
+                zone = next((z for z in msg.zone_list if z.name == zone_name), None)
+                try:
+                    path_idx = int(path_idx_str)
+                except (TypeError, ValueError):
+                    path_idx = -1
+                if zone is None:
+                    rospy.logwarn('[MONITOR_PROGRAM_UNFINISHED] zone %s no longer in '
+                                  'the program - mowing the whole program', zone_name)
+                    userdata.unfinished_active = False
+                elif not 0 <= path_idx < len(zone.paths):
+                    rospy.logwarn('[MONITOR_PROGRAM_UNFINISHED] path %s not in zone %s '
+                                  '(%d paths) - resuming at the zone start',
+                                  path_idx_str, zone_name, len(zone.paths))
+                    userdata.unfinished_path = '0'
+                    userdata.unfinished_window = 0
 
         userdata.program.last_result = 'failed: on_init'
         pubs.active_program.publish(String(msg.name))
@@ -678,6 +695,9 @@ def _build_process_zone_sm(pubs, zone_it):
         # --- SET_CUT_HEIGHT ---
         @smach.cb_interface(input_keys=['zone_cut_height'], outcomes=['done', 'preempted'])
         def set_height_cb(ud):
+            if ud.zone_cut_height is None:
+                rospy.loginfo('[SET_CUT_HEIGHT] no height set, keeping current')
+                return 'done'
             rospy.loginfo('[SET_CUT_HEIGHT] height=%d', ud.zone_cut_height)
             pubs.mower_set_height.publish(Int16(ud.zone_cut_height))
             pubs.log_info.publish(String("Setting mower height"))
@@ -702,6 +722,10 @@ def _build_process_zone_sm(pubs, zone_it):
         # --- SET_RPM + MOTOR ON ---
         @smach.cb_interface(input_keys=['zone_rpm'], outcomes=['done', 'preempted'])
         def set_rpm_cb(ud):
+            if ud.zone_rpm is None:
+                rospy.loginfo('[SET_RPM] no rpm set, keeping current')
+                pubs.smach_status.publish(String("Set rpm"))
+                return 'done'
             rospy.loginfo('[SET_RPM] rpm=%d', ud.zone_rpm)
             pubs.mower_set_rpm.publish(Int16(ud.zone_rpm))
             pubs.smach_status.publish(String("Set rpm"))

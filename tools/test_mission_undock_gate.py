@@ -179,6 +179,17 @@ def status_script(steps):
     return f
 
 
+def mowable(**kw):
+    """A program with one zone and one path: CHECK_ACTIVE_MAP rejects a
+    program with nothing to mow before it gets to the map check."""
+    from vitulus_msgs.msg import MapEditZone
+    from nav_msgs.msg import Path
+    from geometry_msgs.msg import PoseStamped
+    prog = PlannerProgram(**kw)
+    prog.zone_list = [MapEditZone(name='Z1', paths=[Path(poses=[PoseStamped()])])]
+    return prog
+
+
 MAPSTAT = '/mapping_manager/status'
 PLANNER = '/web_plan/planner_loaded'
 GPS = '/nav_tf/odom_status'
@@ -200,7 +211,7 @@ def run_mission(script, map_name='SITE', params=None, dead_after=None, preempt_i
         W.script.setdefault(MAPSTAT, lambda t: serving('Nmap'))   # a site is served
     pubs = MowerPublishers()
     sm = mission.build_mission_child_sm(pubs)
-    sm.userdata.program = PlannerProgram(name='T1', map_name=map_name)
+    sm.userdata.program = mowable(name='T1', map_name=map_name)
     visited = []
 
     sm.register_transition_cb(lambda ud, active: visited.extend(active), cb_args=[])
@@ -534,7 +545,7 @@ def test_review_findings():
     st = states.PreStartCheck(pubs)
     W.script = {PM: lambda t: PS(battery_capacity=20, supply_status='OFFLINE')}
     ud = smach.UserData()
-    ud.program = PlannerProgram(name='T1')
+    ud.program = mowable(name='T1')
     out = st.execute(ud)
     check('F7: low battery -> rejected', out == 'rejected', out)
     check('F7: stop_reason string unchanged (master_controller parses it)',
@@ -563,7 +574,7 @@ def test_review_findings():
 
 def make_parent():
     parent = smach.StateMachine(outcomes=['x'])
-    parent.userdata.program = PlannerProgram(name='T1', map_name='SITE')
+    parent.userdata.program = mowable(name='T1', map_name='SITE')
     for k in ('prg_start_time', 'unfinished_active', 'unfinished_zone', 'unfinished_path',
               'unfinished_window', 'path_window_start_index', 'path_chunk',
               'restore_height_pending', 'consecutive_nav_failures'):

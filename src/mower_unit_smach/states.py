@@ -421,16 +421,20 @@ class GetZoneData(smach.State):
         zone = userdata.program.zone_list[userdata.index]
         # If the program has override_zone set, the program-level cut_height/rpm
         # take precedence over the per-zone values.
-        if getattr(userdata.program, 'override_zone', False):
-            userdata.zone_cut_height = userdata.program.cut_height
-            userdata.zone_rpm = userdata.program.rpm
-            rospy.loginfo('[GetZoneData] override_zone active: using program '
-                          'cut_height=%d rpm=%d (zone defaults %d/%d ignored)',
-                          userdata.program.cut_height, userdata.program.rpm,
-                          zone.cut_height, zone.rpm)
-        else:
-            userdata.zone_cut_height = zone.cut_height
-            userdata.zone_rpm = zone.rpm
+        # A value <= 0 means "not set": fall back to the zone, and when the zone
+        # has none either keep the mower's current setting (None = not sent).
+        override = getattr(userdata.program, 'override_zone', False)
+        cut_height = userdata.program.cut_height if override else 0
+        rpm = userdata.program.rpm if override else 0
+        if cut_height <= 0:
+            cut_height = zone.cut_height
+        if rpm <= 0:
+            rpm = zone.rpm
+        userdata.zone_cut_height = cut_height if cut_height > 0 else None
+        userdata.zone_rpm = rpm if rpm > 0 else None
+        rospy.loginfo('[GetZoneData] zone %s: cut_height=%s rpm=%s (override=%s)',
+                      zone.name, userdata.zone_cut_height, userdata.zone_rpm,
+                      override)
         userdata.zone_name = zone.name
         userdata.paths = zone.paths
 
@@ -572,7 +576,8 @@ class GetPathData(smach.State):
         if userdata.unfinished_active and str(userdata.index_path) == userdata.unfinished_path:
             rospy.loginfo('[GetPathData] Resuming path %s window %s',
                           userdata.unfinished_path, userdata.unfinished_window)
-            userdata.path_window_start_index = userdata.unfinished_window
+            userdata.path_window_start_index = max(
+                0, min(int(userdata.unfinished_window), len(path.poses) - 1))
             userdata.path_start_pose = path.poses[userdata.path_window_start_index]
             userdata.unfinished_active = False
 
@@ -1078,8 +1083,9 @@ class ExecutePathWithFeedback(smach.State):
         # After successful chunk: restore height if pending from BLOCKED Phase 2
         if outcome == 0:
             if getattr(userdata, 'restore_height_pending', False):
-                rospy.loginfo("[EXE] restoring cut height to %d", userdata.zone_cut_height)
-                self.pubs.mower_set_height.publish(Int16(userdata.zone_cut_height))
+                if userdata.zone_cut_height is not None:
+                    rospy.loginfo("[EXE] restoring cut height to %d", userdata.zone_cut_height)
+                    self.pubs.mower_set_height.publish(Int16(userdata.zone_cut_height))
                 userdata.restore_height_pending = False
             # Genuine forward progress on a full chunk → reset the navigation
             # failure escalation counter (moved here from NAV_RECOVERY so a
@@ -1469,7 +1475,8 @@ class WaitForRpmReached(smach.State):
 
     def execute(self, userdata):
         deadline = rospy.Time.now() + rospy.Duration(self.timeout)
-        target = int(userdata.zone_rpm)
+        # None = rpm not set by the program/zone: any running blade counts.
+        target = int(userdata.zone_rpm) if userdata.zone_rpm is not None else None
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
             if self.preempt_requested():
                 self.service_preempt()
@@ -1481,11 +1488,12 @@ class WaitForRpmReached(smach.State):
             if msg.status in MOWER_ERROR_STATES:
                 rospy.logwarn('[WaitForRpmReached] FW error: %s', msg.status)
                 return 'error'
-            if target - 100 < msg.moto_rpm < target + 100:
+            if (msg.moto_rpm > 1000 if target is None
+                    else target - 100 < msg.moto_rpm < target + 100):
                 self.pubs.log_info.publish(String("Mowing started..."))
                 self.pubs.smach_status.publish(String("Mowing started"))
                 return 'reached'
-        rospy.logwarn('[WaitForRpmReached] timeout (%.1fs) target=%d', self.timeout, target)
+        rospy.logwarn('[WaitForRpmReached] timeout (%.1fs) target=%s', self.timeout, target)
         return 'timeout'
 
 
@@ -1915,6 +1923,19 @@ class CheckActiveMapState(smach.State):
         self.pubs = pubs
 
     def execute(self, userdata):
+        # Nothing to mow -> never leave the dock (an empty program used to
+        # undock, run zero zones and report "succeeded").
+        zones = list(userdata.program.zone_list)
+        if not zones:
+            return reject_mission(self, self.pubs,
+                                  "Start rejected: the program has no zones",
+                                  "Rejected: program has no zones", "no_zones")
+        for zone in zones:
+            if not zone.paths:
+                return reject_mission(
+                    self, self.pubs,
+                    "Start rejected: zone '{}' has no mowing paths".format(zone.name),
+                    "Rejected: zone without paths", "no_paths")
         if not is_site_native_program(userdata.program):
             return 'ok'
         deadline = rospy.Time.now() + rospy.Duration(self.NO_SITE_GRACE)

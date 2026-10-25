@@ -94,6 +94,26 @@ def tracker_budget_limits(c0_m, per_m, per_rot_m, yaw0_deg, yaw_per_rot,
     return lim_m, lim_deg
 
 
+def georef_map_odom_xy(utm_odom_xy, utm_map_xy, map_yaw):
+    """map->odom translation from the GPS georef (vitulus-field#32).
+
+    utm_map_xy / map_yaw are the site datum: the map origin in UTM and the map
+    axes' rotation within the UTM grid (in practice the UTM grid convergence at
+    the site: the map/odom frames are true-north ENU, the grid is not). The
+    vector utm_odom - utm_map is in UTM GRID axes; map->odom needs it in MAP
+    axes, i.e. rotated by -map_yaw:
+
+        t = R(-map_yaw) . (utm_odom - utm_map)
+
+    Without the rotation the error is 2*sin(|map_yaw|/2)*|t|: ~0 when the stack
+    starts at the map origin (dock), 0.81 m for a start 23 m away at a site
+    with 2.01 deg convergence. Returns (tx, ty)."""
+    dx = utm_odom_xy[0] - utm_map_xy[0]
+    dy = utm_odom_xy[1] - utm_map_xy[1]
+    c, s = math.cos(map_yaw), math.sin(map_yaw)
+    return (c * dx + s * dy, -s * dx + c * dy)
+
+
 class NavTfNode:
 
     def __init__(self):
@@ -1278,14 +1298,18 @@ class NavTfNode:
             p_z = 0
 
             if (msg.pose.position.x + msg.pose.position.y + msg.pose.position.z) != 0:
-                p_x = trans.transform.translation.x - msg.pose.position.x
-                p_y = trans.transform.translation.y - msg.pose.position.y
+                # #32: express the UTM-grid offset in MAP axes (rotate by
+                # -map_yaw, the datum's grid convergence) — see georef_map_odom_xy.
+                p_x, p_y = georef_map_odom_xy(
+                    (trans.transform.translation.x, trans.transform.translation.y),
+                    (msg.pose.position.x, msg.pose.position.y), map_yaw)
                 p_z = trans.transform.translation.z - msg.pose.position.z
 
             rospy.loginfo_throttle(5,
                 f"[map->odom] utm_odom=({trans.transform.translation.x:.3f}, {trans.transform.translation.y:.3f}) "
                 f"utm_map=({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}) "
                 f"map_odom=({p_x:.3f}, {p_y:.3f}) "
+                f"map_yaw={math.degrees(map_yaw):.2f}deg "
                 f"yaw_diff={math.degrees(yaw_offset):.2f}deg "
                 f"navsat_running={self.launch_navsat is not None}")
 

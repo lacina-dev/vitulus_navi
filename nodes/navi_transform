@@ -114,6 +114,182 @@ def georef_map_odom_xy(utm_odom_xy, utm_map_xy, map_yaw):
     return (c * dx + s * dy, -s * dx + c * dy)
 
 
+# ---- UTM frame observability (/nav_tf/georef_status, vitulus-field#32) -----
+# WGS84 <-> UTM with the USGS series robot_localization's navsat_conversions
+# uses (the same as ~/vitulus-field/tools/gps-map-probe), so the "map vs GPS"
+# deviation here is the probe's dD.
+_UTM_A, _UTM_E2, _UTM_K0 = 6378137.0, 0.00669438, 0.9996
+_UTM_BANDS = 'CDEFGHJKLMNPQRSTUVWX'
+
+
+def utm_zone_of(lon):
+    return int((lon + 180.0) / 6.0) + 1
+
+
+def utm_band_of(lat):
+    """MGRS latitude band letter (C..X, 8 deg each from 80 S; X is 12 deg)."""
+    if lat is None or not (-80.0 <= lat <= 84.0):
+        return None
+    return _UTM_BANDS[min(int((lat + 80.0) / 8.0), len(_UTM_BANDS) - 1)]
+
+
+def utm_central_meridian(zone):
+    return (zone - 1) * 6 - 180 + 3
+
+
+def ll_to_utm(lat, lon, zone=None):
+    """lat/lon [deg] -> (easting, northing, zone); a given zone forces it."""
+    a, ecc2, k0 = _UTM_A, _UTM_E2, _UTM_K0
+    if zone is None:
+        zone = utm_zone_of(lon)
+    latr, lonr = math.radians(lat), math.radians(lon)
+    lon0r = math.radians(utm_central_meridian(zone))
+    ecc2p = ecc2 / (1 - ecc2)
+    N = a / math.sqrt(1 - ecc2 * math.sin(latr) ** 2)
+    T = math.tan(latr) ** 2
+    C = ecc2p * math.cos(latr) ** 2
+    A = math.cos(latr) * (lonr - lon0r)
+    M = a * ((1 - ecc2 / 4 - 3 * ecc2 ** 2 / 64 - 5 * ecc2 ** 3 / 256) * latr
+             - (3 * ecc2 / 8 + 3 * ecc2 ** 2 / 32 + 45 * ecc2 ** 3 / 1024) * math.sin(2 * latr)
+             + (15 * ecc2 ** 2 / 256 + 45 * ecc2 ** 3 / 1024) * math.sin(4 * latr)
+             - (35 * ecc2 ** 3 / 3072) * math.sin(6 * latr))
+    e = k0 * N * (A + (1 - T + C) * A ** 3 / 6
+                  + (5 - 18 * T + T * T + 72 * C - 58 * ecc2p) * A ** 5 / 120) + 500000.0
+    n = k0 * (M + N * math.tan(latr) * (A * A / 2 + (5 - T + 9 * C + 4 * C * C) * A ** 4 / 24
+                                         + (61 - 58 * T + T * T + 600 * C - 330 * ecc2p) * A ** 6 / 720))
+    if lat < 0:
+        n += 10000000.0
+    return e, n, zone
+
+
+def utm_to_ll(e, n, zone, north=True):
+    """Inverse of ll_to_utm (USGS footpoint series) -> (lat, lon) [deg]."""
+    a, ecc2, k0 = _UTM_A, _UTM_E2, _UTM_K0
+    ecc2p = ecc2 / (1 - ecc2)
+    e1 = (1 - math.sqrt(1 - ecc2)) / (1 + math.sqrt(1 - ecc2))
+    x = e - 500000.0
+    y = n if north else n - 10000000.0
+    M = y / k0
+    mu = M / (a * (1 - ecc2 / 4 - 3 * ecc2 ** 2 / 64 - 5 * ecc2 ** 3 / 256))
+    phi1 = (mu + (3 * e1 / 2 - 27 * e1 ** 3 / 32) * math.sin(2 * mu)
+            + (21 * e1 ** 2 / 16 - 55 * e1 ** 4 / 32) * math.sin(4 * mu)
+            + (151 * e1 ** 3 / 96) * math.sin(6 * mu))
+    N1 = a / math.sqrt(1 - ecc2 * math.sin(phi1) ** 2)
+    T1 = math.tan(phi1) ** 2
+    C1 = ecc2p * math.cos(phi1) ** 2
+    R1 = a * (1 - ecc2) / (1 - ecc2 * math.sin(phi1) ** 2) ** 1.5
+    D = x / (N1 * k0)
+    lat = phi1 - (N1 * math.tan(phi1) / R1) * (
+        D * D / 2 - (5 + 3 * T1 + 10 * C1 - 4 * C1 * C1 - 9 * ecc2p) * D ** 4 / 24
+        + (61 + 90 * T1 + 298 * C1 + 45 * T1 * T1 - 252 * ecc2p - 3 * C1 * C1) * D ** 6 / 720)
+    lon = (D - (1 + 2 * T1 + C1) * D ** 3 / 6
+           + (5 - 2 * C1 + 28 * T1 - 3 * C1 * C1 + 8 * ecc2p + 24 * T1 * T1) * D ** 5 / 120) / math.cos(phi1)
+    return math.degrees(lat), utm_central_meridian(zone) + math.degrees(lon)
+
+
+def utm_convergence(lat, lon, zone):
+    """Grid convergence [rad, CCW from true north to grid north]: the angle
+    the UTM grid is turned against the true-north ENU map frame. The same
+    formula as the UI (mapping.js _mapTrueYaw) — gamma = atan(tan(dlon) sin(lat))."""
+    dl = math.radians(lon - utm_central_meridian(zone))
+    return math.atan(math.tan(dl) * math.sin(math.radians(lat)))
+
+
+def utm_to_map_xy(e, n, utm_e, utm_n, yaw):
+    """vitulus_mapping.geo.utm_to_map: UTM -> map through the datum."""
+    dx, dy = e - utm_e, n - utm_n
+    c, s = math.cos(yaw), math.sin(yaw)
+    return c * dx + s * dy, -s * dx + c * dy
+
+
+def georef_status(datum, georef, fix, ant_xy, loc, now_s, fix_max_age_s=3.0):
+    """/nav_tf/georef_status payload (pure; vitulus-field#32 observability).
+
+    datum   dict from the site datum.yaml (utm_zone, origin_lat/lon, ...) or None
+    georef  (utm_e, utm_n, yaw_rad, src) of the georef map->odom actually uses
+            (live navi-map map_coords or the site datum), or None
+    fix     (lat, lon, status, stamp_s, rtk_usable) of the last /gnss/fix, or None
+    ant_xy  (x, y) of the GNSS antenna in map (TF map->gnss), or None
+    loc     dict: owner, docked, gps_good, proven
+    Returns a JSON-able dict. dev_m = |GPS -> map  -  antenna in map| (the
+    gps-map-probe dD), only while GPS holds the pose; otherwise None + reason."""
+    datum = datum or {}
+    out = {'stamp': round(now_s, 3), 'owner': loc.get('owner'),
+           'utm_zone': None, 'utm_band': None, 'hemisphere': None, 'zone_src': None,
+           'utm_e': None, 'utm_n': None, 'georef_src': None,
+           'map_yaw_deg': None, 'convergence_deg': None, 'manual_yaw_deg': None,
+           'origin_lat': None, 'origin_lon': None,
+           'dev_m': None, 'dev_dx': None, 'dev_dy': None, 'dev_raw_m': None,
+           'gps_x': None, 'gps_y': None, 'ant_x': None, 'ant_y': None,
+           'reason': None, 'fix_status': None, 'fix_age_s': None}
+    if georef is None:
+        out['reason'] = 'no_datum'
+        return out
+    ue, un, yaw, src = georef
+    out.update(utm_e=round(ue, 3), utm_n=round(un, 3), georef_src=src,
+               map_yaw_deg=round(math.degrees(yaw), 4))
+    # zone: the datum's own, else from the map origin's longitude, else the fix
+    olat, olon = datum.get('origin_lat'), datum.get('origin_lon')
+    zone, zsrc = datum.get('utm_zone'), 'datum'
+    if zone is None and olon is not None:
+        zone, zsrc = utm_zone_of(float(olon)), 'origin'
+    if zone is None and fix is not None:
+        zone, zsrc = utm_zone_of(fix[1]), 'navsat'
+    if zone is not None:
+        zone = int(zone)
+        # hemisphere: the origin's latitude, else the fix; no hint = north
+        north = (float(olat) >= 0.0) if olat is not None else \
+            ((fix[0] >= 0.0) if fix is not None else True)
+        out.update(utm_zone=zone, zone_src=zsrc, hemisphere='N' if north else 'S')
+        if olat is None or olon is None:
+            try:
+                olat, olon = utm_to_ll(ue, un, zone, north)
+            except (ValueError, ZeroDivisionError):
+                olat = olon = None
+        if olat is not None and olon is not None:
+            olat, olon = float(olat), float(olon)
+            g = utm_convergence(olat, olon, zone)
+            out.update(origin_lat=round(olat, 8), origin_lon=round(olon, 8),
+                       utm_band=utm_band_of(olat),
+                       convergence_deg=round(math.degrees(g), 4),
+                       manual_yaw_deg=round(math.degrees(yaw - g), 4))
+    # deviation map vs GPS
+    if fix is not None:
+        out['fix_status'] = fix[2]
+        out['fix_age_s'] = round(now_s - fix[3], 2)
+    if ant_xy is not None:
+        out.update(ant_x=round(ant_xy[0], 3), ant_y=round(ant_xy[1], 3))
+    if fix is not None and zone is not None and ant_xy is not None \
+            and not (math.isnan(fix[0]) or math.isnan(fix[1])) \
+            and now_s - fix[3] <= fix_max_age_s:
+        e, n, _ = ll_to_utm(fix[0], fix[1], zone)
+        gx, gy = utm_to_map_xy(e, n, ue, un, yaw)
+        dx, dy = gx - ant_xy[0], gy - ant_xy[1]
+        out.update(gps_x=round(gx, 3), gps_y=round(gy, 3))
+        if fix[4]:     # an RTK-fixed position: worth a number even when not counted
+            out['dev_raw_m'] = round(math.hypot(dx, dy), 3)
+        holding = bool(loc.get('gps_good')) and bool(loc.get('proven')) \
+            and not loc.get('docked') and bool(fix[4])
+        if holding:
+            out.update(dev_m=out['dev_raw_m'], dev_dx=round(dx, 3), dev_dy=round(dy, 3))
+    if out['dev_m'] is None:
+        # the dock first: there it is the normal state, whatever the GPS does
+        if loc.get('docked'):
+            out['reason'] = 'docked'
+        elif fix is None or now_s - fix[3] > fix_max_age_s \
+                or math.isnan(fix[0]) or math.isnan(fix[1]):
+            out['reason'] = 'no_fix'
+        elif not fix[4]:
+            out['reason'] = 'no_rtk'
+        elif not (loc.get('gps_good') and loc.get('proven')):
+            out['reason'] = 'gps_not_holding'
+        elif zone is None:
+            out['reason'] = 'no_zone'
+        else:
+            out['reason'] = 'no_tf'
+    return out
+
+
 class NavTfNode:
 
     def __init__(self):
@@ -389,6 +565,8 @@ class NavTfNode:
         self._site_datum_file = os.path.expanduser(rospy.get_param(
             '~site_datum_file', '~/.vitulus/saves/site_datum.yaml'))
         self._site_datum = None          # PoseStamped built from datum.yaml
+        self._site_datum_dict = None     # the raw datum.yaml (zone, origin lat/lon)
+        self._last_fix = None            # (lat, lon, status, t, rtk_usable) for georef_status
         self._site_datum_mtime = 0.0
         self._map_coords_rx_t = 0.0      # last LIVE nonzero map_coords receive
         # 3.0 -> 8.0 (2026-07-06): roof-edge RTK flaps run longer than 3 s and
@@ -412,6 +590,8 @@ class NavTfNode:
         self._probation_tol_abs_m = float(rospy.get_param('~probation_tol_abs_m', 0.1))
         self._probation_tol_frac = float(rospy.get_param('~probation_tol_frac', 0.2))
         self._datum_live_window_s = float(rospy.get_param('~datum_live_window_s', 10.0))
+        self._map_frame_georef = 'map'
+        self._gnss_frame = rospy.get_param('~gnss_frame', 'gnss')   # /gnss/fix frame_id
         self._rtk_fresh_s = float(rospy.get_param('~rtk_fresh_s', 2.0))
         # WP2 (localization v2): source-tagged /nav_tf/set_map_pose arbitration.
         # Corrections arrive on per-source topics (dock/tracker/rtabmap) + the
@@ -670,6 +850,10 @@ class NavTfNode:
         # health, so downstream stops string-parsing bridge_status. Published at
         # 1 Hz from loop1hz (see publish_loc_status).
         self.loc_status_pub = rospy.Publisher("/nav_tf/loc_status", String, queue_size=1, latch=True)
+        # vitulus-field#32: the UTM frame of the map (zone, origin, map rotation
+        # in the grid vs the grid convergence) + the live map-vs-GPS deviation
+        # (gps-map-probe dD). JSON, latched, 1 Hz from loop1hz.
+        self.georef_status_pub = rospy.Publisher("/nav_tf/georef_status", String, queue_size=1, latch=True)
         # FIX4 (telemfix): edge-triggered loc_status. Baseline stays 1 Hz; on an
         # owner-change edge publish_loc_status is called immediately so an
         # ownership transition is not smeared into the next 1 Hz tick.
@@ -1224,6 +1408,7 @@ class NavTfNode:
             ps.pose.orientation.z = q[2]
             ps.pose.orientation.w = q[3]
             self._site_datum = ps
+            self._site_datum_dict = d
             self._site_datum_mtime = mtime
             rospy.logwarn('[navi_transform] site datum loaded from %s: '
                           'utm=(%.2f, %.2f) alt=%.2f yaw=%.2fdeg',
@@ -1817,6 +2002,41 @@ class NavTfNode:
         except Exception as e:
             rospy.logwarn_throttle(10.0, "[loc_status] %s" % e)
 
+    def publish_georef_status(self):
+        """/nav_tf/georef_status (vitulus-field#32): which UTM frame the map
+        sits in and how far the GPS is from the robot's map pose. Uses only
+        what the node already has: the georef map->odom uses, the site datum,
+        the last /gnss/fix and one TF lookup map->gnss."""
+        try:
+            now_s = rospy.get_time()
+            georef = None
+            m = self.map_coords_msg
+            if m is not None and (m.pose.position.x + m.pose.position.y) != 0:
+                q = m.pose.orientation
+                yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+                live = now_s - self._map_coords_rx_t < self._datum_live_window_s
+                georef = (m.pose.position.x, m.pose.position.y, yaw,
+                          'navi_map' if live else 'datum')
+            elif self._site_datum is not None:
+                p = self._site_datum.pose
+                q = p.orientation
+                georef = (p.position.x, p.position.y,
+                          euler_from_quaternion([q.x, q.y, q.z, q.w])[2], 'datum')
+            ant = None
+            try:
+                t = self.tf2_Buffer.lookup_transform(self._map_frame_georef, self._gnss_frame,
+                                                     rospy.Time(0))
+                ant = (t.transform.translation.x, t.transform.translation.y)
+            except Exception:
+                ant = None
+            st = georef_status(self._site_datum_dict, georef, self._last_fix, ant,
+                               {'owner': self._current_owner(), 'docked': self._docked,
+                                'gps_good': self._gps_stable(), 'proven': self._gps_proven},
+                               now_s)
+            self.georef_status_pub.publish(String(data=json.dumps(st)))
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[georef_status] %s" % e)
+
     def _current_owner(self):
         """FIX4 (telemfix): owner predicate for edge detection — identical logic
         to publish_loc_status (gps > dock > freshest map_pose source > dr)."""
@@ -1896,6 +2116,8 @@ class NavTfNode:
         # applies RTK position + the IMU-fused heading, so anchoring position on
         # this alone is safe and keeps the pose on RTK far more of the time.
         self.position_fix_usable = position_usable
+        self._last_fix = (msg.latitude, msg.longitude, msg.status.status,
+                          rospy.get_time(), position_usable)
         self.position_fix_usable_history.pop(0)
         self.position_fix_usable_history.append(position_usable)
         self._update_gps_probation(msg, position_usable)
@@ -2933,6 +3155,7 @@ class NavTfNode:
         # 30 Hz hold (service call at 1 Hz max, never in the hot loop).
         node_gnss.refresh_dock_anchor()
         node_gnss.publish_loc_status()
+        node_gnss.publish_georef_status()
         # FIX-8: silent no-TF trap watchdog. If is_indoor is still True 30 s after
         # start, nothing (navi_man map load) flipped us outdoor — transform_map_to_odom
         # is suppressing the map->odom broadcast. Warn loudly and repeatedly so a

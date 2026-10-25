@@ -137,9 +137,18 @@ C_OV_ALT = (255, 90, 200)
 C_OV_GOAL = (255, 255, 0)
 C_OV_OBSTACLE = (255, 0, 90)
 C_OV_NARROW = (255, 140, 0)
+# Skica plánu (map_canvas): to, co si agent do mapy sám nakreslil.  Jantarová,
+# ať se nepotká s plánem (zelená), objížďkou (růžová) ani cílem (žlutá).
+C_SKETCH = (255, 176, 0)
+C_SKETCH_WARN = (255, 70, 70)
+C_SKETCH_INFO = (120, 200, 255)
+C_AXES = (255, 255, 255, 62)
+C_AXES_MAJOR = (255, 255, 255, 110)
 OVERLAY_COLOURS = {'route': C_OV_ROUTE, 'alt': C_OV_ALT, 'goal': C_OV_GOAL,
                    'via': C_OV_ALT, 'obstacle': C_OV_OBSTACLE,
-                   'narrow': C_OV_NARROW}
+                   'narrow': C_OV_NARROW, 'sketch': C_SKETCH,
+                   'warn': C_SKETCH_WARN, 'info': C_SKETCH_INFO,
+                   'dock': (245, 245, 245)}
 
 FONT_PATHS = ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
               '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf')
@@ -1062,6 +1071,111 @@ def _wrap(draw, text, font, max_px):
 
 
 # ---------------------------------------------------------------------------
+# souřadnicová mřížka (axes=True) — ať jde souřadnice přečíst z obrázku
+# ---------------------------------------------------------------------------
+AXES_MARGIN = (66, 30, 66, 34)          # vlevo, nahoře, vpravo, dole (px)
+AXES_TARGET_LINES = 9                   # kolik čar zhruba přes delší stranu
+
+
+def axes_step(span_m, target=AXES_TARGET_LINES):
+    """Krok mřížky 1/2/5 × 10^n tak, aby přes `span_m` vyšlo ~`target` čar."""
+    try:
+        raw = float(span_m) / max(1, int(target))
+    except (TypeError, ValueError):
+        return 1.0
+    if raw <= 0:
+        return 1.0
+    exponent = math.floor(math.log10(raw))
+    for mult in (1.0, 2.0, 5.0, 10.0):
+        candidate = mult * (10 ** exponent)
+        if candidate >= 0.95 * raw:             # 9.006 m / 9 čar je pořád metr
+            return candidate
+    return 10 ** (exponent + 1)
+
+
+def _ticks(lo, hi, step):
+    first = math.ceil(lo / step - 1e-9) * step
+    out, value = [], first
+    while value <= hi + 1e-9:
+        out.append(0.0 if abs(value) < 1e-9 else round(value, 6))
+        value += step
+    return out
+
+
+def _draw_axes_grid(Image, ImageDraw, canvas, proj):
+    """Polopropustné čáry mřížky přes mapu; vrať krok v metrech.
+
+    Kreslí se do RGBA vrstvy a slévá, ať čára přes zelenou volnou plochu
+    i přes šedé nezmapované zůstane vidět a nic pod sebou nepřebije.  Osa
+    x = 0 a y = 0 je výraznější — počátek rámu `map` (dok/start mapy).
+    """
+    west, south, east, north = proj.bbox
+    step = axes_step(max(east - west, north - south))
+    layer = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
+    pen = ImageDraw.Draw(layer)
+    for x in _ticks(west, east, step):
+        px, _ = proj.px(x, 0.0)
+        colour = C_AXES_MAJOR if abs(x) < 1e-9 else C_AXES
+        pen.line([(px, proj.y0), (px, proj.y0 + proj.height)], fill=colour,
+                 width=2 if abs(x) < 1e-9 else 1)
+    for y in _ticks(south, north, step):
+        _, py = proj.px(0.0, y)
+        colour = C_AXES_MAJOR if abs(y) < 1e-9 else C_AXES
+        pen.line([(proj.x0, py), (proj.x0 + proj.width, py)], fill=colour,
+                 width=2 if abs(y) < 1e-9 else 1)
+    canvas.paste(layer, (0, 0), layer)
+    return step
+
+
+def _fmt_tick(value):
+    return ('%g' % round(value, 3)).replace('-', '−')
+
+
+def _draw_axes_labels(draw, proj, step, offset, font, tiny):
+    """Čísla os do okraje: x nahoře i dole, y vlevo i vpravo."""
+    ox, oy = offset
+    west, south, east, north = proj.bbox
+    top, bottom = oy, oy + proj.height
+    left, right = ox, ox + proj.width
+    draw.rectangle([left - 1, top - 1, right, bottom], outline=LINE)
+    for x in _ticks(west, east, step):
+        px = ox + proj.px(x, 0.0)[0]
+        text = _fmt_tick(x)
+        tw, th = _measure(draw, text, tiny)
+        draw.line([(px, top - 5), (px, top)], fill=INK, width=1)
+        draw.line([(px, bottom), (px, bottom + 5)], fill=INK, width=1)
+        draw.text((px - tw / 2.0, top - 7 - th - 3), text, fill=INK, font=tiny)
+        draw.text((px - tw / 2.0, bottom + 6), text, fill=INK, font=tiny)
+    for y in _ticks(south, north, step):
+        py = oy + proj.px(0.0, y)[1]
+        text = _fmt_tick(y)
+        tw, th = _measure(draw, text, tiny)
+        draw.line([(left - 5, py), (left, py)], fill=INK, width=1)
+        draw.line([(right, py), (right + 5, py)], fill=INK, width=1)
+        draw.text((left - 8 - tw, py - th / 2.0 - 2), text, fill=INK, font=tiny)
+        draw.text((right + 8, py - th / 2.0 - 2), text, fill=INK, font=tiny)
+    draw.text((left, bottom + 19), 'x [m] →', fill=DIM, font=tiny)
+    draw.text((4, top - 24), 'y [m] ↑', fill=DIM, font=tiny)
+
+
+def _explicit_bounds(bounds):
+    """(west, south, east, north) z n-tice nebo dictu, nebo None."""
+    if not bounds:
+        return None
+    try:
+        if isinstance(bounds, dict):
+            west, south = float(bounds['west']), float(bounds['south'])
+            east, north = float(bounds['east']), float(bounds['north'])
+        else:
+            west, south, east, north = [float(v) for v in bounds]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if east - west < 1e-3 or north - south < 1e-3:
+        return None
+    return west, south, east, north
+
+
+# ---------------------------------------------------------------------------
 # legenda — všechno, co obrázek nedokáže říct sám za sebe
 # ---------------------------------------------------------------------------
 def _draw_overlay(draw, proj, overlay, font):
@@ -1082,7 +1196,12 @@ def _draw_overlay(draw, proj, overlay, font):
         _polyline(draw, proj, pts, (0, 0, 0), width=8)
         _polyline(draw, proj, pts, colour, width=4)
         label = str(item.get('label') or style)
-        if label not in seen:
+        if style in ('sketch', 'warn', 'info'):
+            _label(draw, proj.px(*pts[0]), item.get('label'), colour, font, dx=6, dy=-20)
+            if 'sketch_path' not in seen:
+                rows.append((colour, 'skica — trasa (lomená čára)'))
+                seen.add('sketch_path')
+        elif label not in seen:
             rows.append((colour, 'analýza — %s' % label))
             seen.add(label)
     for item in overlay.get('markers') or []:
@@ -1098,20 +1217,101 @@ def _draw_overlay(draw, proj, overlay, font):
             draw.line([(px - 9, py + 9), (px + 9, py - 9)], fill=(0, 0, 0), width=6)
             draw.line([(px - 9, py - 9), (px + 9, py + 9)], fill=colour, width=3)
             draw.line([(px - 9, py + 9), (px + 9, py - 9)], fill=colour, width=3)
+        elif kind == 'dock':
+            draw.rectangle([px - 9, py - 9, px + 9, py + 9], fill=(0, 0, 0),
+                           outline=colour, width=3)
+            draw.line([(px - 4, py), (px + 4, py)], fill=colour, width=2)
+        elif kind in ('sketch', 'warn', 'info'):
+            _dot(draw, px, py, 9, (0, 0, 0))
+            _dot(draw, px, py, 7, colour)
+            _dot(draw, px, py, 2.5, (0, 0, 0))
         else:
             _dot(draw, px, py, 8, colour, outline=(0, 0, 0))
         label = str(item.get('label') or '')
         if label:
-            draw.text((px + 11, py - 9), label, fill=colour, font=font,
+            # dok stojí na waypointu „docked" se svým popiskem vpravo — DOK nad
+            lx, ly = (px - 14, py - 30) if kind == 'dock' else (px + 11, py - 9)
+            draw.text((lx, ly), label, fill=colour, font=font,
                       stroke_width=2, stroke_fill=(0, 0, 0))
         legend = {'goal': 'cíl', 'via': 'mezilehlý bod objížďky',
                   'obstacle': 'překážka z analýzy (křížek)',
-                  'narrow': 'nejužší místo cesty'}.get(kind, kind)
+                  'narrow': 'nejužší místo cesty',
+                  'sketch': 'bod (tečka se středem, popisek vedle)',
+                  'warn': 'bod, který kontrolou neprošel',
+                  'info': 'pomocný bod',
+                  'dock': 'DOK — nabíjecí stanice (čtverec)'}.get(kind, kind)
         if kind not in seen:
-            rows.append((colour, 'analýza — %s' % legend))
+            prefix = ('skica — ' if kind in ('sketch', 'warn', 'info') else
+                      '' if kind == 'dock' else 'analýza — ')
+            rows.append((colour, prefix + legend))
             seen.add(kind)
+    rows.extend(_draw_sketch_parts(draw, proj, overlay, font, seen))
     for note in overlay.get('notes') or []:
         rows.append((None, str(note)))
+    return rows
+
+
+def _xy_list(raw):
+    try:
+        return [(float(a), float(b)) for a, b in raw or []]
+    except (TypeError, ValueError):
+        return []
+
+
+def _label(draw, xy, text, colour, font, dx=11, dy=-9):
+    if not text:
+        return
+    draw.text((xy[0] + dx, xy[1] + dy), str(text), fill=colour, font=font,
+              stroke_width=3, stroke_fill=(0, 0, 0))
+
+
+def _draw_sketch_parts(draw, proj, overlay, font, seen):
+    """Polygony, šipky a texty překryvu (skica plánu z `map_canvas`).
+
+    Každá položka nese `label`; jméno se kreslí u položky, ne jen v legendě —
+    model odkazuje na „bod 2", tak ho musí najít v obrázku, ne v textu pod ním.
+    """
+    rows = []
+    for item in overlay.get('polygons') or []:
+        ring = _xy_list(item.get('points'))
+        if len(ring) < 3:
+            continue
+        colour = OVERLAY_COLOURS.get(item.get('style') or 'sketch', C_SKETCH)
+        _polyline(draw, proj, ring, (0, 0, 0), width=7, closed=True)
+        _polyline(draw, proj, ring, colour, width=3, closed=True)
+        # Popisek u nejsevernějšího vrcholu, ne v těžišti: tam už je jméno zóny,
+        # kterou plocha skici často obkresluje, a dva popisky přes sebe nejdou číst.
+        top = max(ring, key=lambda p: p[1])
+        _label(draw, proj.px(*top), item.get('label'), colour, font, dx=-10, dy=-24)
+        if 'polygon' not in seen:
+            rows.append((colour, 'skica — plocha (obrys)'))
+            seen.add('polygon')
+    for item in overlay.get('arrows') or []:
+        pts = _xy_list(item.get('points'))
+        if len(pts) < 2:
+            continue
+        colour = OVERLAY_COLOURS.get(item.get('style') or 'sketch', C_SKETCH)
+        _polyline(draw, proj, pts, (0, 0, 0), width=8)
+        _polyline(draw, proj, pts, colour, width=4)
+        (ax, ay), (bx, by) = proj.px(*pts[-2]), proj.px(*pts[-1])
+        ang = math.atan2(by - ay, bx - ax)
+        head = 16.0
+        left = (bx - head * math.cos(ang - 0.45), by - head * math.sin(ang - 0.45))
+        right = (bx - head * math.cos(ang + 0.45), by - head * math.sin(ang + 0.45))
+        draw.polygon([(bx, by), left, right], fill=colour, outline=(0, 0, 0))
+        mid = proj.px(0.5 * (pts[0][0] + pts[-1][0]), 0.5 * (pts[0][1] + pts[-1][1]))
+        _label(draw, mid, item.get('label'), colour, font, dx=6, dy=-18)
+        if 'arrow' not in seen:
+            rows.append((colour, 'skica — šipka (směr jízdy)'))
+            seen.add('arrow')
+    for item in overlay.get('texts') or []:
+        try:
+            x, y = float(item['x']), float(item['y'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        colour = OVERLAY_COLOURS.get(item.get('style') or 'sketch', C_SKETCH)
+        _label(draw, proj.px(x, y), item.get('text') or item.get('label'),
+               colour, font, dx=0, dy=-8)
     return rows
 
 
@@ -1212,11 +1412,12 @@ def normalise_layers(layers):
 
 def compose(layers=None, size=DEFAULT_WIDTH, center='robot',
             radius=DEFAULT_RADIUS_M, out=None, timeout_s=DEFAULT_TIMEOUT_S,
-            keep=DEFAULT_KEEP, site=None, overlay=None, prefetched=None):
+            keep=DEFAULT_KEEP, site=None, overlay=None, prefetched=None,
+            bounds=None, axes=False):
     """Slož požadované vrstvy do jednoho PNG.  Vždy vrací dict, nikdy nevyhazuje.
 
         {ok: True,  path, layers, empty, missing, bbox, scale_m_per_px, size,
-         frame, site, stamp, robot, legend, warnings[], bytes}
+         frame, site, stamp, robot, legend, warnings[], bytes, transform}
         {ok: False, stamp, warnings[], error: '<jednořádkový český důvod>'}
 
     `layers`  seznam nebo 'a,b,c'; 'all' = všechno.
@@ -1231,11 +1432,21 @@ def compose(layers=None, size=DEFAULT_WIDTH, center='robot',
                'notes': ['věta do legendy', ...]}
     `prefetched` {vrstva: (payload, chyba)} už jednou přečtených vrstev —
               volající, který data právě analyzoval, je nemusí číst podruhé.
+              Vrstva i robot, které jsou v `prefetched`, se z ROSu nečtou
+              vůbec (ani TF se nestaví) — render z uložených dat jde bez ROSu.
+    `bounds`  (west, south, east, north) v metrech rámu `map` — přesný výřez;
+              přebije `center`/`radius` (výřez kolem bodu/zóny, `map_canvas`).
+    `axes`    True = souřadnicová mřížka s popisky os v metrech kolem mapy,
+              ať jde z obrázku přečíst souřadnice bodu.  Mapa se pak kreslí
+              s okrajem; kde přesně leží, říká `transform`.
+
+    `transform` ve výsledku: pixel (px, py) celého PNG <-> metry v `map`:
+        x = cx + (px - x0 - w/2) · m_per_px,   y = cy - (py - y0 - h/2) · m_per_px
     """
     stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
     try:
         return _compose(layers, size, center, radius, out, timeout_s,
-                        keep, site, stamp, overlay, prefetched)
+                        keep, site, stamp, overlay, prefetched, bounds, axes)
     except Exception as exc:                            # noqa: BLE001
         return {'ok': False, 'stamp': stamp, 'warnings': [],
                 'error': 'Neočekávaná chyba při skládání mapy: %s' % exc}
@@ -1269,7 +1480,7 @@ def _span_bounds(bounds, data, span_m):
 
 
 def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
-             overlay=None, prefetched=None):
+             overlay=None, prefetched=None, bounds=None, axes=False):
     requested, warnings = normalise_layers(layers)
     warnings = list(warnings)
 
@@ -1292,14 +1503,15 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
     site = site or active_site()
     datum = _datum(site)
     timeout = max(0.2, float(timeout_s))
-    needs_tf = {'robot', 'lidar', 'lidar_objects'} & set(requested)
+    given = prefetched or {}
+    needs_tf = ({'robot', 'lidar', 'lidar_objects'} & set(requested)) - set(given)
     if needs_tf:
         _prime_tf(timeout)
     # Robota potřebuje i ořez kolem robota, i když si o vrstvu nikdo neřekl:
     # jinak by `--center robot` tiše spadl na celý výřez.
     center = str(center or 'robot').lower()
-    want_robot = 'robot' in requested or center == 'robot'
-    if want_robot and 'robot' not in requested:
+    want_robot = 'robot' in requested or (center == 'robot' and not bounds)
+    if want_robot and 'robot' not in requested and 'robot' not in given:
         _prime_tf(timeout)
 
     # ---- sběr (paralelně; každý sběrač odpoví (payload, chyba)) ----------
@@ -1348,13 +1560,14 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
         else:
             status[name] = {'kind': 'ok', 'note': ''}
 
-    bounds = _content_bounds(data)
+    explicit = _explicit_bounds(bounds)
+    bounds = explicit or _content_bounds(data)
     if bounds is None:
         return {'ok': False, 'stamp': stamp, 'warnings': warnings,
                 'error': ('Není z čeho mapu složit — žádná z vrstev (%s) '
                           'nedodala data.' % ', '.join(requested))}
     span_m = None
-    if center == 'robot':
+    if center == 'robot' and not explicit:
         try:
             span_m = 2.0 * float(radius if radius is not None else DEFAULT_RADIUS_M)
         except (TypeError, ValueError):
@@ -1412,6 +1625,8 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
             warnings.append('%s (nedostupná): mřížku se nepodařilo vykreslit' % name)
         else:
             status[name]['note'] = grid['topic']
+
+    step = _draw_axes_grid(Image, ImageDraw, canvas, proj) if axes else None
 
     zones = payload_of('zones') if 'zones' in requested else None
     if zones:
@@ -1495,8 +1710,15 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
 
     # ---- legenda --------------------------------------------------------
     rows = _legend_lines(status, requested, proj, stamp, site, robot)
+    if step:
+        rows.insert(1, (None, 'Souřadnice: čáry mřížky po %g m, čísla na okrajích = '
+                              'metry v rámu map (x roste doprava = východ, y roste '
+                              'nahoru = sever); bod čti z nejbližších čar.' % step))
     if overlay_rows:
         rows = rows[:-1] + [(None, '—')] + overlay_rows + rows[-1:]
+    # Okraj kolem mapy jen s osami: čísla os patří VEDLE mapy, ne přes ni.
+    ml, mt, mr, mb = (AXES_MARGIN if step else (0, 0, 0, 0))
+    full_w = ml + map_w + mr
     row_h = max(19, _measure(draw, 'Ag', small)[1] + 8)
     wrapped = []
     for colour, text in rows:
@@ -1504,18 +1726,20 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
             wrapped.append((colour, text, False))
             continue
         indent = 38 if colour is not None else 16
-        for index, line in enumerate(_wrap(draw, text, small, map_w - indent - 16)):
+        for index, line in enumerate(_wrap(draw, text, small, full_w - indent - 16)):
             wrapped.append((colour if index == 0 else None, line, index > 0))
     legend_h = int(38 + row_h * len(wrapped) + 16)
 
-    full = Image.new('RGB', (map_w, map_h + legend_h), BG)
-    full.paste(canvas, (0, 0))
+    full = Image.new('RGB', (full_w, mt + map_h + mb + legend_h), BG)
+    full.paste(canvas, (ml, mt))
     canvas = full
     draw = ImageDraw.Draw(canvas)
+    if step:
+        _draw_axes_labels(draw, proj, step, (ml, mt), small, tiny)
 
-    top = map_h
-    draw.rectangle([0, top, map_w, map_h + legend_h], fill=PANEL)
-    draw.line([(0, top), (map_w, top)], fill=LINE, width=2)
+    top = mt + map_h + mb
+    draw.rectangle([0, top, full_w, top + legend_h], fill=PANEL)
+    draw.line([(0, top), (full_w, top)], fill=LINE, width=2)
     draw.text((16, top + 10), 'Mapa robota Vitulus — legenda', fill=INK, font=bold)
     y = top + 36
     for colour, text, continuation in wrapped:
@@ -1523,7 +1747,7 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
             draw.rectangle([16, y + 3, 30, y + 15], fill=colour, outline=LINE)
             draw.text((38, y), text, fill=INK, font=small)
         elif text == '—':
-            draw.line([(16, y + 9), (map_w - 16, y + 9)], fill=LINE, width=1)
+            draw.line([(16, y + 9), (full_w - 16, y + 9)], fill=LINE, width=1)
         elif continuation:
             draw.text((38, y), text, fill=INK, font=small)
         else:
@@ -1566,7 +1790,15 @@ def _compose(layers, size, center, radius, out, timeout_s, keep, site, stamp,
         'bbox': {'west': round(proj.bbox[0], 2), 'south': round(proj.bbox[1], 2),
                  'east': round(proj.bbox[2], 2), 'north': round(proj.bbox[3], 2)},
         'scale_m_per_px': round(proj.scale, 4),
-        'size': [map_w, map_h + legend_h],
+        'size': [full_w, top + legend_h],
+        'transform': {'frame': FRAME, 'x0': ml, 'y0': mt, 'w': map_w, 'h': map_h,
+                      'cx': round(proj.cx, 4), 'cy': round(proj.cy, 4),
+                      'm_per_px': round(proj.scale, 6),
+                      'axes_step_m': step,
+                      'to_map': 'x = cx + (px - x0 - w/2)*m_per_px; '
+                                'y = cy - (py - y0 - h/2)*m_per_px',
+                      'to_px': 'px = x0 + w/2 + (x - cx)/m_per_px; '
+                               'py = y0 + h/2 - (y - cy)/m_per_px'},
         'stamp': stamp,
         'robot': ({'x': round(robot['x'], 2), 'y': round(robot['y'], 2),
                    'yaw': round(robot['yaw'], 3), 'rtk': robot.get('rtk'),

@@ -67,6 +67,30 @@ def load_paths(site):
     return paths
 
 
+def load_zones(site):
+    """{name: [(easting, northing), ...]} for every saved Polygon (outer ring).
+
+    No zones.geojson is a legitimate state (nothing drawn yet), so it is an
+    empty dict, not an error.
+    """
+    try:
+        features = _features(site, 'zones.geojson')
+    except SiteError:
+        return {}
+    zones = {}
+    for feature in features:
+        geometry = feature.get('geometry') or {}
+        name = (feature.get('properties') or {}).get('name')
+        if geometry.get('type') != 'Polygon' or not name:
+            continue
+        rings = geometry.get('coordinates') or []
+        ring = [(float(p[0]), float(p[1])) for p in (rings[0] if rings else [])
+                if len(p) >= 2]
+        if ring:
+            zones[str(name)] = ring
+    return zones
+
+
 def load_datum(site):
     """The bundle datum (utm_e / utm_n / yaw_rad), or None when absent."""
     import yaml

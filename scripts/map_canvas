@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""CLI nad `vitulus_navi.map_canvas` — mapa jako plátno.
+
+    rosrun vitulus_navi map_canvas view --center ZoneB --out /tmp/zb.png
+    rosrun vitulus_navi map_canvas view --center map --source bundle
+    rosrun vitulus_navi map_canvas check --points "10.7,-6.7;TEST" --start dock
+    rosrun vitulus_navi map_canvas zone --name ZoneB --from dock --offset 0.5
+
+Na stdout jde JSON (cesta k PNG + metadata: transformace pixel<->mapa, objekty;
+výsledky kontroly bodů; geometrie zóny).  Jen čtení.  `--source bundle` jede
+z uloženého site bundlu bez ROSu.  Návratový kód 0 = ok, 1 = chyba (v JSONu).
+"""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PKG_SRC = os.path.join(os.path.dirname(_HERE), 'src', 'vitulus_navi')
+try:
+    from vitulus_navi import map_canvas
+except ImportError:
+    import vitulus_navi as _vn
+    if _PKG_SRC not in list(getattr(_vn, '__path__', [])):
+        _vn.__path__.append(_PKG_SRC)
+    from vitulus_navi import map_canvas
+
+
+if __name__ == '__main__':
+    sys.exit(map_canvas.main())

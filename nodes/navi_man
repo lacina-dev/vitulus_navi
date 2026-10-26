@@ -196,6 +196,15 @@ class LaunchConnection:
     def run(self, command):
         self.stop()
         self.cont_command = command
+        # a container of the same name left from an earlier run (engine was rtabmap) would publish the same
+        # topics a second time -> remove it
+        try:
+            c = docker.from_env().containers.get(self.cont_name)
+            rospy.logwarn("navi_man: stopping the old %s container (obstacles_engine depth_obstacles)", self.cont_name)
+            c.stop()
+            c.remove()
+        except Exception:
+            pass
         self.proc = subprocess.Popen(['roslaunch'] + list(self.launch), start_new_session=True)
 
     def status(self):

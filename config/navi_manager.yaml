@@ -25,6 +25,13 @@
 # true = legacy behavior (bring rtabmap up in localization mode on every map load).
 rtabmap_on_start: false
 
+# Obstacle / ground clouds (/obstacles_cloud, /ground_cloud, /mapping/*_wide), 2026-10-26 (owner: "NO rtabmap"):
+#   depth_obstacles = vitulus_depth_obstacles, one node, the same algorithm and values as the RTAB-Map chains
+#                     (outputs identical in the A/B), + /rest_cloud (neither ground nor obstacle) for the UI camera
+#   rtabmap         = the docker container RTABMAP_OBSTACLES (rtabmap_docker obstacles_detection.launch), as before
+# RTABMAP_ODOM_SYNC stays in both cases (input of the clouds and of RTABMAP_MAPPING).
+obstacles_engine: depth_obstacles
+
 # Map source that is DISPLAYED and SERVED on /navi_manager/map at boot (feeds the
 # global costmap static layer, the planner and the UI). Localization v2: default to
 # the mapping_v3 octomap raster (mapping_manager /mapping_manager/site_map), so

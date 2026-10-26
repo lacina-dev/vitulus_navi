@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import pickle
+import subprocess
 import threading
 import shutil
 import signal
@@ -155,6 +156,59 @@ class DockerConnection:
                                     entrypoint="/ros_entrypoint.sh",
                                     user="vitulus", network_mode="host", privileged=True,
                                     name=self.cont_name)
+
+
+    def status(self):
+        """container state for the watchdog: running / exited / absent"""
+        try:
+            return self.client.containers.get(self.cont_name).status
+        except Exception:
+            return 'absent'
+
+
+class LaunchConnection:
+    """RTABMAP_OBSTACLES without RTAB-Map (2026-10-26): vitulus_depth_obstacles - one node making the same
+    /obstacles_cloud, /ground_cloud and /mapping/*_wide clouds from the same RTABMAP_ODOM_SYNC inputs - as a
+    roslaunch child process with the DockerConnection interface (run / stop / status / cont_command), so the
+    container watchdog and shutdown treat it the same way. The docker command given to run() is ignored."""
+
+    def __init__(self, cont_name, launch):
+        self.cont_name = cont_name
+        self.launch = launch            # [package, launch file]
+        self.cont_command = None
+        self.proc = None
+
+    def stop(self):
+        p = self.proc
+        if p is not None and p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGINT)
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+            except OSError:
+                pass
+        self.proc = None
+        self.cont_command = None        # deliberate stop -> the watchdog must not resurrect it
+        return True
+
+    def run(self, command):
+        self.stop()
+        self.cont_command = command
+        self.proc = subprocess.Popen(['roslaunch'] + list(self.launch), start_new_session=True)
+
+    def status(self):
+        return 'running' if self.proc is not None and self.proc.poll() is None else 'exited'
+
+
+def obstacles_engine():
+    """navi_manager.yaml obstacles_engine: rtabmap (container RTABMAP_OBSTACLES) | depth_obstacles"""
+    try:
+        with open(os.path.join(NAVI_PKG_DIR, 'config', 'navi_manager.yaml')) as f:
+            return (yaml.load(f, Loader=yaml.Loader) or {}).get('obstacles_engine', 'rtabmap')
+    except Exception:
+        return 'rtabmap'
 
 
 class Node:
@@ -378,7 +432,12 @@ class Node:
         # rtabmap_mapping.run(["roslaunch", "/rtabmap_docker/rtabmap_outdoor.launch"])
         # print(self.rtabmap_mapping.cont)
 
-        self.rtabmap_obstacles = DockerConnection("RTABMAP_OBSTACLES")
+        if obstacles_engine() == 'depth_obstacles':
+            rospy.loginfo("navi_man: obstacle clouds by vitulus_depth_obstacles (RTABMAP_OBSTACLES container not used)")
+            self.rtabmap_obstacles = LaunchConnection("RTABMAP_OBSTACLES",
+                                                      ["vitulus_depth_obstacles", "depth_obstacles.launch"])
+        else:
+            self.rtabmap_obstacles = DockerConnection("RTABMAP_OBSTACLES")
         self.rtabmap_obstacles.run(["roslaunch", "/rtabmap_docker/obstacles_detection.launch"])
         # print(self.rtabmap_obstacles.cont)
 
@@ -2036,10 +2095,7 @@ class Node:
             cmd = conn.cont_command
             if not cmd:
                 continue
-            try:
-                status = conn.client.containers.get(conn.cont_name).status
-            except Exception:
-                status = 'absent'
+            status = conn.status()
             if status == 'running':
                 continue
             last = self._wd_last_restart.get(conn.cont_name, 0)

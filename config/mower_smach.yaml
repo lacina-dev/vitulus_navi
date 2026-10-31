@@ -11,8 +11,13 @@
 # --- Rain gating ------------------------------------------------------------
 # How the mission reacts to the rain forecast (weather_alert/RainAlert).
 
-# true = skip ALL rain checks (pre-start and in-mission). For testing / override.
+# true = skip the rain checks (pre-start and in-mission) of programs started by
+# hand. A calendar run always obeys the rain (/scheduler/run_active).
 weather_rain_bypass: true
+
+# A RainAlert older than this counts as no data: the start goes ahead (with a
+# log line) and the in-mission monitor decides nothing.
+weather_max_age_min: 30
 
 # Forecast statuses that count as "rain" and block mowing.
 # The RainAlert nowcast fields carry strings like RAIN / ALERT / WARN / DRY.

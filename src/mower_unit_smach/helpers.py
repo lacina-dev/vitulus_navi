@@ -66,10 +66,74 @@ def mbf_outcome_str(code):
 _NOWCAST_FIELDS = ('status_nowcast10m', 'status_nowcast20m', 'status_nowcast30m')
 
 
+class RunFlags(object):
+    """What master_controller tells the running mission. Without the master
+    (manual programs, tests) both stay False.
+
+      scheduled          /scheduler/run_active: this is a calendar run, the rain
+                         checks hold even with ~weather_rain_bypass
+      finish_after_path  /mower_smach/finish_after_path: go home at the next
+                         path boundary (see stop_at_path_boundary)
+    """
+
+    def __init__(self):
+        self.scheduled = False
+        self.finish_after_path = False
+        self.home_latch = None
+        self._subs = []
+
+    def start(self):
+        self._subs = [
+            rospy.Subscriber('/scheduler/run_active', Bool, self._on_scheduled,
+                             queue_size=1),
+            rospy.Subscriber('/mower_smach/finish_after_path', Bool, self._on_finish,
+                             queue_size=1)]
+
+    def _on_scheduled(self, msg):
+        self.scheduled = bool(msg.data)
+
+    def _on_finish(self, msg):
+        self.finish_after_path = bool(msg.data)
+
+
+run_flags = RunFlags()
+
+
+def mark_run_phase(program, phase):
+    """Record which start phase the mission is in, unless the program carries a
+    path checkpoint: that one is the resume point until mowing moves it, and a
+    resume that fails before the first path must leave it in place."""
+    if not (program.last_result or '').startswith('failed: on_path-'):
+        program.last_result = 'failed: {}'.format(phase)
+
+
+def stop_at_path_boundary(state, userdata, pubs, zone_name, path_idx):
+    """Going home was requested and a path has just ended: the next path is the
+    checkpoint, then the mission child is preempted like by a monitor. Returns
+    True when the caller has to return 'preempted'."""
+    latch = run_flags.home_latch
+    if not run_flags.finish_after_path or latch is None:
+        return False
+    userdata.program.last_result = 'failed: on_path-{}-{}-0'.format(zone_name, path_idx)
+    pubs.save_program.publish(userdata.program)
+    pubs.log_info.publish(String("Window closed, going home"))
+    run_flags.finish_after_path = False
+    latch.request('window')
+    rospy.sleep(0.2)
+    if state.preempt_requested():
+        state.service_preempt()
+        return True
+    return False
+
+
 def get_weather_config():
     """Read rain-gating params with safe defaults. Called per check so a live
-    `rosparam set` takes effect without restarting the node."""
-    bypass = bool(rospy.get_param('~weather_rain_bypass', False))
+    `rosparam set` takes effect without restarting the node.
+
+    The bypass is an override for manual runs: a calendar run always obeys the
+    rain rules, nobody is there to watch it."""
+    bypass = (bool(rospy.get_param('~weather_rain_bypass', False))
+              and not run_flags.scheduled)
 
     statuses = rospy.get_param('~weather_reject_statuses', ['RAIN'])
     if isinstance(statuses, str):
@@ -93,7 +157,17 @@ def get_weather_config():
         'horizon_min': horizon,
         'n_steps': n_steps,
         'monitor_min_steps': min_steps,
+        'max_age_s': float(rospy.get_param('~weather_max_age_min', 30.0)) * 60.0,
     }
+
+
+def rain_data_fresh(rain_msg, cfg):
+    """False for a RainAlert older than ~weather_max_age_min: the node keeps
+    publishing its last result when the radar source is unreachable."""
+    stamp = getattr(rain_msg, 'time', None)
+    if stamp is None or stamp.to_sec() <= 0:
+        return True
+    return (rospy.Time.now() - stamp).to_sec() <= cfg['max_age_s']
 
 
 def rain_forecast_steps(rain_msg, n_steps):

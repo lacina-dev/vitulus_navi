@@ -32,12 +32,13 @@ from mbf_msgs.srv import CheckPath, CheckPathRequest, CheckPathResponse
 from rtabmap_msgs.msg import Info
 
 from .gps_wait import GpsWaitBudget, fmt_mmss
+from .hold_gate import HOLD
 from .helpers import (
     get_tf_listener, get_robot_xy_in_map, nearest_pose_index,
     classify_mbf_result, distance_xy, direction_angle,
     safe_blade_shutdown, segmentize_raw_path, MOWER_ERROR_STATES,
     mbf_outcome_str, get_weather_config, rain_forecast_steps,
-    first_lethal_index)
+    first_lethal_index, mark_run_phase, rain_data_fresh, stop_at_path_boundary)
 
 
 # ===========================================================================
@@ -102,6 +103,7 @@ class WaitForMowerStatus(smach.State):
     def execute(self, userdata):
         deadline = rospy.Time.now() + rospy.Duration(self.timeout)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            deadline = HOLD.stretch(deadline, self)
             if self.preempt_requested():
                 self.service_preempt()
                 return 'preempted'
@@ -333,6 +335,10 @@ class PreStartCheck(smach.State):
             try:
                 rain = rospy.wait_for_message(
                     '/weather_alert/rain_alert', RainAlert, timeout=5.0)
+                # Unknown weather does not hold the robot back (no internet
+                # would mean no mowing at all): see "except" below.
+                if not rain_data_fresh(rain, cfg):
+                    raise rospy.ROSException("stale")
 
                 if rain.rain_now == 1:
                     return reject_mission(self, self.pubs, "Start rejected: raining now",
@@ -356,6 +362,8 @@ class PreStartCheck(smach.State):
 
             except rospy.ROSException:
                 rospy.logwarn("[PRE_START_CHECK] Weather data unavailable, proceeding")
+                self.pubs.log_info.publish(String(
+                    "No current weather data, starting anyway"))
 
         # --- Battery check ---
         min_start_pct = int(rospy.get_param('~battery_min_start_pct', 40))
@@ -387,7 +395,7 @@ class GetZoneData(smach.State):
                                          'unfinished_active', 'unfinished_zone',
                                          'unfinished_path', 'path_window_start_index',
                                          'unfinished_window'],
-                             output_keys=['zone_cut_height', 'zone_rpm', 'zone_name',
+                             output_keys=['program', 'zone_cut_height', 'zone_rpm', 'zone_name',
                                           'zone_start_pose', 'paths', 'controller',
                                           'unfinished_active', 'unfinished_zone',
                                           'unfinished_path', 'path_window_start_index',
@@ -413,6 +421,11 @@ class GetZoneData(smach.State):
             rospy.loginfo('[GetZoneData] Skipping zone %s to resume at %s',
                           current_zone_name, userdata.unfinished_zone)
             return 'skip_zone'
+
+        # Going home: not all the way to the next zone first.
+        if (not userdata.unfinished_active
+                and stop_at_path_boundary(self, userdata, self.pubs, current_zone_name, 0)):
+            return 'preempted'
 
         if userdata.unfinished_active and current_zone_name == userdata.unfinished_zone:
             rospy.loginfo('[GetZoneData] Resuming zone: %s path: %s',
@@ -499,6 +512,11 @@ class GetPathData(smach.State):
                           userdata.index_path, userdata.unfinished_path)
             return 'skip_path'
 
+        resuming = userdata.unfinished_active
+        if (not resuming and stop_at_path_boundary(
+                self, userdata, self.pubs, userdata.zone_name, userdata.index_path)):
+            return 'preempted'
+
         path = userdata.paths[userdata.index_path]
         userdata.path_start_pose = path.poses[0]
         userdata.path_planner = path
@@ -507,7 +525,8 @@ class GetPathData(smach.State):
         userdata.program.last_result = (
             'failed: on_path-{}-{}-{}'.format(
                 userdata.zone_name, userdata.index_path,
-                userdata.path_window_start_index))
+                userdata.unfinished_window if resuming
+                else userdata.path_window_start_index))
         self.pubs.save_program.publish(userdata.program)
         self.pubs.show_map_layer.publish(
             String("SMACH|ZONE|{}".format(userdata.zone_name)))
@@ -932,6 +951,15 @@ class ExecutePathWithFeedback(smach.State):
                     self.service_preempt()
                     return 'preempted'
 
+                # --- cmd_vel_mux hold: not a stall.  Wait, then a new window
+                #     from where the robot really stands (the index only grows).
+                if HOLD.held():
+                    rospy.logwarn("[EXE] mux hold at chunk_idx=%d: waiting", start_idx)
+                    self._client.cancel_goal()
+                    self._client.wait_for_result(rospy.Duration(1.0))
+                    HOLD.wait(self, self.pubs.smach_status)
+                    return 'replan_needed'
+
                 now = rospy.Time.now()
                 mower = self._mower_status.status if self._mower_status else '?'
                 dist_to_goal = (self.last_feedback.dist_to_goal
@@ -1190,6 +1218,7 @@ class DetourAroundObstacle(smach.State):
             self.service_preempt()
             return 'preempted'
 
+        t_entry = rospy.Time.now()
         full_path = userdata.path
         if not full_path or not full_path.poses:
             rospy.logwarn('[DETOUR] no path to detour on')
@@ -1289,6 +1318,15 @@ class DetourAroundObstacle(smach.State):
                           (target_idx - start_idx) * self.SEG_SPACING_M * 100)
             return 'resumed'
 
+        if HOLD.seen_since(t_entry):
+            # The mux stopped the attempts: says nothing about the obstacle.
+            if not HOLD.wait(self, self.pubs.smach_status):
+                self.service_preempt()
+                return 'preempted'
+            rospy.logwarn('[DETOUR] interrupted by a mux hold -> new window')
+            self.pubs.mower_set_motor_on.publish(Bool(True))
+            rospy.sleep(1.0)
+            return 'resumed'
         rospy.logwarn('[DETOUR] FAILED no feasible detour around obstacle (start_idx=%d)',
                       start_idx)
         self.pubs.log_info.publish(String("No detour possible around obstacle"))
@@ -1440,7 +1478,13 @@ class RemowSkippedSpans(smach.State):
             if self.preempt_requested():
                 self.service_preempt()
                 return 'preempted'
+            t_span = rospy.Time.now()
             status = self._attempt_span(span)
+            if status == 'fail' and HOLD.seen_since(t_span):
+                if not HOLD.wait(self, self.pubs.smach_status):
+                    self.service_preempt()
+                    return 'preempted'
+                status = self._attempt_span(span)
             rospy.loginfo('[REMOW] span path=%s reason=%s poses=%d -> %s',
                           span.get('path_idx'), span.get('reason'),
                           len(span.get('poses') or []), status)
@@ -1478,6 +1522,7 @@ class WaitForRpmReached(smach.State):
         # None = rpm not set by the program/zone: any running blade counts.
         target = int(userdata.zone_rpm) if userdata.zone_rpm is not None else None
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            deadline = HOLD.stretch(deadline, self)
             if self.preempt_requested():
                 self.service_preempt()
                 return 'preempted'
@@ -1979,7 +2024,7 @@ class WaitForPlannerLoaded(smach.State):
         self.pubs = pubs
 
     def execute(self, userdata):
-        userdata.program.last_result = 'failed: on_planner'
+        mark_run_phase(userdata.program, 'on_planner')
         start = rospy.Time.now()
         deadline = start + rospy.Duration(self.timeout)
         last_report = start
@@ -2042,6 +2087,7 @@ class WaitForDockedState(smach.State):
         rospy.loginfo("Waiting for docked (timeout %.0fs)...", self.DOCK_TIMEOUT)
         deadline = rospy.Time.now() + rospy.Duration(self.DOCK_TIMEOUT)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            deadline = HOLD.stretch(deadline, self)
             if self.preempt_requested():
                 self.pubs.log_info.publish(String("Docking preempted."))
                 self.service_preempt()

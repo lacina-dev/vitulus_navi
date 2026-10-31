@@ -114,6 +114,11 @@ except Exception as _e:
     sys.stderr.write("navi_man: bundle_sync unavailable (%s); site-bundle sync "
                      "disabled.\n" % _e)
 _BUNDLE_OK = (_bundle is not None and _geo is not None and _bsync is not None)
+try:
+    from vitulus_mapping import objnames as _objnames
+except Exception as _e:
+    _objnames = None
+    sys.stderr.write("navi_man: objnames unavailable (%s); rename disabled.\n" % _e)
 
 
 class DockerConnection:
@@ -370,6 +375,10 @@ class Node:
         # an AttributeError.
         rospy.Subscriber("/navi_manager/goal_point", String, self.callback_goal_point)
         rospy.Subscriber("/navi_manager/remove_point", String, self.callback_remove_point)
+        if _objnames is not None:
+            self.rename_result_pub = rospy.Publisher(_objnames.RENAME_RESULT_TOPIC, String, queue_size=10)
+            rospy.Subscriber("/navi_manager/rename_point", String, self.callback_rename_point)
+            rospy.Subscriber("/navi_manager/rename_path", String, self.callback_rename_path)
         rospy.Subscriber("/navi_manager/save_path", String, self.callback_save_path)
         rospy.Subscriber("/navi_manager/save_path_at", String, self.callback_save_path_at)
         rospy.Subscriber("/navi_manager/save_path_point", String, self.callback_save_path_point)
@@ -1274,6 +1283,52 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
             self.nex_log_info_pub.publish("The name is empty!")
+
+    def callback_rename_point(self, msg):
+        self._rename_map_object('waypoint', msg.data)
+
+    def callback_rename_path(self, msg):
+        self._rename_map_object('path', msg.data)
+
+    def _rename_map_object(self, kind, data):
+        # Payload JSON {"from", "to"}. The name is the key of a point/path, so a
+        # clash is refused; the bundle export rewrites the whole set, the old name
+        # does not survive there.
+        old, new, code = '', '', 'failed'
+        try:
+            old, new = _objnames.parse_request(data)
+            rmd = self.running_map_data
+            items = rmd.points if kind == 'waypoint' else rmd.paths
+            code = _objnames.check_rename(old, new, [i.name for i in items]) or 'ok'
+            if code == 'ok' and kind == 'path' and self.autopath_name == old:
+                code = 'busy'       # still being recorded under this name
+            if code != 'ok':
+                return
+            with self._map_data_lock:
+                for i, item in enumerate(items):
+                    if item.name != old:
+                        continue
+                    if kind == 'waypoint':
+                        # A new MapPoint: its marker namespace is the name.
+                        items[i] = MapPoint(new, item.pose, item.tf_frame)
+                    else:
+                        item.name = new
+            if kind == 'waypoint':
+                if self.point_to_publish == old:
+                    self.point_to_publish = new
+            elif self.path_to_publish == old:
+                self.path_to_publish = new
+            self.save_running_map_data()
+            rospy.loginfo("%s %s renamed to %s.", kind, old, new)
+            self.nex_log_info_pub.publish("{} renamed to {}".format(old, new))
+            self._republish_map_lists()
+        except ValueError:
+            code = 'bad_request'
+        except Exception as e:
+            rospy.logerr("navi_man: rename %s failed: %s", kind, e)
+            code = 'failed'
+        finally:
+            self.rename_result_pub.publish(_objnames.result_json(kind, old, new, code))
 
     def callback_save_waypoint_at(self, msg):
         # WP-D2 (map editor): save/update a waypoint at an EXPLICIT map-frame pose

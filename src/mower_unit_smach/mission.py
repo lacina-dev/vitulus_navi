@@ -23,8 +23,10 @@ from mbf_msgs.msg import (
 from mbf_msgs.srv import CheckPath, CheckPathRequest
 from rtabmap_msgs.msg import Info
 
+from .hold_gate import HOLD
 from .helpers import (
-    classify_mbf_result, safe_blade_shutdown, wait_for_mbf, MOWER_ERROR_STATES)
+    classify_mbf_result, safe_blade_shutdown, wait_for_mbf, MOWER_ERROR_STATES,
+    mark_run_phase, run_flags)
 from .states import (
     VerifyAtPose, WaitForMowerStatus, WaitForTopic, WaitForGpsFixState, RetryLimitedAction,
     GetZoneData, GetPathData, CheckDistance, WindowPlannerPath, TrimAndRetry,
@@ -65,6 +67,8 @@ def build_wait_for_program(pubs):
         # previous mission's (latched) stop_reason.
         cancel_rejected_hold()
         pubs.stop_reason.publish(String(""))
+        pubs.mission_started.publish(String(""))
+        run_flags.finish_after_path = False
 
     def callback_program(userdata, msg):
         mission_start()
@@ -87,9 +91,8 @@ def build_wait_for_program(pubs):
         rospy.loginfo('[MONITOR_PROGRAM_UNFINISHED] Resume: %s last_result=%s',
                       msg.name, msg.last_result)
 
-        last_result = msg.last_result.split(': ')
-        if last_result[0] == 'failed':
-            failure_payload = last_result[1] if len(last_result) > 1 else ''
+        kind, _, failure_payload = msg.last_result.partition(': ')
+        if kind == 'failed':
             tag, _, rest = failure_payload.partition('-')
             if tag == 'on_path' and rest:
                 parts = rest.rsplit('-', 2)
@@ -127,7 +130,10 @@ def build_wait_for_program(pubs):
                     userdata.unfinished_path = '0'
                     userdata.unfinished_window = 0
 
-        userdata.program.last_result = 'failed: on_init'
+        # A valid checkpoint stays as it came until the mission moves past it:
+        # a refused or interrupted resume must not lose it.
+        if not userdata.unfinished_active:
+            userdata.program.last_result = 'failed: on_init'
         pubs.active_program.publish(String(msg.name))
         pubs.log_info.publish(String("Resuming program: {}".format(msg.name)))
         pubs.pm_play_melody.publish(Int16(2))
@@ -265,10 +271,18 @@ def build_mission_child_sm(pubs):
         # only refuses to start while they are off.
         smach.StateMachine.add('CHECK_MOTORS_ON', CheckMotorsOnState(pubs),
                                transitions={
-                                   'motors_on': 'LOAD_MAP',
+                                   'motors_on': 'MISSION_STARTED',
                                    'rejected': 'rejected',
                                    'preempted': 'preempted'
                                })
+
+        @smach.cb_interface(input_keys=['program'], outcomes=['done'])
+        def mission_started_cb(ud):
+            pubs.mission_started.publish(String(ud.program.name))
+            return 'done'
+
+        smach.StateMachine.add('MISSION_STARTED', smach.CBState(mission_started_cb),
+                               transitions={'done': 'LOAD_MAP'})
 
         def _on_undock_program(userdata, msg):
             userdata.undock_program = msg
@@ -298,8 +312,10 @@ def build_mission_child_sm(pubs):
                 "Rejected: no undock program", "no_undock_program"),
             transitions={'rejected': 'rejected', 'preempted': 'preempted'})
 
-        @smach.cb_interface(input_keys=['undock_program'], outcomes=['done', 'preempted'])
+        @smach.cb_interface(input_keys=['undock_program', 'program'],
+                            outcomes=['done', 'preempted'])
         def send_undock_cb(ud):
+            pubs.mission_started.publish(String(ud.program.name))
             pub = rospy.Publisher('/dock_smach/start_docking',
                                   DockProgram, queue_size=1, latch=True)
             pub.publish(ud.undock_program)
@@ -461,7 +477,7 @@ def build_mission_child_sm(pubs):
         @smach.cb_interface(input_keys=['program'], output_keys=['program'],
                             outcomes=['done', 'preempted'])
         def power_on_cb(ud):
-            ud.program.last_result = 'failed: on_mower'
+            mark_run_phase(ud.program, 'on_mower')
             rospy.loginfo('[POWER_ON_MOWER] Turning on mower')
             pubs.mower_set_power.publish(Bool(True))
             pubs.log_info.publish(String("Turn on mower"))
@@ -806,11 +822,19 @@ def _build_process_zone_sm(pubs, zone_it):
                                transitions={'done': 'critical_failure'})
 
         # --- SET_MOTOR_OFF_AND_HOME ---
-        @smach.cb_interface(input_keys=['program'], output_keys=['program'],
+        @smach.cb_interface(input_keys=['program', 'index'], output_keys=['program'],
                             outcomes=['done', 'preempted'])
         def motor_off_home_cb(ud):
             rospy.loginfo('[SET_MOTOR_OFF_AND_HOME] Raising blade')
-            ud.program.last_result = 'succeeded'
+            # Between zones the checkpoint is the next zone: 'succeeded' here
+            # made an interruption in that gap mow the whole program again.
+            zones = ud.program.zone_list
+            if ud.index + 1 < len(zones):
+                ud.program.last_result = 'failed: on_path-{}-0-0'.format(
+                    zones[ud.index + 1].name)
+                pubs.save_program.publish(ud.program)
+            else:
+                ud.program.last_result = 'succeeded'
             pubs.show_map_layer.publish(String("SMACH|MAP|FULL"))
             pubs.smach_status.publish(String("Raising blade to max"))
             safe_blade_shutdown(source='SET_MOTOR_OFF_AND_HOME', pubs=pubs)
@@ -1141,6 +1165,36 @@ def clear_stale_preempt(container):
         clear_stale_preempt(child)
 
 
+class ReturnHomeLatch(object):
+    """The mission goes home before its end (window closed): same mechanism as
+    UserStopLatch, preempt of the mission child -> RETURN_TO_DOCK.
+
+    request() comes from the mission itself at a path boundary (it finished the
+    path) or from /mower_smach/return_home (master: the path did not end).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._mission_child = None
+        self.reason = None
+
+    def attach(self, mission_child):
+        self._mission_child = mission_child
+
+    def reset(self):
+        with self._lock:
+            self.reason = None
+
+    def request(self, reason='window'):
+        child = self._mission_child
+        if child is None or not child.is_running():
+            return False
+        with self._lock:
+            self.reason = reason
+        child.request_preempt()
+        return True
+
+
 class UserStopLatch(object):
     """A user STOP seen while MISSION_CHILD runs (vitulus-field#53).
 
@@ -1179,7 +1233,7 @@ class UserStopLatch(object):
         return True
 
 
-def build_mission_concurrence(pubs, parent_sm, stop_latch=None):
+def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None):
     """Wrap the mission child SM with concurrent monitors.
 
     Outcomes:
@@ -1187,6 +1241,7 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None):
       - 'weather_preempt': rain detected in forecast
       - 'battery_preempt': battery <= 25%
       - 'temp_preempt': motor overtemperature
+      - 'home_preempt': sent home before the end (window closed)
       - 'stop_preempt': external stop signal
       - 'critical_error': critical failure from within mission
       - 'mission_rejected': mission refused before anything moved (stop_reason
@@ -1195,9 +1250,22 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None):
     """
 
     mission_child = build_mission_child_sm(pubs)
+    HOLD.wrap_tree(mission_child)    # no state starts during a mux hold
     if stop_latch is None:
         stop_latch = UserStopLatch()
     stop_latch.attach(mission_child)
+    if home_latch is None:
+        home_latch = ReturnHomeLatch()
+    home_latch.attach(mission_child)
+    run_flags.home_latch = home_latch
+
+    def save_checkpoint():
+        # The periodic save is up to 60 s behind: the robot goes home now and
+        # the next stop may be a power cut.
+        try:
+            pubs.save_program.publish(parent_sm.userdata.program)
+        except Exception as exc:  # noqa: BLE001 - never decides the outcome
+            rospy.logwarn('[MISSION] checkpoint save failed: %s', exc)
 
     def child_term_cb(outcome_map):
         # If ANY child finishes/triggers, terminate all others
@@ -1207,21 +1275,30 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None):
         # Priority: STOP > TEMP > BATTERY > WEATHER > mission
         if (outcome_map.get('STOP_MONITOR') == 'invalid'
                 or stop_latch.requested()):
+            save_checkpoint()
             pubs.stop_reason.publish(String("terminal:stop_signal"))
             return 'stop_preempt'
         if outcome_map.get('MOWER_TEMP_MONITOR') == 'invalid':
+            save_checkpoint()
             pubs.stop_reason.publish(String("interrupted:temp"))
             return 'temp_preempt'
         if outcome_map.get('BATTERY_MONITOR') == 'invalid':
+            save_checkpoint()
             pubs.stop_reason.publish(String("interrupted:battery"))
             return 'battery_preempt'
         if outcome_map.get('WEATHER_MONITOR') == 'invalid':
+            save_checkpoint()
             pubs.stop_reason.publish(String("interrupted:weather"))
             return 'weather_preempt'
         mission_out = outcome_map.get('MISSION_CHILD')
         if mission_out == 'succeeded':
             return 'mission_complete'
+        if home_latch.reason:
+            save_checkpoint()
+            pubs.stop_reason.publish(String("interrupted:{}".format(home_latch.reason)))
+            return 'home_preempt'
         if mission_out == 'aborted':
+            save_checkpoint()
             pubs.stop_reason.publish(String("critical:mission_aborted"))
             return 'critical_error'
         if mission_out == 'rejected':
@@ -1236,7 +1313,7 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None):
 
     cc = smach.Concurrence(
         outcomes=['mission_complete', 'weather_preempt', 'battery_preempt',
-                  'temp_preempt', 'stop_preempt', 'critical_error',
+                  'temp_preempt', 'home_preempt', 'stop_preempt', 'critical_error',
                   'mission_rejected', 'preempted'],
         default_outcome='preempted',
         child_termination_cb=child_term_cb,
@@ -1249,6 +1326,7 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None):
     def _on_start(ud, labels):
         clear_stale_preempt(mission_child)
         stop_latch.reset()
+        home_latch.reset()
 
     cc.register_start_cb(_on_start, cb_args=[])
 

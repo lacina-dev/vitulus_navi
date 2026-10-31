@@ -6,19 +6,23 @@ of the Concurrence (which preempts the mission child SM).
 """
 import rospy
 
-from .helpers import get_weather_config, rain_forecast_steps
+from .helpers import get_weather_config, rain_data_fresh, rain_forecast_steps
 
 
 def weather_monitor_cb(userdata, msg):
     """Monitor /weather_alert/rain_alert (weather_alert/RainAlert).
 
-    Pravidlo 2: Return to dock if the rain forecast over the configured horizon
-    contains at least `monitor_min_steps` reject statuses. Statuses, horizon and
-    a full bypass are configurable (see helpers.get_weather_config).
+    Pravidlo 2: Return to dock if it rains now, or if the rain forecast over the
+    configured horizon contains at least `monitor_min_steps` reject statuses.
+    Statuses, horizon and a full bypass are configurable (see
+    helpers.get_weather_config). Stale data decides nothing.
     """
     cfg = get_weather_config()
-    if cfg['bypass']:
+    if cfg['bypass'] or not rain_data_fresh(msg, cfg):
         return True
+    if msg.rain_now == 1:
+        rospy.logwarn("[WEATHER_MONITOR] Raining now")
+        return False
     nowcast = rain_forecast_steps(msg, cfg['n_steps'])
     rain_count = sum(1 for s in nowcast if s in cfg['reject_statuses'])
     if rain_count >= cfg['monitor_min_steps']:

@@ -9,6 +9,7 @@ from std_msgs.msg import Bool, String, Int16, Int8
 from vitulus_msgs.msg import DockProgram, PlannerProgram
 
 from .helpers import safe_blade_shutdown
+from .hold_gate import HOLD
 from .states import WaitForTopic, WaitForDockedState, CheckForDockPoint
 
 
@@ -355,6 +356,7 @@ def build_return_to_dock_sm(pubs):
                                    'preempted': 'preempted'
                                })
 
+    HOLD.wrap_tree(sm)    # return to dock starts after a mux hold, not into it
     return sm
 
 

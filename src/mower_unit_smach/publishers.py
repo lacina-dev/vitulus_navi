@@ -23,6 +23,11 @@ class MowerPublishers:
             '/nextion/log_info', String, queue_size=10, latch=True)
         self.active_program = rospy.Publisher(
             '/mower_smach/active_program', String, latch=True, queue_size=1)
+        # Program name once the mission is past every start check (it leaves
+        # the dock now), "" at each mission start. That is what makes a slot
+        # "run" for master_controller.
+        self.mission_started = rospy.Publisher(
+            '/mower_smach/mission_started', String, latch=True, queue_size=1)
         # True while the SM is anywhere but idle (WAIT_FOR_PROGRAM, STOPPED,
         # TERMINAL_ERROR): the supervisor and cmd_vel_mux send
         # /mower_smach/stop only then (18. 10. 2026).

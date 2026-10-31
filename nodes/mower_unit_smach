@@ -25,14 +25,15 @@ import smach_ros
 from std_msgs.msg import Bool, String
 
 from mower_unit_smach.publishers import MowerPublishers
-from mower_unit_smach.helpers import wait_for_mbf, start_power_watch
+from mower_unit_smach.helpers import wait_for_mbf, start_power_watch, run_flags
 from mower_unit_smach.global_stop import GlobalStop
 from mower_unit_smach.states import PreStartCheck
 from mower_unit_smach.top_level import (
     CriticalErrorState, TerminalErrorState, StoppedState,
     build_return_to_dock_with_stop)
 from mower_unit_smach.mission import (
-    build_wait_for_program, build_mission_concurrence, UserStopLatch)
+    build_wait_for_program, build_mission_concurrence, ReturnHomeLatch,
+    UserStopLatch)
 
 
 # Top-level states in which no mowing program runs: a STOP there switches the
@@ -56,6 +57,7 @@ def main():
     pubs.smach_status.publish(String("Starting..."))
     pubs.busy.publish(Bool(False))
     start_power_watch()
+    run_flags.start()
     wait_for_mbf()
 
     # ===================================================================
@@ -99,6 +101,7 @@ def main():
 
     # Every STOP re-preempts a running mission (vitulus-field#53).
     stop_latch = UserStopLatch()
+    home_latch = ReturnHomeLatch()
 
     with sm:
 
@@ -119,13 +122,14 @@ def main():
                                })
 
         # ==================== MISSION_CONCURRENCE ====================
-        mission_cc = build_mission_concurrence(pubs, sm, stop_latch)
+        mission_cc = build_mission_concurrence(pubs, sm, stop_latch, home_latch)
         smach.StateMachine.add('MISSION_CONCURRENCE', mission_cc,
                                transitions={
                                    'mission_complete': 'RETURN_TO_DOCK',
                                    'weather_preempt': 'RETURN_TO_DOCK',
                                    'battery_preempt': 'RETURN_TO_DOCK',
                                    'temp_preempt': 'RETURN_TO_DOCK',
+                                   'home_preempt': 'RETURN_TO_DOCK',
                                    'stop_preempt': 'STOPPED',
                                    'critical_error': 'CRITICAL_ERROR',
                                    'mission_rejected': 'WAIT_FOR_PROGRAM',
@@ -196,6 +200,11 @@ def main():
     # the slow blade parking on a worker thread.
     global_stop = GlobalStop(pubs, stop_latch, lambda: sm_busy(sm))
     rospy.Subscriber("/mower_smach/stop", Bool, global_stop.on_stop, queue_size=5)
+
+    # master_controller: the path did not end in time, go home now.
+    rospy.Subscriber("/mower_smach/return_home", String,
+                     lambda msg: home_latch.request(msg.data or 'window'),
+                     queue_size=1)
 
     # /mower_smach/busy (latched) for the supervisor and cmd_vel_mux.
     busy_state = {'last': None}

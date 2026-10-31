@@ -1952,9 +1952,21 @@ def no_active_map_text(program):
             "first".format(site))
 
 
+def program_owner_site(program):
+    """The site the program belongs to, None when its data does not say (saved
+    before vitulus-field#46: 'SITE' / 'New') or it is a legacy program."""
+    site = (getattr(program, 'map_name', '') or '').strip()
+    if not site or site in ('SITE', 'New') or '***env*' in site:
+        return None
+    return site
+
+
 class CheckActiveMapState(smach.State):
-    """First mission state: a site-native program needs a served site. Checked
-    BEFORE undocking so a robot without an active map never leaves the dock.
+    """First mission state: a site-native program needs a served site - and it
+    has to be ITS site. Checked BEFORE undocking so a robot never leaves the dock
+    on another map. The planner loads the program's map before the program gets
+    here (vitulus-field#46, node_planner._select_program); this is the last line:
+    the map may have changed since, or someone published the program directly.
     Legacy programs pass straight through.
 
     A null 'serving' is tolerated for NO_SITE_GRACE: a respawned
@@ -1990,7 +2002,14 @@ class CheckActiveMapState(smach.State):
                 return 'preempted'
             known, site = get_served_site()
             if known and site:
-                return 'ok'
+                owner = program_owner_site(userdata.program)
+                if owner is None or owner == site:
+                    return 'ok'
+                return reject_mission(
+                    self, self.pubs,
+                    "Start rejected: the program belongs to map '{}', map '{}' is "
+                    "active".format(owner, site),
+                    "Rejected: another map is active", "wrong_map")
             if rospy.Time.now() >= deadline:
                 break
             if known:

@@ -394,6 +394,21 @@ def test_site_native_planner():
     check('no active map, program of BACK: message names the map',
           "Start rejected: no map is active - activate map 'BACK' first"
           in W.texts('/nextion/log_info'), W.texts('/nextion/log_info'))
+    # vitulus-field#46: the last line behind the planner's map gate
+    out, vis, reason, dur = run_mission({DOCK: status_script([(0, 0)]), UNDOCK_PRG: PRG,
+                                         MAPSTAT: lambda t: serving('LADA')}, map_name='BACK')
+    check('program of BACK, LADA on -> rejected, never undocks',
+          out == 'rejected' and vis == ['CHECK_ACTIVE_MAP'] and
+          not any(t == '/dock_smach/start_docking' for t, m in W.published), (out, vis))
+    check('program of BACK, LADA on: stop_reason',
+          'rejected:wrong_map' in W.texts('/mower_smach/stop_reason'))
+    check('program of BACK, LADA on: message names both',
+          any("'BACK'" in t and "'LADA'" in t for t in W.texts('/nextion/log_info')),
+          W.texts('/nextion/log_info'))
+    out, vis, reason, dur = run_mission({DOCK: status_script([(0, 0)]), UNDOCK_PRG: PRG,
+                                         MAPSTAT: lambda t: serving('LADA')}, map_name='SITE')
+    check('old data without an owner still runs on the map that is on',
+          'CHECK_IF_DOCKED' in vis, (out, vis))
     for tag in ('SITE', 'New', '', None, 'G***env*OUTDOOR'):
         check('rejection text for map_name %r stays generic' % (tag,),
               states.no_active_map_text(PlannerProgram(name='T1', map_name=tag or ''))

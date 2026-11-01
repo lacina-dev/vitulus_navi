@@ -2705,7 +2705,9 @@ class Node:
     def publish_map_objects(self):
         # WP map editor V3: latched JSON snapshot of waypoints + paths in MAP
         # frame for the editor overlay (toggleable Waypoints / Paths groups).
-        #   {"waypoints": [{name,x,y,yaw}], "paths": [{name, points:[[x,y]..]}]}
+        #   {"waypoints": [{name,x,y,yaw}], "paths": [{name, points:[[x,y]..], yaws:[..]}]}
+        # yaws: heading per pose, so the editor can save a reshaped path without
+        # losing the headings of the poses it did not touch (save_path_at).
         # yaw is extracted from the pose quaternion (z-only heading). Latched, so
         # subscribers get the current snapshot immediately on connect.
         try:
@@ -2724,12 +2726,18 @@ class Node:
             paths = []
             for pa in self.running_map_data.paths:
                 pts = []
+                yaws = []
                 for ps in pa.poses:
                     try:
+                        # x,y of a recorded orientation are zeroed without
+                        # renormalising: only this form stays exact then
+                        q = ps.orientation
+                        yaw = 2.0 * math.atan2(q.z, q.w)
                         pts.append([ps.position.x, ps.position.y])
+                        yaws.append(math.atan2(math.sin(yaw), math.cos(yaw)))
                     except Exception:
                         continue
-                paths.append({'name': pa.name, 'points': pts})
+                paths.append({'name': pa.name, 'points': pts, 'yaws': yaws})
             self.map_objects_pub.publish(json.dumps({'waypoints': wps, 'paths': paths}))
         except Exception as e:
             rospy.logwarn("navi_man: publish_map_objects failed: %s", e)

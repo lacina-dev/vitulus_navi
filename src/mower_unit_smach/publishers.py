@@ -23,6 +23,9 @@ class MowerPublishers:
             '/nextion/log_info', String, queue_size=10, latch=True)
         self.active_program = rospy.Publisher(
             '/mower_smach/active_program', String, latch=True, queue_size=1)
+        # How far a chain of programs got (chain.py), latched JSON.
+        self.chain_state = rospy.Publisher(
+            '/mower_smach/chain', String, latch=True, queue_size=1)
         # Program name once the mission is past every start check (it leaves
         # the dock now), "" at each mission start. That is what makes a slot
         # "run" for master_controller.
@@ -47,8 +50,9 @@ class MowerPublishers:
             '/dock_smach/stop', Bool, queue_size=1)
 
         # --- Program persistence ---
+        # Two programs go out at once at a chain's boundary (NextProgramState).
         self.save_program = rospy.Publisher(
-            '/web_plan/program_new', PlannerProgram, queue_size=1)
+            '/web_plan/program_new', PlannerProgram, queue_size=2)
 
         # --- Mower hardware control ---
         self.mower_set_power = rospy.Publisher(

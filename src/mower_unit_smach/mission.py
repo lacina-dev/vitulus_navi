@@ -23,10 +23,11 @@ from mbf_msgs.msg import (
 from mbf_msgs.srv import CheckPath, CheckPathRequest
 from rtabmap_msgs.msg import Info
 
+from .chain import PROGRAM_CHAIN
 from .hold_gate import HOLD
 from .helpers import (
     classify_mbf_result, safe_blade_shutdown, wait_for_mbf, MOWER_ERROR_STATES,
-    mark_run_phase, run_flags)
+    mark_run_phase, mower_status_now, run_flags)
 from .states import (
     VerifyAtPose, WaitForMowerStatus, WaitForTopic, WaitForGpsFixState, RetryLimitedAction,
     GetZoneData, GetPathData, CheckDistance, WindowPlannerPath, TrimAndRetry,
@@ -34,7 +35,7 @@ from .states import (
     CheckIfDockedState, WaitForPlannerLoaded, WaitForDockedState,
     WaitForUndockedState, CheckMotorsOnState, CheckActiveMapState,
     is_site_native_program, RejectMissionState, cancel_rejected_hold,
-    CheckForDockPoint, DetourAroundObstacle, RemowSkippedSpans)
+    CheckForDockPoint, DetourAroundObstacle, RemowSkippedSpans, NextProgramState)
 from .monitors import (
     weather_monitor_cb, battery_monitor_cb, mower_temp_monitor_cb, stop_monitor_cb)
 from .recovery import build_blocked_recovery_sm, build_nav_recovery_sm
@@ -150,8 +151,8 @@ def build_wait_for_program(pubs):
 
     all_keys = ['program', 'prg_start_time', 'unfinished_active',
                 'unfinished_zone', 'unfinished_path', 'path_window_start_index',
-                'path_chunk', 'unfinished_window', 'restore_height_pending',
-                'consecutive_nav_failures', 'skipped_spans']
+                'path_chunk', 'path_chunk_trim_count', 'unfinished_window',
+                'restore_height_pending', 'consecutive_nav_failures', 'skipped_spans']
 
     cc = smach.Concurrence(
         outcomes=['program_received', 'preempted'],
@@ -201,6 +202,10 @@ def set_iterated_state(label, state, loop_outcomes):
 
 def build_mission_child_sm(pubs):
     """Build the mission child SM: undock → map → mow all zones → power off.
+
+    In a chain of programs (chain.py) the mission goes round from the last zone
+    to CHECK_ACTIVE_MAP with the next program, under the same monitors; only
+    the last program powers off and leaves.
 
     Outcomes:
       - 'succeeded': all zones mowed, mower powered off
@@ -337,7 +342,8 @@ def build_mission_child_sm(pubs):
         # ==================== LOAD MAP ====================
 
         @smach.cb_interface(input_keys=['program'],
-                            outcomes=['success_indoor', 'success_outdoor', 'preempted'])
+                            outcomes=['success_indoor', 'success_outdoor', 'loaded_indoor',
+                                      'preempted'])
         def load_map_cb(ud):
             # Determine environment type from map_name (format: "name***env*INDOOR" or "...OUTDOOR")
             indoor = False
@@ -358,6 +364,11 @@ def build_mission_child_sm(pubs):
                 pubs.log_info.publish(String("Using the active map"))
                 pubs.smach_status.publish(String("Loading map"))
                 return 'success_outdoor'
+            if PROGRAM_CHAIN.midway():
+                # Same map as the program before (the planner refuses any
+                # other): loading it again would throw the pose away.
+                rospy.loginfo('[LOAD_MAP] chain: map %s stays loaded', ud.program.map_name)
+                return 'loaded_indoor' if indoor else 'success_outdoor'
             if indoor:
                 pub = rospy.Publisher('/navi_manager/load_map_rtabmap',
                                       String, latch=True, queue_size=1)
@@ -378,6 +389,7 @@ def build_mission_child_sm(pubs):
                                transitions={
                                    'success_indoor': 'WAIT_FOR_RTABMAP',
                                    'success_outdoor': 'WAIT_FOR_GPS_FIX',
+                                   'loaded_indoor': 'WAIT_FOR_PLANNER',
                                    'preempted': 'preempted'
                                })
 
@@ -478,6 +490,10 @@ def build_mission_child_sm(pubs):
                             outcomes=['done', 'preempted'])
         def power_on_cb(ud):
             mark_run_phase(ud.program, 'on_mower')
+            status = mower_status_now()
+            if PROGRAM_CHAIN.board_stays_on(status):
+                rospy.loginfo('[POWER_ON_MOWER] chain: board stays on (%s)', status)
+                return 'done'
             rospy.loginfo('[POWER_ON_MOWER] Turning on mower')
             pubs.mower_set_power.publish(Bool(True))
             pubs.log_info.publish(String("Turn on mower"))
@@ -572,19 +588,36 @@ def build_mission_child_sm(pubs):
         # ==================== POWER OFF ====================
 
         @smach.cb_interface(input_keys=['program'], output_keys=['program'],
-                            outcomes=['done', 'preempted'])
+                            outcomes=['done', 'next_program', 'preempted'])
         def power_off_cb(ud):
             rospy.loginfo('[POWER_OFF_MOWER] Shutting down mower')
             safe_blade_shutdown(source='MISSION_POWER_OFF', pubs=pubs)
-            pubs.mower_set_power.publish(Bool(False))
+            # Another program follows: blade off and parked as between two zones,
+            # the board keeps its power (off it restarts and goes silent for 13 s).
+            chained = PROGRAM_CHAIN.has_next(ud.program.name)
+            if not chained:
+                pubs.mower_set_power.publish(Bool(False))
             pubs.show_map_layer.publish(String("SMACH|MAP|FULL"))
             rospy.sleep(1.5)
             ud.program.last_result = 'succeeded'
+            if chained:
+                return 'next_program'
+            PROGRAM_CHAIN.finish()
             pubs.stop_reason.publish(String("succeeded"))
             return 'done'
 
         smach.StateMachine.add('POWER_OFF_MOWER', smach.CBState(power_off_cb),
                                transitions={'done': 'WAIT_MOWER_OFF',
+                                            'next_program': 'NEXT_PROGRAM',
+                                            'preempted': 'preempted'})
+
+        # The next program of a chain starts here, the same way as a program
+        # started off the dock, every check and wait included.
+        smach.StateMachine.add('NEXT_PROGRAM',
+                               NextProgramState(pubs, PROGRAM_CHAIN),
+                               transitions={'next': 'CHECK_ACTIVE_MAP',
+                                            'last': 'POWER_OFF_MOWER',
+                                            'rejected': 'rejected',
                                             'preempted': 'preempted'})
 
         smach.StateMachine.add('WAIT_MOWER_OFF', WaitForMowerOff(pubs, timeout=30.0),
@@ -1249,6 +1282,11 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None)
       - 'preempted': generic preemption
     """
 
+    def on_program(program):
+        # The top level reads it for the checkpoint saves.
+        parent_sm.userdata.program = program
+
+    PROGRAM_CHAIN.attach(pubs, on_program)
     mission_child = build_mission_child_sm(pubs)
     HOLD.wrap_tree(mission_child)    # no state starts during a mux hold
     if stop_latch is None:
@@ -1272,38 +1310,50 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None)
         return True
 
     def outcome_cb(outcome_map):
+        outcome, reason = mission_outcome(outcome_map)
+        if outcome == 'mission_rejected' and PROGRAM_CHAIN.midway():
+            # Refused in the middle of a chain: the robot is out in the field,
+            # unlike every other refusal (nothing moved yet).
+            rospy.logwarn('[MISSION] next program of the chain refused, going home')
+            cancel_rejected_hold()
+            outcome = 'home_preempt'
+        if outcome != 'mission_complete':
+            PROGRAM_CHAIN.interrupt(reason)
+        return outcome
+
+    def mission_outcome(outcome_map):
         # Priority: STOP > TEMP > BATTERY > WEATHER > mission
         if (outcome_map.get('STOP_MONITOR') == 'invalid'
                 or stop_latch.requested()):
             save_checkpoint()
             pubs.stop_reason.publish(String("terminal:stop_signal"))
-            return 'stop_preempt'
+            return 'stop_preempt', 'stop'
         if outcome_map.get('MOWER_TEMP_MONITOR') == 'invalid':
             save_checkpoint()
             pubs.stop_reason.publish(String("interrupted:temp"))
-            return 'temp_preempt'
+            return 'temp_preempt', 'temp'
         if outcome_map.get('BATTERY_MONITOR') == 'invalid':
             save_checkpoint()
             pubs.stop_reason.publish(String("interrupted:battery"))
-            return 'battery_preempt'
+            return 'battery_preempt', 'battery'
         if outcome_map.get('WEATHER_MONITOR') == 'invalid':
             save_checkpoint()
             pubs.stop_reason.publish(String("interrupted:weather"))
-            return 'weather_preempt'
+            return 'weather_preempt', 'weather'
         mission_out = outcome_map.get('MISSION_CHILD')
         if mission_out == 'succeeded':
-            return 'mission_complete'
+            return 'mission_complete', None
         if home_latch.reason:
             save_checkpoint()
             pubs.stop_reason.publish(String("interrupted:{}".format(home_latch.reason)))
-            return 'home_preempt'
+            return 'home_preempt', home_latch.reason
         if mission_out == 'aborted':
             save_checkpoint()
             pubs.stop_reason.publish(String("critical:mission_aborted"))
-            return 'critical_error'
+            return 'critical_error', 'critical'
         if mission_out == 'rejected':
-            return 'mission_rejected'
-        return 'preempted'
+            return 'mission_rejected', 'rejected'
+        return 'preempted', 'preempted'
 
     all_keys = ['program', 'prg_start_time', 'unfinished_active',
                 'unfinished_zone', 'unfinished_path', 'unfinished_window',
@@ -1327,6 +1377,7 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None)
         clear_stale_preempt(mission_child)
         stop_latch.reset()
         home_latch.reset()
+        PROGRAM_CHAIN.begin(parent_sm.userdata.program)
 
     cc.register_start_cb(_on_start, cb_args=[])
 

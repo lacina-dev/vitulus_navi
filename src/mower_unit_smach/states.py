@@ -1578,6 +1578,92 @@ class WaitForMowerOff(smach.State):
         return 'timeout'
 
 
+class NextProgramState(smach.State):
+    """A program of a chain is done and another one follows (chain.py).
+
+    Saves the finished program, takes the next one over as a new Run would
+    (WAIT_FOR_PROGRAM reinit_userdata) and leaves for CHECK_ACTIVE_MAP. Its
+    checkpoint and results are its own from here on.
+
+    The next program starts only above the start limit of the battery, the same
+    ~battery_min_start_pct and the same "unknown does not hold it back" as
+    PreStartCheck (owner 2026-11-01). Below it the next program is left untouched
+    and the mission goes home. This runs under the mission's monitors, STOP included.
+    """
+    BATTERY_WAIT_S = 5
+
+    def __init__(self, pubs, chain):
+        smach.State.__init__(self,
+                             outcomes=['next', 'last', 'rejected', 'preempted'],
+                             input_keys=['program', 'prg_start_time'],
+                             output_keys=['program', 'prg_start_time', 'unfinished_active',
+                                          'path_window_start_index', 'path_chunk',
+                                          'restore_height_pending',
+                                          'consecutive_nav_failures', 'skipped_spans'])
+        self.pubs = pubs
+        self.chain = chain
+
+    def execute(self, userdata):
+        finished = userdata.program
+        if userdata.prg_start_time is not None:
+            duration = (rospy.Time.now() - userdata.prg_start_time).to_sec() / 60
+            finished.last_duration_minutes = int(round(duration))
+        self.pubs.save_program.publish(finished)
+        battery = self._battery()
+        if battery is False:
+            # `finished` is done and saved: a retry must not mow it again.
+            self.chain.leave_next(finished.name)
+            self.service_preempt()
+            return 'preempted'
+        min_start_pct = int(rospy.get_param('~battery_min_start_pct', 40))
+        if battery is not None and battery < min_start_pct \
+                and self.chain.has_next(finished.name):
+            self.chain.leave_next(finished.name)
+            return reject_mission(
+                self, self.pubs,
+                "Next program not started: battery {}% < {}%, going home".format(
+                    battery, min_start_pct),
+                "Rejected: low battery", "battery")
+        program = self.chain.advance(finished.name)
+        if program is None:
+            return 'last'
+        userdata.program = program
+        userdata.prg_start_time = rospy.Time.now()
+        userdata.unfinished_active = False
+        userdata.path_window_start_index = 0
+        userdata.path_chunk = None
+        userdata.restore_height_pending = False
+        userdata.consecutive_nav_failures = 0
+        userdata.skipped_spans = []
+        # Its old checkpoint is over: the list and the map must not show it.
+        self.pubs.save_program.publish(program)
+        rospy.loginfo('[NEXT_PROGRAM] %s done, next: %s', finished.name, program.name)
+        self.pubs.active_program.publish(String(program.name))
+        self.pubs.log_info.publish(String("{} done, next: {}".format(
+            finished.name, program.name)))
+        self.pubs.pm_play_melody.publish(Int16(2))
+        self.pubs.smach_status.publish(String("Initiating"))
+        # After the takeover: a STOP right here leaves this program undone and
+        # the finished one out of what remains.
+        if self.preempt_requested():
+            self.service_preempt()
+            return 'preempted'
+        return 'next'
+
+    def _battery(self):
+        """Battery %, None when unknown, False when preempted meanwhile."""
+        for _ in range(self.BATTERY_WAIT_S):
+            if self.preempt_requested():
+                return False
+            try:
+                msg = rospy.wait_for_message('/pm/power_status', Power_status, timeout=1.0)
+                return msg.battery_capacity
+            except rospy.ROSException:
+                pass
+        rospy.logwarn('[NEXT_PROGRAM] power status unavailable, proceeding')
+        return None
+
+
 # ===========================================================================
 # Dock-related states
 # ===========================================================================

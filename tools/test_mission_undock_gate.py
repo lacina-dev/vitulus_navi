@@ -34,6 +34,7 @@ Run:  python3 test_mission_undock_gate.py   (needs the ROS python env: rospy,
       smach, vitulus_msgs ... importable; does NOT need a ROS master)
 """
 import os
+import time
 import sys
 import threading
 
@@ -473,6 +474,9 @@ def test_review_findings():
     W.__init__()
     W.script = dict(healthy, **{MAPSTAT: lambda t: serving('Nmap'), '/mower_smach/stop':
                                 lambda t: Bool(data=True) if t > 300 else None})
+    # the simulated clock would otherwise outrun the monitor threads: STOP_MON subscribed
+    # only after 300-600 simulated s, and the GPS timeout decided the outcome
+    W.hooks.append(lambda t: time.sleep(0.002))
     del vis[:]
     out = cc.execute(parent.userdata)
     check('F1: leftover preempt recalled at mission start (real Concurrence)',

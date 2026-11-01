@@ -1,6 +1,8 @@
 """
 Top-level SMACH states: CriticalError, TerminalError, and RETURN_TO_DOCK sub-SM.
 """
+import threading
+
 import rospy
 import smach
 import smach_ros
@@ -52,6 +54,44 @@ class RunRequestNotifier(object):
         for sub in self._subs:
             sub.unregister()
         self._subs = []
+
+
+# ===========================================================================
+# /mower_smach/reset for the states that only leave on it
+# ===========================================================================
+
+class ResetListener(object):
+    """/mower_smach/reset on one subscriber for the whole stay in the state.
+
+    A Reset comes once and is not latched. wait_for_message re-subscribes every
+    second: a publisher still connected to the subscriber being closed loses the
+    message and the mission waits for ever (4 of 60 shots at that moment).
+    """
+    POLL_S = 0.2
+
+    def __init__(self):
+        self._requested = threading.Event()
+        self._sub = None
+
+    def _cb(self, msg):
+        if msg.data:
+            self._requested.set()
+
+    def start(self):
+        """Before the state says where it is: a Reset before that does not count."""
+        self._requested.clear()
+        self._sub = rospy.Subscriber('/mower_smach/reset', Bool, self._cb, queue_size=5)
+
+    def stop(self):
+        if self._sub is not None:
+            self._sub.unregister()
+            self._sub = None
+
+    def requested(self):
+        """Waits one poll; True when a Reset came since start()."""
+        if not self._requested.is_set():
+            rospy.sleep(self.POLL_S)
+        return self._requested.is_set()
 
 
 # ===========================================================================
@@ -116,8 +156,16 @@ class TerminalErrorState(smach.State):
                              input_keys=['error_reason'],
                              output_keys=['error_reason'])
         self.pubs = pubs
+        self._reset = ResetListener()
 
     def execute(self, userdata):
+        self._reset.start()
+        try:
+            return self._quarantine(userdata)
+        finally:
+            self._reset.stop()
+
+    def _quarantine(self, userdata):
         reason = userdata.error_reason or 'UNKNOWN'
         rospy.logerr("[TERMINAL_ERROR] Quarantine. Reason: %s", reason)
         self.pubs.log_info.publish(String(
@@ -143,19 +191,15 @@ class TerminalErrorState(smach.State):
                     self.service_preempt()
                     return 'preempted'
                 # Check for reset
-                try:
-                    msg = rospy.wait_for_message('/mower_smach/reset', Bool, timeout=1.0)
-                    if msg.data:
-                        rospy.loginfo("[TERMINAL_ERROR] Reset received")
-                        self.pubs.log_info.publish(String("Reset accepted. Returning to idle."))
-                        # The program is over: its latched name must not
-                        # outlive it (readers take it as "a program runs").
-                        self.pubs.active_program.publish(String(" "))
-                        self.pubs.smach_status.publish(String("Ready"))
-                        userdata.error_reason = ''
-                        return 'reset'
-                except rospy.ROSException:
-                    pass
+                if self._reset.requested():
+                    rospy.loginfo("[TERMINAL_ERROR] Reset received")
+                    self.pubs.log_info.publish(String("Reset accepted. Returning to idle."))
+                    # The program is over: its latched name must not
+                    # outlive it (readers take it as "a program runs").
+                    self.pubs.active_program.publish(String(" "))
+                    self.pubs.smach_status.publish(String("Ready"))
+                    userdata.error_reason = ''
+                    return 'reset'
 
                 # Periodic buzzer
                 if (rospy.Time.now() - last_buzzer).to_sec() >= self.BUZZER_INTERVAL:
@@ -195,8 +239,16 @@ class StoppedState(smach.State):
         # Own publisher so we can clear a possibly-stuck STOP on resume.
         self._stop_pub = rospy.Publisher('/mower_smach/stop', Bool,
                                          queue_size=1, latch=True)
+        self._reset = ResetListener()
 
     def execute(self, userdata):
+        self._reset.start()
+        try:
+            return self._hold(userdata)
+        finally:
+            self._reset.stop()
+
+    def _hold(self, userdata):
         rospy.logwarn("[STOPPED] Paused by STOP signal. Holding position.")
         self.pubs.log_info.publish(String(
             "Mission stopped. Press Reset, then Run to continue."))
@@ -217,21 +269,17 @@ class StoppedState(smach.State):
                 if self.preempt_requested():
                     self.service_preempt()
                     return 'preempted'
-                try:
-                    msg = rospy.wait_for_message('/mower_smach/reset', Bool, timeout=1.0)
-                    if msg.data:
-                        rospy.loginfo("[STOPPED] Reset received -> re-arming")
-                        # Clear any stuck STOP so the restarted mission is not
-                        # immediately preempted again.
-                        self._stop_pub.publish(Bool(False))
-                        self.pubs.log_info.publish(String("Reset accepted. Ready for Run."))
-                        # The stopped program is over (Run sets the name
-                        # again): its latched name must not outlive it.
-                        self.pubs.active_program.publish(String(" "))
-                        self.pubs.smach_status.publish(String("Ready"))
-                        return 'resume'
-                except rospy.ROSException:
-                    pass
+                if self._reset.requested():
+                    rospy.loginfo("[STOPPED] Reset received -> re-arming")
+                    # Clear any stuck STOP so the restarted mission is not
+                    # immediately preempted again.
+                    self._stop_pub.publish(Bool(False))
+                    self.pubs.log_info.publish(String("Reset accepted. Ready for Run."))
+                    # The stopped program is over (Run sets the name
+                    # again): its latched name must not outlive it.
+                    self.pubs.active_program.publish(String(" "))
+                    self.pubs.smach_status.publish(String("Ready"))
+                    return 'resume'
 
                 if (rospy.Time.now() - last_status).to_sec() >= self.STATUS_INTERVAL:
                     self.pubs.smach_status.publish(String("Stopped"))

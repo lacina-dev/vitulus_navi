@@ -377,6 +377,14 @@ def segmentize_raw_path(raw_path, segmentize_distance=0.03, outline_start_offset
     return path_new
 
 
+def mower_status_now(timeout=2.5):
+    """Status string of the next /mower/status, None when the board is silent."""
+    try:
+        return rospy.wait_for_message('/mower/status', Mower, timeout=timeout).status
+    except rospy.ROSException:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Mower power evidence (18. 10. 2026)
 #

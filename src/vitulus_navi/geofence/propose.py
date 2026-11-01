@@ -40,7 +40,7 @@ udělá teprve podpis člověka — a to jen v agentovi, ne tady.
    `~/.vitulus/mapping_v3/<site>/datum.yaml`; vzorec je otočení o `yaw_rad`
    a posun o `(utm_e, utm_n)`.  Ověřeno na živém robotu 2026-08-23: pozice
    `map <- base_link` (2.483, 0.126) vyjde na UTM (493076.183, 5540714.800),
-   což je waypoint `docked` z `waypoints.geojson` na 0.000 m.  Ta dvojice je
+   což je waypoint `DOCKED` z `waypoints.geojson` na 0.000 m.  Ta dvojice je
    fixture v `test/test_geofence_propose.py`.
 
 3. **Neznámo není volno.**  Každý vrchol *a každá hrana* musí ležet ve

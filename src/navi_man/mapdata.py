@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 
+import os
+import sys
+
 import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker
+
+try:
+    from vitulus_mapping import objnames
+except Exception:  # pragma: no cover - devel PYTHONPATH fallback (as bundle_sync)
+    sys.path.append(os.path.join(os.path.dirname(__file__),
+                                 "..", "..", "..", "vitulus_mapping", "src"))
+    from vitulus_mapping import objnames
 
 
 class MapPoint:
@@ -74,10 +84,29 @@ class MapData:
         self.points.append(point)
 
     def get_map_point(self, name):
+        # DOCK, UNDOCK, DOCKED answer in any case: a node not restarted yet still
+        # asks for `docked`.
+        name = objnames.canonical_name(name)
         for point in self.points:
             if point.name == name:
                 return point
         return False
+
+    def normalize_dock_names(self):
+        """Dock points from an old pickle -> uppercase, one of each. True if
+        something changed."""
+        names = [point.name for point in self.points]
+        kept = objnames.normalize_dock_names(names)
+        if [name for _, name in kept] == names:
+            return False
+        points = []
+        for i, name in kept:
+            point = self.points[i]
+            point.name = name
+            point.marker_message.ns = name
+            points.append(point)
+        self.points = points
+        return True
 
     def get_map_point_list(self):
         result = ''

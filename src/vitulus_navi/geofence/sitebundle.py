@@ -11,6 +11,7 @@ import os
 
 BUNDLE_ROOT = os.path.expanduser('~/.vitulus/mapping_v3')
 GEOFENCE_NAME = 'geofence.geojson'
+DOCK_POINTS = {'dock': 'DOCK', 'undock': 'UNDOCK', 'docked': 'DOCKED'}
 
 
 class SiteError(ValueError):
@@ -47,7 +48,11 @@ def load_waypoints(site):
             continue
         coordinates = geometry.get('coordinates') or []
         if len(coordinates) >= 2:
-            waypoints[str(name)] = (float(coordinates[0]), float(coordinates[1]))
+            # Dock points are uppercase, also in a file not migrated yet; the
+            # exact name wins over `docked` beside it.
+            key = DOCK_POINTS.get(str(name).casefold(), str(name))
+            if key == str(name) or key not in waypoints:
+                waypoints[key] = (float(coordinates[0]), float(coordinates[1]))
     return waypoints
 
 

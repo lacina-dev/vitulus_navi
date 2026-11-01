@@ -2,6 +2,7 @@
 import math
 import signal
 import sys
+import threading
 import time
 
 import PyKDL as kdl
@@ -12,19 +13,93 @@ import smach_ros
 from geometry_msgs.msg import Quaternion, PoseStamped
 from mbf_msgs.msg import ExePathAction, GetPathAction
 from mbf_msgs.msg import RecoveryAction
-from mbf_msgs.srv import CheckPath, CheckPathRequest
+from mbf_msgs.srv import CheckPath, CheckPathRequest, CheckPathResponse
 from nav_msgs.msg import Path
 from shapely import geometry
 from smach import CBState
 from smach_ros import ServiceState
 from std_msgs.msg import String, Int16, Bool
 
+from navi_man import path_rules
+
+
+NOGO_ASK_M = 0.6      # half width + safety_dist + the costmap's 5 cm + a cell or two
+
+
+def rule_refusal(path, nogos, lethal_index):
+    """Backstop behind navi_man (a path can arrive from anybody).  Why `path` must
+    not start, None when it may.  `lethal_index` sees every live obstacle, and a
+    path ran past those before: it is asked only about the poses near a nogo, so
+    what it finds is the stamped nogo, not a person somewhere along the path."""
+    if not nogos:
+        return None
+    xy = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
+    why = path_rules.path_refusal(xy, nogos)
+    if why:
+        return why
+    near = path_rules.near_nogo(xy, nogos, NOGO_ASK_M)
+    if not near:
+        return None
+    probe = Path()
+    probe.header = path.header
+    probe.poses = [path.poses[i] for i in near]
+    index = lethal_index(probe)
+    return 'lethal costmap cell next to a nogo' if index >= 0 else None
+
 
 class GetPathData(smach.State):
+    CHECK_TIMEOUT_S = 2.0
+
     def __init__(self):
-        smach.State.__init__(self, outcomes=['available', 'failed'],
+        smach.State.__init__(self, outcomes=['available', 'failed', 'refused'],
                              input_keys=['path', 'path_to_exe'],
                              output_keys=['path', 'path_start_pose'])
+        self.rule_set = path_rules.RuleSet()
+        rospy.Subscriber('/map_objects/rules', String, self.rules_cb, queue_size=1)
+        rospy.Subscriber('/mapping_manager/status', String,
+                         lambda m: self.rule_set.on_status(m.data), queue_size=1)
+        # navi_man's result channel: who sent the path reads this one.
+        self.status_pub = rospy.Publisher('/navi_manager/status', String, queue_size=10)
+        self.check_path = rospy.ServiceProxy('/move_base_flex/check_path_cost', CheckPath)
+
+    def rules_cb(self, msg):
+        if not self.rule_set.on_rules(msg.data):
+            rospy.logwarn('[GET_PATH_DATA] bad /map_objects/rules ignored')
+
+    def lethal_index(self, path):
+        """mower_unit_smach first_lethal_index; unavailable service = clear."""
+        try:
+            req = CheckPathRequest()
+            req.path = path
+            req.costmap = CheckPathRequest.GLOBAL_COSTMAP
+            req.return_on = CheckPathResponse.LETHAL
+            req.lethal_cost_mult = 1
+            req.inscrib_cost_mult = 1
+            req.unknown_cost_mult = 0
+            req.safety_dist = 0.10
+        except (rospy.ServiceException, rospy.ROSException) as e:
+            rospy.logwarn('[GET_PATH_DATA] check_path_cost unavailable: {}'.format(e))
+            return -1
+        # A call has no timeout of its own, and a preempt must not wait for it.
+        answer = []
+
+        def ask():
+            try:
+                answer.append(self.check_path(req))
+            except (rospy.ServiceException, rospy.ROSException) as e:
+                rospy.logwarn('[GET_PATH_DATA] check_path_cost unavailable: {}'.format(e))
+        worker = threading.Thread(target=ask, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + self.CHECK_TIMEOUT_S
+        while worker.is_alive() and time.monotonic() < deadline:
+            if self.preempt_requested():
+                return -1
+            worker.join(0.05)
+        if not answer:
+            return -1
+        resp = answer[0]
+        return int(resp.last_checked) if resp.state == CheckPathResponse.LETHAL else -1
+
     def path_to_polygon(self, path):
         # create shapely polygon from path poses
         polygon = geometry.LinearRing([[pose.pose.position.x, pose.pose.position.y] for pose in path.poses])
@@ -95,6 +170,14 @@ class GetPathData(smach.State):
         path_new.poses = path_new.poses[0:-start_poses_offset]
         path_new.poses = path_new.poses[start_poses_offset:]
         path = path_new
+        refused = rule_refusal(path, self.rule_set.nogos, self.lethal_index)
+        if refused:
+            rospy.logwarn('[GET_PATH_DATA] path refused: {}'.format(refused))
+            text = 'Path refused: {}'.format(refused)
+            self.status_pub.publish(text)
+            pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+            pub_log_info.publish(String(text))
+            return 'refused'
         userdata.path_start_pose = path.poses[0]
         # userdata.final_pose = path.poses[-1]
         # publish current path
@@ -143,7 +226,8 @@ def main():
         # Add state GET_PATH_DATA
         smach.StateMachine.add('GET_PATH_DATA', GetPathData(),
                                transitions={'available': 'GET_PATH_TO_BEGIN',
-                                            'failed': 'GET_PATH_TO_BEGIN'})
+                                            'failed': 'GET_PATH_TO_BEGIN',
+                                            'refused': 'WAIT_FOR_PATH'})
 
 
 

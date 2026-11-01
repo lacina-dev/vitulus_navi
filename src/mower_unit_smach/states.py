@@ -33,6 +33,8 @@ from rtabmap_msgs.msg import Info
 
 from .gps_wait import GpsWaitBudget, fmt_mmss
 from .hold_gate import HOLD
+from .rule_gate import RULES, StallAnchor
+from .temp_watch import TEMP_WATCH
 from .helpers import (
     get_tf_listener, get_robot_xy_in_map, nearest_pose_index,
     classify_mbf_result, distance_xy, direction_angle,
@@ -102,6 +104,7 @@ class WaitForMowerStatus(smach.State):
 
     def execute(self, userdata):
         deadline = rospy.Time.now() + rospy.Duration(self.timeout)
+        grace = TEMP_WATCH.grace()
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
             deadline = HOLD.stretch(deadline, self)
             if self.preempt_requested():
@@ -111,12 +114,17 @@ class WaitForMowerStatus(smach.State):
                 msg = rospy.wait_for_message('/mower/status', Mower, timeout=1.0)
             except rospy.ROSException:
                 continue
+            if grace.waits(rospy.get_time(), msg.status):
+                continue
             if msg.status in MOWER_ERROR_STATES:
                 rospy.logwarn('[WaitForMowerStatus] FW error state: %s', msg.status)
                 return 'error'
             if msg.status in self.targets:
                 if self.extra_check is None or self.extra_check(msg):
                     return 'reached'
+            if 'RUN' in self.targets and RULES.blade_held():
+                rospy.logwarn('[WaitForMowerStatus] blade held off by a map rule: going on')
+                return 'reached'
         rospy.logwarn('[WaitForMowerStatus] timeout (%.1fs) waiting for %s',
                       self.timeout, self.targets)
         return 'timeout'
@@ -939,6 +947,7 @@ class ExecutePathWithFeedback(smach.State):
         last_xy = start_xy
         max_displacement = 0.0   # furthest the robot got from chunk-start position
         stalled = False
+        stall_anchor = StallAnchor()
         best_dist_to_goal = float('inf')   # closest we have got to the chunk goal
         last_goal_progress_time = t_start  # when best_dist_to_goal last improved
         last_obs_check_time = t_start      # throttle for the live costmap probe
@@ -969,6 +978,16 @@ class ExecutePathWithFeedback(smach.State):
                 if self._mower_status and self._mower_status.status == 'BLOCKED':
                     rospy.logwarn("[EXE] BLOCKED motor at chunk_idx=%d dist_to_goal=%.2f",
                                   start_idx, dist_to_goal)
+                    self._client.cancel_goal()
+                    self._client.wait_for_result(rospy.Duration(1.0))
+                    return 'blocked'
+
+                # --- Blade lost behind a noblade area (map_rules_guard) ---
+                if RULES.blade_failed():
+                    rospy.logwarn("[EXE] blade did not come back after a noblade area "
+                                  "at chunk_idx=%d", start_idx)
+                    self.pubs.log_info.publish(String(
+                        "Blade did not come back after a no-blade area"))
                     self._client.cancel_goal()
                     self._client.wait_for_result(rospy.Duration(1.0))
                     return 'blocked'
@@ -1038,8 +1057,16 @@ class ExecutePathWithFeedback(smach.State):
                         if last_xy is not None:
                             moved = distance_xy(cur_xy[0], cur_xy[1],
                                                 last_xy[0], last_xy[1])
+                            # A map rule's cap: see StallAnchor.
+                            reverse = (self.last_feedback is not None and
+                                       self.last_feedback.last_cmd_vel.twist.linear.x < 0)
+                            moved = stall_anchor.moved(
+                                last_xy, cur_xy, moved, RULES.capped_below(
+                                    1.25 * self.STALL_MOVE_EPS / self.STALL_SAMPLE_DT,
+                                    reverse))
                             if moved > self.STALL_MOVE_EPS:
                                 last_move_time = now
+                                stall_anchor.reset()
                             last_xy = cur_xy
                         else:
                             last_xy = cur_xy
@@ -1521,6 +1548,7 @@ class WaitForRpmReached(smach.State):
         deadline = rospy.Time.now() + rospy.Duration(self.timeout)
         # None = rpm not set by the program/zone: any running blade counts.
         target = int(userdata.zone_rpm) if userdata.zone_rpm is not None else None
+        grace = TEMP_WATCH.grace()
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
             deadline = HOLD.stretch(deadline, self)
             if self.preempt_requested():
@@ -1530,6 +1558,8 @@ class WaitForRpmReached(smach.State):
                 msg = rospy.wait_for_message('/mower/status', Mower, timeout=1.0)
             except rospy.ROSException:
                 continue
+            if grace.waits(rospy.get_time(), msg.status):
+                continue
             if msg.status in MOWER_ERROR_STATES:
                 rospy.logwarn('[WaitForRpmReached] FW error: %s', msg.status)
                 return 'error'
@@ -1537,6 +1567,9 @@ class WaitForRpmReached(smach.State):
                     else target - 100 < msg.moto_rpm < target + 100):
                 self.pubs.log_info.publish(String("Mowing started..."))
                 self.pubs.smach_status.publish(String("Mowing started"))
+                return 'reached'
+            if RULES.blade_held():
+                rospy.logwarn('[WaitForRpmReached] blade held off by a map rule: going on')
                 return 'reached'
         rospy.logwarn('[WaitForRpmReached] timeout (%.1fs) target=%s', self.timeout, target)
         return 'timeout'

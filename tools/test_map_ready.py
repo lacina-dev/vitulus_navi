@@ -3,7 +3,7 @@
 
 navi_man says on /navi_manager/map_ready when it holds the map, and how far the
 live pose is from that map's dock. navi_transform and dock_localization_seed use
-it to drop the OLD map's "docked" anchor: on a served-site change active_map stays
+it to drop the OLD map's DOCKED anchor: on a served-site change active_map stays
 the constant 'SITE', so before this the dock hold kept the old map's pose for up
 to 30 s and then refused the jump as creep.
 
@@ -67,7 +67,7 @@ def test_map_ready():
     print('navi_man map_ready:')
     Node = load('navi_man_node', os.path.join(HERE, '..', 'nodes', 'navi_man')).Node
     state = Node.map_ready_state
-    pts = [point('docked', 10.0, 20.0), point('DOCK', 11.0, 20.0)]
+    pts = [point('DOCKED', 10.0, 20.0), point('DOCK', 11.0, 20.0)]
     s = state(navi_node(points=pts, tf=Tf(10.3, 20.4)))
     check('taken over', s['ready'] and s['site'] == 'BACK')
     check('dock error measured', s['dock_err_m'] == 0.5, str(s['dock_err_m']))
@@ -101,7 +101,7 @@ def test_dock_hold():
     Cls = load('navi_transform_node', os.path.join(HERE, '..', 'nodes', 'navi_transform')).NavTfNode
     node = types.SimpleNamespace(_SITE_UNSET=object(), _dock_anchor_pose=(1.0, 2.0, 0.0),
                                  _dock_anchor_fetch_t=99.0, _dock_hold_active=True,
-                                 _dock_anchor_point='docked', _dock_anchor_map='SITE')
+                                 _dock_anchor_point='DOCKED', _dock_anchor_map='SITE')
     node._dock_anchor_site = node._SITE_UNSET
     node._drop_dock_anchor = lambda what, name: Cls._drop_dock_anchor(node, what, name)
     Cls.cb_map_ready(node, msg('BACK'))

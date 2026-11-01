@@ -340,7 +340,7 @@ class GlocServer(object):
         #      nudges on a 20 % rms improvement would disable tracking outright —
         #      near convergence rms_min ~= rms_prior by construction).
         # The PRIOR here is pose0 = map->base_link at the scan stamp, which IS the
-        # best-known pose: while docked it is the dock-held "docked" waypoint
+        # best-known pose: while docked it is the dock-held DOCKED waypoint
         # (navi_transform A2), under GPS it is the GPS anchor, otherwise the
         # odometry-propagated last accepted pose.
         self.track_overlap_apply_gate = bool(rospy.get_param(

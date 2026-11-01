@@ -1229,7 +1229,7 @@ def _draw_overlay(draw, proj, overlay, font):
             _dot(draw, px, py, 8, colour, outline=(0, 0, 0))
         label = str(item.get('label') or '')
         if label:
-            # dok stojí na waypointu „docked" se svým popiskem vpravo — DOK nad
+            # dok stojí na waypointu DOCKED se svým popiskem vpravo — DOK nad
             lx, ly = (px - 14, py - 30) if kind == 'dock' else (px + 11, py - 9)
             draw.text((lx, ly), label, fill=colour, font=font,
                       stroke_width=2, stroke_fill=(0, 0, 0))

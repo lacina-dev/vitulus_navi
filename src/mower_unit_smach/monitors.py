@@ -7,6 +7,7 @@ of the Concurrence (which preempts the mission child SM).
 import rospy
 
 from .helpers import get_weather_config, rain_data_fresh, rain_forecast_steps
+from .temp_watch import TEMP_WATCH
 
 
 def weather_monitor_cb(userdata, msg):
@@ -51,13 +52,11 @@ def battery_monitor_cb(userdata, msg):
 def mower_temp_monitor_cb(userdata, msg):
     """Monitor /mower/status (vitulus_msgs/Mower).
 
-    Pravidlo 5: Trigger return-to-dock if motor state is TEMP.
+    Pravidlo 5: Trigger return-to-dock if motor state stays TEMP; a reading that
+    falls back within seconds is a sensor spike, see temp_watch.py.
     BLOCKED is handled locally inside ExecutePathWithFeedback.
     """
-    if msg.status == 'TEMP':
-        rospy.logwarn("[MOWER_TEMP_MONITOR] Motor overtemperature detected")
-        return False
-    return True
+    return TEMP_WATCH.on_status(msg)
 
 
 def stop_monitor_cb(userdata, msg):

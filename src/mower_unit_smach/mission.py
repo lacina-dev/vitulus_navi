@@ -25,6 +25,8 @@ from rtabmap_msgs.msg import Info
 
 from .chain import PROGRAM_CHAIN
 from .hold_gate import HOLD
+from .stale_blade import TERMINAL_REASON
+from .temp_watch import TEMP_WATCH
 from .helpers import (
     classify_mbf_result, safe_blade_shutdown, wait_for_mbf, MOWER_ERROR_STATES,
     mark_run_phase, mower_status_now, run_flags)
@@ -1198,6 +1200,15 @@ def clear_stale_preempt(container):
         clear_stale_preempt(child)
 
 
+def rules_terminal(home_latch, userdata):
+    """stale_blade.py gave up: nothing can move, so no way home either.  The caller
+    returns 'preempted' -> TERMINAL_ERROR, buzzer and Reset."""
+    if home_latch.reason != TERMINAL_REASON:
+        return False
+    userdata.error_reason = TERMINAL_REASON.upper()
+    return True
+
+
 class ReturnHomeLatch(object):
     """The mission goes home before its end (window closed): same mechanism as
     UserStopLatch, preempt of the mission child -> RETURN_TO_DOCK.
@@ -1296,6 +1307,7 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None)
         home_latch = ReturnHomeLatch()
     home_latch.attach(mission_child)
     run_flags.home_latch = home_latch
+    TEMP_WATCH.attach(pubs, HOLD, home_latch)
 
     def save_checkpoint():
         # The periodic save is up to 60 s behind: the robot goes home now and
@@ -1330,7 +1342,7 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None)
             return 'stop_preempt', 'stop'
         if outcome_map.get('MOWER_TEMP_MONITOR') == 'invalid':
             save_checkpoint()
-            pubs.stop_reason.publish(String("interrupted:temp"))
+            pubs.stop_reason.publish(String(TEMP_WATCH.stop_reason()))
             return 'temp_preempt', 'temp'
         if outcome_map.get('BATTERY_MONITOR') == 'invalid':
             save_checkpoint()
@@ -1343,6 +1355,9 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None)
         mission_out = outcome_map.get('MISSION_CHILD')
         if mission_out == 'succeeded':
             return 'mission_complete', None
+        if rules_terminal(home_latch, parent_sm.userdata):
+            save_checkpoint()
+            return 'preempted', TERMINAL_REASON
         if home_latch.reason:
             save_checkpoint()
             pubs.stop_reason.publish(String("interrupted:{}".format(home_latch.reason)))

@@ -314,7 +314,7 @@ def collect(source='auto', timeout_s=2.0, site=None, sources=None):
             col['datum'] = bundle.get('datum')
     if col['dock'] is None:
         pts = wq.points_table(col['data'].get('waypoints'))
-        for name in ('docked', 'DOCK', 'dock'):
+        for name in ('DOCKED', 'docked', 'DOCK', 'dock'):
             if name in pts:
                 col['dock'] = {'name': name, 'x': pts[name][0], 'y': pts[name][1], 'yaw': None}
                 break

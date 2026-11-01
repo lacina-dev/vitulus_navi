@@ -27,6 +27,10 @@ from std_msgs.msg import Bool, String
 from mower_unit_smach.publishers import MowerPublishers
 from mower_unit_smach.helpers import wait_for_mbf, start_power_watch, run_flags
 from mower_unit_smach.global_stop import GlobalStop
+from mower_unit_smach.hold_gate import HOLD
+from mower_unit_smach.rule_gate import RULES
+from mower_unit_smach.temp_watch import TEMP_WATCH
+from mower_unit_smach.stale_blade import StaleBladeWatch
 from mower_unit_smach.states import PreStartCheck
 from mower_unit_smach.top_level import (
     CriticalErrorState, TerminalErrorState, StoppedState,
@@ -58,6 +62,9 @@ def main():
     pubs.busy.publish(Bool(False))
     start_power_watch()
     run_flags.start()
+    RULES.start()
+    blade_watch = StaleBladeWatch(pubs, HOLD, RULES)   # the blade while the rules stop all
+    TEMP_WATCH.blade_watch = blade_watch
     wait_for_mbf()
 
     # ===================================================================
@@ -102,6 +109,7 @@ def main():
     # Every STOP re-preempts a running mission (vitulus-field#53).
     stop_latch = UserStopLatch()
     home_latch = ReturnHomeLatch()
+    blade_watch.latch = home_latch
 
     with sm:
 

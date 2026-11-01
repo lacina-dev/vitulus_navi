@@ -191,7 +191,7 @@ def test_import_from_a_site_without_a_waypoint_file(mod):
         n = FakeNode(mod, served='Plna', points_site=None,
                      points=[FakePoint('docked')])
         mod.Node._import_served_site_bundle(n)
-        check('the site file wins', sorted(names(n)), ['DOCK', 'docked'])
+        check('the site file wins', sorted(names(n)), ['DOCK', 'DOCKED'])
     finally:
         mod._bundle.SITES_ROOT = old_root
         mod.MAPDATA_PKL = old_pkl

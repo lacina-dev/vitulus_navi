@@ -16,7 +16,7 @@
             <param name="heading_anchor_spread_max_deg" value="6.0"/>
             <!-- DOCKFIX-2026-08-29 — dock localization hardening.
                  A2 continuous dock hold: while docked (debounced) map->odom is
-                 recomputed every 30 Hz tick from the "docked" waypoint composed
+                 recomputed every 30 Hz tick from the DOCKED waypoint composed
                  with the live odom->base, so the docked pose IS the waypoint and
                  cannot drift between the old 5 s re-anchor pulses.
                  ROLLBACK: dock_anchor_enable:=false (back to pulse re-anchor). -->
@@ -42,7 +42,7 @@
         <!-- lidar global localization scorer (passive; apply is margin-gated) -->
         <node name="gloc_server" pkg="vitulus_navi" type="gloc_server" respawn="true" respawn_delay="2" output="log">
             <!-- EDT tracker localizes against the served mapping-v3 site raster -->
-            <param name="map_topic" value="/mapping_manager/site_map"/>
+            <param name="map_topic" value="/mapping_manager/site_map_loc"/>
             <!-- 2026-07-19 INCIDENT: auto-relock teleported the pose 4.68 m on
                  the new DIRECT raster — its sparse obstacle landscape inflates
                  relative margins (337% on a false lock) and the baseline rms is

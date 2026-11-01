@@ -45,6 +45,15 @@ def _navi_pkg_dir():
 NAVI_PKG_DIR = _navi_pkg_dir()
 
 
+def _dock_point_pose(srv, name):
+    """get_point_pose answer for a dock point. A navi_man not restarted yet still
+    holds `docked`; this goes when no such navi_man can exist."""
+    resp = srv(name)
+    if not resp.result and name == 'DOCKED':
+        resp = srv('docked')
+    return resp
+
+
 def cart2pol(x, y):
     rho = np.sqrt(x ** 2 + y ** 2)
     phi = np.arctan2(y, x)
@@ -728,7 +737,7 @@ class NavTfNode:
         self.ekf_wheel_nav_odom_sub = rospy.Subscriber("/odometry/ekf_wheel_nav_odom", Odometry, self.callback_ekf_wheel_nav_odom, queue_size=200)
         self.map_coords_sub = rospy.Subscriber("/navi_manager/map_coords", PoseStamped, self.callback_map_coords)
         self.navi_indoor_sub = rospy.Subscriber("/navi_manager/is_indoor", Bool, self.callback_navi_indoor)
-        # DOCKFIX-2026-08-29 (A2): invalidate the cached "docked" waypoint when
+        # DOCKFIX-2026-08-29 (A2): invalidate the cached DOCKED waypoint when
         # the served map changes — every map has its own dock anchor.
         self.active_map_sub = rospy.Subscriber("/navi_manager/active_map", String,
                                                self.cb_active_map, queue_size=2)
@@ -786,7 +795,7 @@ class NavTfNode:
             rospy.get_param('~tracker_dock_grace_s', 8.0))
         # --- DOCKFIX-2026-08-29 ------------------------------------------------
         # A2 CONTINUOUS DOCK HOLD. Owner's requirement: "robot docked => the pose
-        # IS the 'docked' waypoint, rock stable". The old design pulsed the anchor
+        # IS the DOCKED waypoint, rock stable". The old design pulsed the anchor
         # from dock_localization_seed every 5-6 s once the pose had already
         # drifted 10 cm off; between pulses odom drift owned the pose, and the
         # pulse itself raced a second writer. Instead, while DOCKED (debounced)
@@ -802,10 +811,10 @@ class NavTfNode:
         # teleporting the pose — degrade to "reject", never to "confidently wrong".
         self._dock_anchor_max_hold_m = float(
             rospy.get_param('~dock_anchor_max_hold_m', 3.0))
-        self._dock_anchor_point = rospy.get_param('~dock_anchor_point', 'docked')
+        self._dock_anchor_point = rospy.get_param('~dock_anchor_point', 'DOCKED')
         self._dock_anchor_refresh_s = float(
             rospy.get_param('~dock_anchor_refresh_s', 30.0))
-        self._dock_anchor_pose = None      # (x, y, yaw) of the "docked" waypoint
+        self._dock_anchor_pose = None      # (x, y, yaw) of the DOCKED waypoint
         self._dock_anchor_fetch_t = 0.0
         self._dock_anchor_map = None       # active map the cached anchor belongs to
         self._SITE_UNSET = object()
@@ -923,11 +932,11 @@ class NavTfNode:
                 return
             try:
                 srv = rospy.ServiceProxy('/navi_manager/get_point_pose', Point_pose)  # Connect to the service
-                # FIX-1: fetch "docked" (the pose AT the dock), not "dock" (the
+                # FIX-1: fetch DOCKED (the pose AT the dock), not DOCK (the
                 # approach point in front of it), and route the correction through
                 # the source-tagged dock-priority channel (same path as messages
                 # on /nav_tf/set_map_pose_dock) instead of snapping the nav EKF.
-                response = srv("docked")
+                response = _dock_point_pose(srv, 'DOCKED')
                 if response.result:
                     rospy.logdebug("Docked point pose: %s" % response.point_pose)
                     self.callback_set_map_pose(response.point_pose, source='dock')
@@ -1054,7 +1063,7 @@ class NavTfNode:
         return (rospy.get_time() - self._docked_since) >= self._dock_anchor_debounce_s
 
     def refresh_dock_anchor(self):
-        """1 Hz: keep the "docked" waypoint for THIS map cached for the 30 Hz
+        """1 Hz: keep the DOCKED waypoint for THIS map cached for the 30 Hz
         hold (no service calls in the hot loop). Cleared on a map change."""
         if not self._dock_anchor_enable:
             return
@@ -1070,7 +1079,7 @@ class NavTfNode:
         try:
             rospy.wait_for_service('/navi_manager/get_point_pose', timeout=1.0)
             srv = rospy.ServiceProxy('/navi_manager/get_point_pose', Point_pose)
-            resp = srv(self._dock_anchor_point)
+            resp = _dock_point_pose(srv, self._dock_anchor_point)
         except (rospy.ROSException, rospy.ServiceException) as e:
             rospy.logwarn_throttle(60.0, '[dock_hold] get_point_pose("%s") '
                                    'unavailable: %s', self._dock_anchor_point, e)
@@ -1093,7 +1102,7 @@ class NavTfNode:
         """A served-site change is a map change too, but active_map stays the
         constant 'SITE' (vitulus-field#46). map_ready names the site navi_man
         has really taken over, so the waypoint fetched next is the new one.
-        Without this the hold kept the OLD site's "docked" pose for up to 30 s
+        Without this the hold kept the OLD site's DOCKED pose for up to 30 s
         and then refused the jump as creep: the robot would leave the dock with
         a pose in the wrong frame."""
         try:
@@ -1109,7 +1118,7 @@ class NavTfNode:
         self._drop_dock_anchor('site', site)
 
     def cb_active_map(self, msg):
-        """A new map has its OWN "docked" waypoint — drop the cached anchor.
+        """A new map has its OWN DOCKED waypoint — drop the cached anchor.
         Only on an actual CHANGE: /navi_manager/active_map is republished
         periodically, and clearing on every message left the anchor unavailable
         between the 5 s refetches — the hold then never held."""
@@ -3177,7 +3186,7 @@ class NavTfNode:
         node_gnss.print_info()
         node_gnss.publish_status()
         node_gnss.maybe_apply_site_datum()
-        # DOCKFIX-2026-08-29 (A2): keep the "docked" waypoint cached for the
+        # DOCKFIX-2026-08-29 (A2): keep the DOCKED waypoint cached for the
         # 30 Hz hold (service call at 1 Hz max, never in the hot loop).
         node_gnss.refresh_dock_anchor()
         node_gnss.publish_loc_status()

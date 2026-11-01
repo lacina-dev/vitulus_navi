@@ -40,6 +40,7 @@ from tf import TransformListener
 from vitulus_navi.srv import Point_pose, Point_poseResponse
 
 from navi_man import mapdata
+from navi_man import path_rules
 sys.modules['mapdata'] = mapdata
 from mapdata import MapPoint, MapData, MapPath
 
@@ -119,6 +120,23 @@ try:
 except Exception as _e:
     _objnames = None
     sys.stderr.write("navi_man: objnames unavailable (%s); rename disabled.\n" % _e)
+
+
+def _point_name(name):
+    """A publisher not restarted yet may still say `docked`: that is DOCKED,
+    never a second point."""
+    return _objnames.canonical_name(name) if _objnames is not None else name
+
+
+def _migrate_dock_names(site):
+    """The site's file written with the uppercase dock names. Nothing depends on
+    it succeeding: the bundle reader answers canonically either way."""
+    try:
+        if _bundle.migrate_dock_names(site):
+            rospy.loginfo("navi_man: dock point names of site '%s' made uppercase.",
+                          site)
+    except Exception as e:
+        rospy.logwarn("navi_man: dock name migration of site '%s' failed: %s", site, e)
 
 
 class DockerConnection:
@@ -288,7 +306,7 @@ class Node:
         # + waypoint import in site-native mode. Set by callback_mapping_status.
         self._served_site = None
         # Site the in-memory waypoints/paths BELONG TO. None = they belong to no
-        # site yet (the dock 'docked' seed can land before anything is served).
+        # site yet (the dock DOCKED seed can land before anything is served).
         # A map with no waypoints must show no waypoints, so points are dropped
         # the moment the served site stops matching this (2026-08-30).
         self._points_site = None
@@ -359,6 +377,15 @@ class Node:
         self.tf2_TransformBroadcaster = tf2_ros.TransformBroadcaster()
         self.msg_odometry_odom = Odometry()
 
+        # Map rules for stored paths (MAP_OBJECTS.md section 5), before execute_path.
+        self.rule_set = path_rules.RuleSet()
+        self.rule_lethal = []
+        self.rule_free = []
+        self.refuse_lethal_edits = bool(rospy.get_param('~refuse_lethal_edits', True))
+        rospy.Subscriber("/map_objects/rules", String, self.callback_map_rules, queue_size=1)
+        rospy.Subscriber("/mapping_manager/status", String,
+                         lambda m: self.rule_set.on_status(m.data), queue_size=1)
+        rospy.Subscriber("/map_objects/objects", String, self.callback_map_edits, queue_size=1)
         rospy.Subscriber("/navi_manager/save_map", String, self.callback_save_map)
         rospy.Subscriber("/navi_manager/remove_map", String, self.callback_remove_map)
         rospy.Subscriber("/navi_manager/edit_map", String, self.callback_edit_map)
@@ -981,6 +1008,21 @@ class Node:
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
 
+    def callback_map_rules(self, msg):
+        if not self.rule_set.on_rules(msg.data):
+            rospy.logwarn("navi_man: bad /map_objects/rules ignored")
+
+    def callback_map_edits(self, msg):
+        try:
+            self.rule_lethal, self.rule_free = path_rules.parse_edits(msg.data)
+        except (ValueError, TypeError, AttributeError) as e:
+            rospy.logwarn("navi_man: bad /map_objects/objects: {}".format(e))
+
+    def path_refusal(self, path):
+        xy = [(p.position.x, p.position.y) for p in path.poses]
+        lethal = self.rule_lethal if self.refuse_lethal_edits else []
+        return path_rules.path_refusal(xy, self.rule_set.nogos, lethal, self.rule_free)
+
     def callback_execute_path(self, msg):
         if msg.data != "":
             # print(self.move_base_client_state)
@@ -988,7 +1030,11 @@ class Node:
                 path = self.running_map_data.get_map_path(msg.data)
                 # print("path")
                 # print(path)
-                if path:
+                refused = self.path_refusal(path) if path else None
+                if refused:
+                    self.status_msg_pub.publish("{} path refused: {}".format(msg.data, refused))
+                    rospy.logwarn("{} path refused: {}".format(msg.data, refused))
+                elif path:
                     path_exe = Path()
                     path_exe.header.frame_id = path.tf_frame
                     path_exe.header.stamp = rospy.Time.now()
@@ -1074,6 +1120,12 @@ class Node:
             rospy.loginfo("The name is empty!")
 
     def callback_remove_point(self, msg):
+        if _objnames is not None and _objnames.is_dock_point(msg.data):
+            # DOCK, UNDOCK, DOCKED can move but never go: dock flows and the dock
+            # seed need them (owner 2026-11-01).
+            self.status_msg_pub.publish("{} cannot be removed.".format(msg.data))
+            rospy.logwarn("remove_point: %s is a protected dock point.", msg.data)
+            return
         if msg.data != "":
             point = self.running_map_data.get_map_point(msg.data)
             if point:
@@ -1260,6 +1312,7 @@ class Node:
         return pose, tf_frames[0].replace('/', '')
 
     def callback_save_waypoint(self, msg):
+        msg.data = _point_name(msg.data)
         if msg.data != "":
             pose, tf_frame = self.getCurrentPose()
             point = MapPoint(msg.data, pose, tf_frame)
@@ -1349,7 +1402,7 @@ class Node:
             self.status_msg_pub.publish("save_waypoint_at: bad JSON ({})".format(e))
             rospy.logwarn("save_waypoint_at: bad JSON: %s", e)
             return
-        name = str(spec.get('name', '')).strip()
+        name = _point_name(str(spec.get('name', '')).strip())
         if name == "":
             self.status_msg_pub.publish("The name is empty!")
             rospy.loginfo("The name is empty!")
@@ -1576,6 +1629,8 @@ class Node:
     def load_running_map_data(self):
         with open(MAPDATA_PKL, 'rb') as input:
             loaded = pickle.load(input)
+        if loaded.normalize_dock_names():
+            rospy.loginfo("navi_man: dock point names of the pickle made uppercase.")
         with self._map_data_lock:   # AUDIT M8
             self.running_map_data = loaded
         # site-bundle import-if-newer (WP-B): if the linked site bundle is newer
@@ -1805,6 +1860,7 @@ class Node:
                 return
             datum = _geo.from_pickle_datum(rmd)
             self._bundle_datum_guard(site, datum)
+            _migrate_dock_names(site)
             pt_specs = _bsync.waypoints_to_point_specs(
                 _bundle.load_waypoints(site), datum)
             pa_specs = _bsync.paths_to_path_specs(
@@ -1856,9 +1912,9 @@ class Node:
             self._import_served_site_bundle()
         else:
             rospy.logwarn("navi_man: no site served at boot — waypoints unavailable "
-                          "until a site is served (the dock 'docked' seed logs "
+                          "until a site is served (the dock DOCKED seed logs "
                           "ACTION-NEEDED and retries; it lands once the site + its "
-                          "'docked' waypoint arrive).")
+                          "DOCKED waypoint arrive).")
             self._served_site_warned = True
 
     def callback_mapping_status(self, msg):
@@ -1964,13 +2020,14 @@ class Node:
             # what we hold, absent -> the site simply has none and we show none.
             # The 2026-07-19 exception that kept whatever was in memory is gone,
             # because it let one map's points show up (and get saved) on another.
-            # The single case it existed for survives: the dock 'docked' seed
+            # The single case it existed for survives: the dock DOCKED seed
             # placed before ANY site was served is not yet owned by a site
             # (_points_site is None), so it is kept for a site that has no
             # waypoints file of its own — that seed is what first fills it.
             wp_file = os.path.join(_bundle.site_dir(site), 'waypoints.geojson')
             pa_file = os.path.join(_bundle.site_dir(site), 'paths.geojson')
             unowned = self._points_site is None
+            _migrate_dock_names(site)
             if os.path.exists(wp_file):
                 pt_specs = _bsync.waypoints_to_point_specs(
                     _bundle.load_waypoints(site), datum)
@@ -2016,7 +2073,7 @@ class Node:
     def map_ready_state(self):
         """What /navi_manager/map_ready says. ready: this node holds the map's
         waypoints/paths/datum (site-native) or has finished load_map (legacy).
-        dock_err_m: distance of the live pose from the map's 'docked' waypoint,
+        dock_err_m: distance of the live pose from the map's DOCKED waypoint,
         None when the map has none or TF is not there."""
         rmd = self.running_map_data
         names = [p.name for p in rmd.points]
@@ -2027,11 +2084,11 @@ class Node:
         state = {'active_map': self.active_map, 'site': self._points_site,
                  'served': self._served_site, 'ready': ready,
                  'has_dock': 'DOCK' in names,    # as CheckForDockPoint: exact
-                 'has_docked': 'docked' in names, 'dock_err_m': None}
+                 'has_docked': 'DOCKED' in names, 'dock_err_m': None}
         if ready and state['has_docked']:
             try:
                 base = self.tf2_Buffer.lookup_transform('map', 'base_link', rospy.Time(0))
-                dock = next(p for p in rmd.points if p.name == 'docked')
+                dock = next(p for p in rmd.points if p.name == 'DOCKED')
                 state['dock_err_m'] = round(math.hypot(
                     base.transform.translation.x - dock.pose.position.x,
                     base.transform.translation.y - dock.pose.position.y), 2)

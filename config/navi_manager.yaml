@@ -2,8 +2,8 @@
 
 # Name of the map to load (create new map if empty).
 # Boot-in-dock: load the production outdoor map so the dock seed can place the
-# robot in it immediately (no GPS needed). The map MUST contain the "docked"
-# waypoint (be docked + localized, then publish "docked" to /navi_manager/save_waypoint
+# robot in it immediately (no GPS needed). The map MUST contain the DOCKED
+# waypoint (be docked + localized, then publish DOCKED to /navi_manager/save_waypoint
 # and SAVE the map).
 #
 # RETIRED (delegacy 2026-07-19): legacy navi maps must NOT be USED anywhere — the
@@ -72,7 +72,7 @@ site_native: true
 # localization launch directly, and takes waypoints/paths/datum from the
 # CURRENTLY SERVED site's bundle (/mapping_manager/status -> serving.site). If no
 # site is served at boot, running_map_data is EMPTY (a one-line warn) and the
-# dock 'docked' seed retries until a site + its 'docked' waypoint arrive; the
+# dock DOCKED seed retries until a site + its DOCKED waypoint arrive; the
 # robot runs odom-frame (GPS owns map->odom via navi_transform's own
 # site_datum.yaml fallback) until then.
 #

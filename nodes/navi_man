@@ -292,6 +292,8 @@ class Node:
         # A map with no waypoints must show no waypoints, so points are dropped
         # the moment the served site stops matching this (2026-08-30).
         self._points_site = None
+        self._map_loading = False       # legacy load_map running (navi restarts)
+        self._map_ready_last = None
         # (site, datum.yaml mtime) of the last import retry from the slow loop
         # (served_site_import_tick) - one retry per state of the datum file.
         self._import_retry_key = None
@@ -339,6 +341,10 @@ class Node:
         # map source but we have not yet received a site_map (e.g. mapping_manager
         # started after us, or has not served yet at boot).
         self.pub_serve_site = rospy.Publisher('/mapping_manager/serve_site', String, queue_size=1, latch=True)
+        # vitulus-field#46: is the map really taken over? Read by the planner
+        # before a program leaves the dock, and by the dock anchor (a site change
+        # does not show on active_map, that is the constant 'SITE').
+        self.pub_map_ready = rospy.Publisher('/navi_manager/map_ready', String, queue_size=1, latch=True)
         self.nex_log_info_pub = rospy.Publisher('/nextion/log_info', String, queue_size=10)
         self.planner_new_map_pub = rospy.Publisher('/web_plan/new_map', String, queue_size=10)
         self.rtabmap_settings_pub = rospy.Publisher('navi_manager/rtabmap_settings', Rtabmap_settings, queue_size=10)
@@ -2007,6 +2013,38 @@ class Node:
             rospy.logwarn("navi_man site-native: import from served site '%s' "
                           "failed — keeping current running_map_data: %s", site, e)
 
+    def map_ready_state(self):
+        """What /navi_manager/map_ready says. ready: this node holds the map's
+        waypoints/paths/datum (site-native) or has finished load_map (legacy).
+        dock_err_m: distance of the live pose from the map's 'docked' waypoint,
+        None when the map has none or TF is not there."""
+        rmd = self.running_map_data
+        names = [p.name for p in rmd.points]
+        if self._legacy_maps:
+            ready = not self._map_loading and self.active_map not in ('', 'New')
+        else:
+            ready = bool(self._served_site) and self._points_site == self._served_site
+        state = {'active_map': self.active_map, 'site': self._points_site,
+                 'served': self._served_site, 'ready': ready,
+                 'has_dock': 'DOCK' in names,    # as CheckForDockPoint: exact
+                 'has_docked': 'docked' in names, 'dock_err_m': None}
+        if ready and state['has_docked']:
+            try:
+                base = self.tf2_Buffer.lookup_transform('map', 'base_link', rospy.Time(0))
+                dock = next(p for p in rmd.points if p.name == 'docked')
+                state['dock_err_m'] = round(math.hypot(
+                    base.transform.translation.x - dock.pose.position.x,
+                    base.transform.translation.y - dock.pose.position.y), 2)
+            except Exception:
+                pass                     # the planner's timeout decides
+        return state
+
+    def publish_map_ready(self, _event=None):
+        state = self.map_ready_state()
+        if state != self._map_ready_last:
+            self._map_ready_last = state
+            self.pub_map_ready.publish(String(json.dumps(state)))
+
     def served_site_import_tick(self):
         """Retry the served site's import until its waypoints are in memory.
         Called from the slow loop. The import runs on boot and on a serving-site
@@ -2381,6 +2419,7 @@ class Node:
                 self.status_msg_pub.publish("Map name malformed, not loaded.")
                 return
             # self.map_status = "Loading"
+            self._map_loading = True
             self.active_map = msg.data
             self.status_msg_pub.publish("Map {} will be loaded...".format(msg.data))
             # self.indoor = False
@@ -2422,6 +2461,7 @@ class Node:
                 self.start_navi_launch(["localization:=true"])
             self.load_running_map_data()
             self.set_map_utm_transform()
+            self._map_loading = False
             # self.map_status = "Ready"
         else:
             self.status_msg_pub.publish("Map not loaded. Empty name.")
@@ -2444,6 +2484,7 @@ class Node:
                 self.status_msg_pub.publish("Map name malformed, not loaded.")
                 return
             # self.map_status = "Loading"
+            self._map_loading = True
             self.active_map = msg.data
             rospy.loginfo("Map {} will be loaded...".format(msg.data))
             # self.indoor = False
@@ -2467,6 +2508,7 @@ class Node:
             self.start_navi_launch(["localization:=true_rtabmap"])
             self.load_running_map_data()
             self.set_map_utm_transform()
+            self._map_loading = False
         else:
             self.status_msg_pub.publish("Map not loaded. Empty name.")
             rospy.logerr("Map not loaded. Empty name.")
@@ -2710,6 +2752,7 @@ if __name__ == '__main__':
         rospy.init_node('navi_man')
         rospy.loginfo("<{}> Initialising...".format(rospy.get_caller_id()))
         node = Node()
+        rospy.Timer(rospy.Duration(1.0), node.publish_map_ready)
         rate_nr = 30
         rate = rospy.Rate(rate_nr)  # 1hz
         slow_counter = 0

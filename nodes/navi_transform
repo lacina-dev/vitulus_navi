@@ -808,6 +808,10 @@ class NavTfNode:
         self._dock_anchor_pose = None      # (x, y, yaw) of the "docked" waypoint
         self._dock_anchor_fetch_t = 0.0
         self._dock_anchor_map = None       # active map the cached anchor belongs to
+        self._SITE_UNSET = object()
+        self._dock_anchor_site = self._SITE_UNSET   # served site, same purpose
+        self.map_ready_sub = rospy.Subscriber("/navi_manager/map_ready", String,
+                                              self.cb_map_ready, queue_size=2)
         self._docked_since = None          # time of the dock_status==0 edge
         self._dock_hold_active = False
         self._dock_hold_refusals = 0
@@ -1085,6 +1089,25 @@ class NavTfNode:
             euler_from_quaternion([p.orientation.x, p.orientation.y,
                                    p.orientation.z, p.orientation.w])[2])
 
+    def cb_map_ready(self, msg):
+        """A served-site change is a map change too, but active_map stays the
+        constant 'SITE' (vitulus-field#46). map_ready names the site navi_man
+        has really taken over, so the waypoint fetched next is the new one.
+        Without this the hold kept the OLD site's "docked" pose for up to 30 s
+        and then refused the jump as creep: the robot would leave the dock with
+        a pose in the wrong frame."""
+        try:
+            site = json.loads(msg.data).get('site')
+        except (ValueError, AttributeError):
+            return
+        if self._dock_anchor_site is self._SITE_UNSET:
+            self._dock_anchor_site = site     # first report: nothing has changed
+            return
+        if site == self._dock_anchor_site:
+            return
+        self._dock_anchor_site = site
+        self._drop_dock_anchor('site', site)
+
     def cb_active_map(self, msg):
         """A new map has its OWN "docked" waypoint — drop the cached anchor.
         Only on an actual CHANGE: /navi_manager/active_map is republished
@@ -1093,13 +1116,16 @@ class NavTfNode:
         if msg.data == self._dock_anchor_map:
             return
         self._dock_anchor_map = msg.data
+        self._drop_dock_anchor('active map', msg.data)
+
+    def _drop_dock_anchor(self, what, name):
         self._dock_anchor_pose = None
         self._dock_anchor_fetch_t = 0.0
         # a different map places the dock somewhere else entirely — the next
         # engage is an initial PLACEMENT again, not creep (see dock_anchor_hold)
         self._dock_hold_active = False
-        rospy.loginfo('[dock_hold] active map -> "%s": re-fetching the "%s" '
-                      'waypoint', msg.data, self._dock_anchor_point)
+        rospy.loginfo('[dock_hold] %s -> "%s": re-fetching the "%s" '
+                      'waypoint', what, name, self._dock_anchor_point)
 
     def dock_anchor_hold(self):
         """A2 (30 Hz): while docked, map->odom == docked_waypoint (.) inv(odom->base)

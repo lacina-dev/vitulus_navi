@@ -222,6 +222,7 @@ def main():
         if busy != busy_state['last']:
             busy_state['last'] = busy
             pubs.busy.publish(Bool(data=busy))
+            run_flags.mission_busy(busy)
     rospy.Timer(rospy.Duration(0.5), busy_tick)
 
     # rosnode kill / SIGTERM: blade off, preempt the SM, and if a state still

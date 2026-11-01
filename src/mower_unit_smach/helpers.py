@@ -5,6 +5,8 @@ Contains TF utilities, MBF result classification, path segmentisation,
 safe blade shutdown, and constants.
 """
 import math
+import time
+
 import rospy
 import tf
 import shapely
@@ -17,6 +19,8 @@ from geometry_msgs.msg import PoseStamped, Quaternion
 from vitulus_msgs.msg import Mower
 import mbf_msgs.msg as mbf_msgs
 from mbf_msgs.srv import CheckPathRequest, CheckPathResponse
+
+from . import rain_rule
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +57,11 @@ def mbf_outcome_str(code):
 #
 # Read from ROS params (set in navi_man.launch under the node's private
 # namespace) so the rain behaviour can be tuned without editing code:
-#   ~weather_rain_bypass          bool  - if true, skip ALL rain checks
+#   ~weather_rain_mode            str   - always | calendar | ignore: who obeys
+#                                         the rain (pushed by master_controller)
+#   ~weather_recent_min           int   - rain this long ago still refuses a start
+#   ~weather_return_home          bool  - rain during a run sends it home
+#   ~weather_stale_ok             bool  - old rain data: start anyway
 #   ~weather_reject_statuses      list  - forecast statuses that block mowing
 #                                         (default ['RAIN']; was RAIN/ALERT/WARN)
 #   ~weather_forecast_horizon_min int   - how far ahead to look: 10/20/30 min
@@ -63,23 +71,27 @@ def mbf_outcome_str(code):
 #                                         dock (pre-start rejects on any 1 step)
 # ---------------------------------------------------------------------------
 
-_NOWCAST_FIELDS = ('status_nowcast10m', 'status_nowcast20m', 'status_nowcast30m')
-
-
 class RunFlags(object):
     """What master_controller tells the running mission. Without the master
-    (manual programs, tests) both stay False.
+    (manual programs, tests) they stay False.
 
       scheduled          /scheduler/run_active: this is a calendar run, the rain
-                         checks hold even with ~weather_rain_bypass
+                         checks hold in ~weather_rain_mode "calendar"
       finish_after_path  /mower_smach/finish_after_path: go home at the next
                          path boundary (see stop_at_path_boundary)
+      rain_ignored()     /scheduler/ignore_rain_once from the Run dialog: holds
+                         until the mission that picked it up ends; no mission
+                         within IGNORE_RAIN_TTL_S drops it
     """
+
+    IGNORE_RAIN_TTL_S = 300.0
 
     def __init__(self):
         self.scheduled = False
         self.finish_after_path = False
         self.home_latch = None
+        self._ignore_rain_t = None
+        self._ignore_rain_seen = False
         self._subs = []
 
     def start(self):
@@ -87,6 +99,8 @@ class RunFlags(object):
             rospy.Subscriber('/scheduler/run_active', Bool, self._on_scheduled,
                              queue_size=1),
             rospy.Subscriber('/mower_smach/finish_after_path', Bool, self._on_finish,
+                             queue_size=1),
+            rospy.Subscriber('/scheduler/ignore_rain_once', Bool, self._on_ignore_rain,
                              queue_size=1)]
 
     def _on_scheduled(self, msg):
@@ -94,6 +108,29 @@ class RunFlags(object):
 
     def _on_finish(self, msg):
         self.finish_after_path = bool(msg.data)
+
+    def _on_ignore_rain(self, msg):
+        self._ignore_rain_t = time.monotonic() if msg.data else None
+        self._ignore_rain_seen = False
+
+    def mission_busy(self, busy):
+        """/mower_smach/busy as it changes: the end of the run ends the flag."""
+        if self._ignore_rain_t is None:
+            return
+        if busy:
+            self._ignore_rain_seen = True
+        elif self._ignore_rain_seen:
+            self._ignore_rain_t = None
+            self._ignore_rain_seen = False
+
+    def rain_ignored(self):
+        if self._ignore_rain_t is None:
+            return False
+        if (self._ignore_rain_seen
+                or time.monotonic() - self._ignore_rain_t < self.IGNORE_RAIN_TTL_S):
+            return True
+        self._ignore_rain_t = None
+        return False
 
 
 run_flags = RunFlags()
@@ -130,22 +167,20 @@ def get_weather_config():
     """Read rain-gating params with safe defaults. Called per check so a live
     `rosparam set` takes effect without restarting the node.
 
-    The bypass is an override for manual runs: a calendar run always obeys the
-    rain rules, nobody is there to watch it."""
-    bypass = (bool(rospy.get_param('~weather_rain_bypass', False))
-              and not run_flags.scheduled)
+    ~weather_rain_mode says who obeys the rain: always | calendar | ignore; the
+    Run dialog's "ignore this time" lifts it for one run (rain_rule.checks_active).
+    master_controller owns these values (Autonomy page) and pushes them here."""
+    mode = str(rospy.get_param('~weather_rain_mode', 'always'))
+    bypass = not rain_rule.checks_active(mode, run_flags.scheduled,
+                                         run_flags.rain_ignored())
 
     statuses = rospy.get_param('~weather_reject_statuses', ['RAIN'])
     if isinstance(statuses, str):
         statuses = [s.strip() for s in statuses.split(',') if s.strip()]
     reject_statuses = tuple(str(s).upper() for s in statuses) or ('RAIN',)
 
-    horizon = int(rospy.get_param('~weather_forecast_horizon_min', 30))
-    # The RainAlert message only carries 10/20/30-minute nowcast steps.
-    if horizon < 10:
-        horizon = 10
-    horizon = min(horizon, 30)
-    n_steps = max(1, horizon // 10)
+    horizon, n_steps = rain_rule.horizon_steps(
+        rospy.get_param('~weather_forecast_horizon_min', 30))
 
     min_steps = int(rospy.get_param('~weather_monitor_min_steps', 2))
     if min_steps < 1:
@@ -153,6 +188,10 @@ def get_weather_config():
 
     return {
         'bypass': bypass,
+        'mode': mode,
+        'recent_min': int(rospy.get_param('~weather_recent_min', 60)),
+        'return_home': bool(rospy.get_param('~weather_return_home', True)),
+        'stale_ok': bool(rospy.get_param('~weather_stale_ok', True)),
         'reject_statuses': reject_statuses,
         'horizon_min': horizon,
         'n_steps': n_steps,
@@ -165,14 +204,14 @@ def rain_data_fresh(rain_msg, cfg):
     """False for a RainAlert older than ~weather_max_age_min: the node keeps
     publishing its last result when the radar source is unreachable."""
     stamp = getattr(rain_msg, 'time', None)
-    if stamp is None or stamp.to_sec() <= 0:
+    if stamp is None:
         return True
-    return (rospy.Time.now() - stamp).to_sec() <= cfg['max_age_s']
+    return rain_rule.is_fresh(stamp.to_sec(), rospy.Time.now().to_sec(), cfg['max_age_s'])
 
 
 def rain_forecast_steps(rain_msg, n_steps):
     """Return the first `n_steps` nowcast status strings from a RainAlert msg."""
-    return [getattr(rain_msg, f, '') for f in _NOWCAST_FIELDS[:n_steps]]
+    return rain_rule.nowcast_steps(rain_msg, n_steps)
 
 
 # ---------------------------------------------------------------------------

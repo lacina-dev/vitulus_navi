@@ -15,11 +15,11 @@ def weather_monitor_cb(userdata, msg):
 
     Pravidlo 2: Return to dock if it rains now, or if the rain forecast over the
     configured horizon contains at least `monitor_min_steps` reject statuses.
-    Statuses, horizon and a full bypass are configurable (see
-    helpers.get_weather_config). Stale data decides nothing.
+    Statuses, horizon, who obeys and whether rain ends a run at all are
+    configurable (see helpers.get_weather_config). Stale data decides nothing.
     """
     cfg = get_weather_config()
-    if cfg['bypass'] or not rain_data_fresh(msg, cfg):
+    if cfg['bypass'] or not cfg['return_home'] or not rain_data_fresh(msg, cfg):
         return True
     if msg.rain_now == 1:
         rospy.logwarn("[WEATHER_MONITOR] Raining now")

@@ -11,9 +11,21 @@
 # --- Rain gating ------------------------------------------------------------
 # How the mission reacts to the rain forecast (weather_alert/RainAlert).
 
-# true = skip the rain checks (pre-start and in-mission) of programs started by
-# hand. A calendar run always obeys the rain (/scheduler/run_active).
-weather_rain_bypass: true
+# These keys and battery_min_start_pct / battery_return_pct are the owner's
+# settings: master_controller keeps them in ~/.vitulus/autonomy.json (Autonomy
+# page) and pushes them here at start, on change and after a reload of this file.
+# The values below apply only while master_controller is not running.
+
+# Who obeys the rain: always | calendar (programs started by hand do not) |
+# ignore. The Run dialog's "ignore this time" (/scheduler/ignore_rain_once) lifts
+# it for one run.
+weather_rain_mode: always
+# Rain this many minutes back still refuses a start (10-minute steps, at most 60).
+weather_recent_min: 60
+# Rain during a run sends the robot home.
+weather_return_home: true
+# Rain data older than weather_max_age_min: start anyway.
+weather_stale_ok: true
 
 # A RainAlert older than this counts as no data: the start goes ahead (with a
 # log line) and the in-mission monitor decides nothing.

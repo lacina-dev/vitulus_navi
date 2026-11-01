@@ -32,6 +32,11 @@ def feed(w, seq):
     return keep, actions
 
 
+def ready(t, temp=20.0):
+    """The proof of a spike: 3.5 s of good samples at 2 Hz."""
+    return [(t + i * 0.5, 'READY', temp, 0) for i in range(8)]
+
+
 def mowing(t=0.0):
     return [(t, 'RUN', 20.0, 3400), (t + 0.5, 'RUN', 20.0, 3400)]
 
@@ -39,7 +44,7 @@ def mowing(t=0.0):
 # /mower/status as received on 1. 11. 2026
 INCIDENT = [(17.5, 'RUN', 20.0, 3400), (18.0, 'RUN', 20.0, 3400), (24.05, 'RUN', 42.5, 3402),
             (24.55, 'RUN', 42.5, -31966), (25.05, 'TEMP', 90.7, -31966),
-            (25.55, 'TEMP', 90.7, 2596), (26.05, 'READY', 20.9, 2596)]
+            (25.55, 'TEMP', 90.7, 2596)] + ready(26.05, 20.9)
 
 
 class Core(unittest.TestCase):
@@ -50,7 +55,7 @@ class Core(unittest.TestCase):
         self.assertTrue(keep)
         self.assertEqual(actions, ['waiting', 'spike', 'blade_on'])
         self.assertTrue(w.hold)                       # stands until the blade is up
-        keep, actions = feed(w, [(26.6, 'RUN', 20.9, 300), (32.0, 'RUN', 20.9, 3390)])
+        keep, actions = feed(w, [(30.0, 'RUN', 20.9, 300), (36.0, 'RUN', 20.9, 3390)])
         self.assertTrue(keep)
         self.assertEqual(actions, ['blade_up'])
         self.assertFalse(w.hold)
@@ -59,7 +64,7 @@ class Core(unittest.TestCase):
         w = tw.TempWatch()
         feed(w, INCIDENT)
         for rpm, setpoint in ((-31966, 3400), (32000, 0)):
-            self.assertEqual(w.on_status(27.0, 'RUN', 20.9, rpm, setpoint), (True, []))
+            self.assertEqual(w.on_status(30.0, 'RUN', 20.9, rpm, setpoint), (True, []))
             self.assertTrue(w.hold)
 
     def test_real_overtemp_ends_the_mission(self):
@@ -91,7 +96,7 @@ class Core(unittest.TestCase):
         w = tw.TempWatch()
         feed(w, mowing() + [(1.0, 'TEMP', 90.0, 0)])
         w.on_command(False)
-        keep, actions = feed(w, [(2.0, 'READY', 20.0, 0)])
+        keep, actions = feed(w, [*ready(2.0)])
         self.assertTrue(keep)
         self.assertEqual(actions, ['spike'])
         self.assertFalse(w.hold)
@@ -99,23 +104,24 @@ class Core(unittest.TestCase):
     def test_no_restart_on_a_noblade_area(self):
         w = tw.TempWatch()
         feed(w, mowing() + [(1.0, 'TEMP', 90.0, 0)])
-        keep, actions = w.on_status(2.0, 'READY', 20.0, 0, 3400, blade_held=True)
+        feed(w, ready(2.0)[:6])
+        keep, actions = w.on_status(5.5, 'READY', 20.0, 0, 3400, blade_held=True)
         self.assertTrue(keep)
         self.assertEqual(actions, ['spike'])
 
     def test_blade_never_on_is_not_started(self):
         w = tw.TempWatch()
         _, actions = feed(w, [(0.0, 'READY', 20.0, 0), (1.0, 'TEMP', 90.0, 0),
-                              (2.0, 'READY', 20.0, 0)])
+                              *ready(2.0)])
         self.assertNotIn('blade_on', actions)
 
     def test_repeated_spikes_go_home(self):
         w = tw.TempWatch()
         for n in range(2):
             t = n * 100.0
-            feed(w, mowing(t) + [(t + 1, 'TEMP', 90.0, 0), (t + 2, 'READY', 20.0, 0),
+            feed(w, mowing(t) + [(t + 1, 'TEMP', 90.0, 0), *ready(t + 2),
                                  (t + 8, 'RUN', 20.0, 3400)])
-        keep, _ = feed(w, mowing(300.0) + [(301.0, 'TEMP', 90.0, 0), (302.0, 'READY', 20.0, 0)])
+        keep, _ = feed(w, mowing(300.0) + [(301.0, 'TEMP', 90.0, 0), *ready(302.0)])
         self.assertFalse(keep)
         self.assertEqual(w.reason, 'temp_spike')
 
@@ -123,14 +129,14 @@ class Core(unittest.TestCase):
         w = tw.TempWatch()
         for n in range(5):
             t = n * 1000.0
-            keep, _ = feed(w, mowing(t) + [(t + 1, 'TEMP', 90.0, 0), (t + 2, 'READY', 20.0, 0),
+            keep, _ = feed(w, mowing(t) + [(t + 1, 'TEMP', 90.0, 0), *ready(t + 2),
                                            (t + 8, 'RUN', 20.0, 3400)])
             self.assertTrue(keep)
 
     def test_blade_not_up_goes_home(self):
         w = tw.TempWatch()
         feed(w, INCIDENT)
-        keep, _ = feed(w, [(40.0, 'READY', 20.0, 0), (57.0, 'READY', 20.0, 0)])
+        keep, _ = feed(w, [(40.0, 'READY', 20.0, 0), (60.0, 'READY', 20.0, 0)])
         self.assertFalse(keep)
         self.assertEqual(w.reason, 'temp_spike')
 
@@ -142,6 +148,70 @@ class Core(unittest.TestCase):
             keep, _ = feed(w, [(1.0, 'OFF', 75.0, 0)])
             self.assertFalse(keep)
             self.assertEqual(w.reason, reason)
+
+    def overheat_ramp(self, w, start=50.0, rate_c_s=0.1):
+        """The motor climbs to 70 C, reporting at 2 Hz."""
+        t, temp = 0.0, start
+        while temp < 70.0:
+            feed(w, [(t, 'RUN', temp, 3400)])
+            t += 0.5
+            temp += rate_c_s * 0.5
+        return t
+
+    def test_overheating_ramp_with_one_low_window_ends_as_temp(self):
+        w = tw.TempWatch()
+        t = self.overheat_ramp(w)
+        # TEMP, the firmware's release on one low window, then the truth again
+        keep, actions = feed(w, [(t, 'TEMP', 70.1, 0), (t + 1, 'READY', 20.0, 0),
+                                 (t + 1.5, 'READY', 20.0, 0), (t + 2, 'READY', 70.2, 0)])
+        self.assertFalse(keep)
+        self.assertEqual(w.reason, 'temp')
+        self.assertNotIn('blade_on', actions)
+
+    def test_recent_low_reading_but_low_only_once_is_no_spike(self):
+        w = tw.TempWatch()
+        feed(w, mowing())
+        keep, actions = feed(w, [(1.0, 'TEMP', 75.0, 0), (2.0, 'READY', 20.0, 0),
+                                 (2.5, 'READY', 20.0, 0)]
+                             + [(3 + i * 0.5, 'READY', 71.0, 0) for i in range(18)])
+        self.assertFalse(keep)
+        self.assertEqual(w.reason, 'temp')
+        self.assertNotIn('blade_on', actions)
+
+    def test_three_samples_are_not_enough_without_three_seconds(self):
+        w = tw.TempWatch()
+        feed(w, mowing() + [(1.0, 'TEMP', 90.0, 0)])
+        keep, actions = feed(w, [(1.5 + i * 0.25, 'READY', 20.0, 0) for i in range(4)])
+        self.assertTrue(keep)
+        self.assertNotIn('spike', actions)
+
+    def test_bad_sample_starts_the_count_over(self):
+        for bad in (float('nan'), 0.0, -273.15, 60.0):
+            w = tw.TempWatch()
+            feed(w, mowing() + [(1.0, 'TEMP', 90.0, 0)])
+            _, actions = feed(w, ready(1.5)[:6] + [(4.5, 'READY', bad, 0)]
+                              + ready(5.0)[:6])
+            self.assertNotIn('spike', actions, bad)
+            self.assertEqual(feed(w, [(8.5, 'READY', 20.0, 0)])[1], ['spike', 'blade_on'])
+
+    def test_temp_again_during_the_proof_starts_it_over(self):
+        w = tw.TempWatch()
+        feed(w, mowing() + [(1.0, 'TEMP', 90.0, 0)])
+        _, actions = feed(w, ready(1.5)[:6] + [(4.5, 'TEMP', 90.0, 0)] + ready(5.0)[:6])
+        self.assertNotIn('spike', actions)
+
+    def test_low_reading_older_than_the_window_is_no_jump(self):
+        w = tw.TempWatch()
+        feed(w, [(0.0, 'RUN', 40.0, 3400), (100.0, 'RUN', 65.0, 3400)])
+        keep, _ = feed(w, [(101.0, 'TEMP', 90.0, 0), (102.0, 'READY', 20.0, 0)])
+        self.assertFalse(keep)
+        self.assertEqual(w.reason, 'temp')
+
+    def test_low_readings_during_the_wait_do_not_make_a_jump(self):
+        w = tw.TempWatch()
+        feed(w, [(0.0, 'RUN', 65.0, 3400), (1.0, 'TEMP', 90.0, 0)])
+        keep, _ = feed(w, [(2.0, 'READY', 20.0, 0)])
+        self.assertFalse(keep)
 
     def test_safety_unknown_is_no_verdict(self):
         w = tw.TempWatch()
@@ -237,7 +307,7 @@ class SpinUp(unittest.TestCase):
         w = tw.TempWatch()
         w.on_command(True)
         feed(w, [(0.0, 'READY', 20.0, 0), (0.5, 'TEMP', 90.0, 0)])
-        _, actions = feed(w, [(1.5, 'READY', 20.0, 0)])
+        _, actions = feed(w, [*ready(1.5)])
         self.assertIn('blade_on', actions)
 
     def test_true_refused_during_temp_does_not_veto(self):
@@ -245,14 +315,14 @@ class SpinUp(unittest.TestCase):
         feed(w, mowing() + [(1.0, 'TEMP', 90.0, 0)])
         w.on_command(False)
         w.on_command(True)
-        _, actions = feed(w, [(2.0, 'READY', 20.0, 0)])
+        _, actions = feed(w, [*ready(2.0)])
         self.assertIn('blade_on', actions)
 
     def test_blade_switched_off_just_before_stays_off(self):
         w = tw.TempWatch()
         feed(w, mowing())
         w.on_command(False)
-        _, actions = feed(w, [(1.0, 'TEMP', 90.0, 0), (2.0, 'READY', 20.0, 0)])
+        _, actions = feed(w, [(1.0, 'TEMP', 90.0, 0), *ready(2.0)])
         self.assertNotIn('blade_on', actions)
 
 
@@ -270,7 +340,7 @@ class Shell(unittest.TestCase):
         rospy.logwarn = rospy.loginfo = lambda *a: None
         self.hold = hold_gate.HoldGate()
         self.shell = tw.TempWatchShell()
-        self.shell.core = tw.TempWatch()
+        self.shell.core = tw.TempWatch({'clear_s': 0.0})
         self.shell.hold = self.hold
         self.pubs = types.SimpleNamespace(log_info=self.Pub(), mower_set_motor_on=self.Pub())
         self.shell.pubs = self.pubs
@@ -298,7 +368,8 @@ class Shell(unittest.TestCase):
         self.assertTrue(cb(None, self.msg('RUN', 20.0)))
         self.assertTrue(cb(None, self.msg('TEMP', 90.7, 0)))
         self.assertTrue(self.hold._held)
-        self.assertTrue(cb(None, self.msg('READY', 20.9, 0)))
+        for _ in range(3):
+            self.assertTrue(cb(None, self.msg('READY', 20.9, 0)))
         self.assertEqual(self.pubs.mower_set_motor_on.sent, [True])
         self.assertTrue(self.hold._held)
         self.assertTrue(cb(None, self.msg('RUN', 20.9)))
@@ -343,7 +414,8 @@ class Shell(unittest.TestCase):
     def restart_due(self):
         self.shell.on_status(self.msg('RUN', 20.0))
         self.shell.on_status(self.msg('TEMP', 90.7, 0))
-        self.shell.on_status(self.msg('READY', 20.9, 0))
+        for _ in range(3):
+            self.shell.on_status(self.msg('READY', 20.9, 0))
 
     def test_no_true_during_a_mux_hold_then_it_goes_out(self):
         self.hold._mux_held = True

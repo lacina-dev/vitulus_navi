@@ -35,6 +35,7 @@ from .gps_wait import GpsWaitBudget, fmt_mmss
 from .hold_gate import HOLD
 from .rule_gate import RULES, StallAnchor
 from .temp_watch import TEMP_WATCH
+from . import rain_rule
 from .helpers import (
     get_tf_listener, get_robot_xy_in_map, nearest_pose_index,
     classify_mbf_result, distance_xy, direction_angle,
@@ -344,31 +345,28 @@ class PreStartCheck(smach.State):
                 rain = rospy.wait_for_message(
                     '/weather_alert/rain_alert', RainAlert, timeout=5.0)
                 # Unknown weather does not hold the robot back (no internet
-                # would mean no mowing at all): see "except" below.
+                # would mean no mowing at all), unless ~weather_stale_ok says so.
                 if not rain_data_fresh(rain, cfg):
                     raise rospy.ROSException("stale")
 
-                if rain.rain_now == 1:
+                reason = rain_rule.start_verdict(rain, cfg)
+                if reason == 'rain':
                     return reject_mission(self, self.pubs, "Start rejected: raining now",
                                           "Rejected: rain", "rain")
-
-                past = [rain.status_past60m, rain.status_past50m, rain.status_past40m,
-                        rain.status_past30m, rain.status_past20m, rain.status_past10m,
-                        rain.status_now]
-                for s in past:
-                    if s == 'RAIN':
-                        return reject_mission(self, self.pubs, "Start rejected: recent rain",
-                                              "Rejected: recent rain", "recent_rain")
-
-                nowcast = rain_forecast_steps(rain, cfg['n_steps'])
-                if any(s in cfg['reject_statuses'] for s in nowcast):
+                if reason == 'recent_rain':
+                    return reject_mission(self, self.pubs, "Start rejected: recent rain",
+                                          "Rejected: recent rain", "recent_rain")
+                if reason == 'forecast':
                     rospy.logwarn("[PRE_START_CHECK] Rain (%s) in forecast (<=%d min): %s",
                                   "/".join(cfg['reject_statuses']), cfg['horizon_min'],
-                                  nowcast)
+                                  rain_forecast_steps(rain, cfg['n_steps']))
                     return reject_mission(self, self.pubs, "Start rejected: rain forecast",
                                           "Rejected: forecast", "forecast")
 
             except rospy.ROSException:
+                if not cfg['stale_ok']:
+                    return reject_mission(self, self.pubs, "Start rejected: no current weather data",
+                                          "Rejected: no weather data", "rain_stale")
                 rospy.logwarn("[PRE_START_CHECK] Weather data unavailable, proceeding")
                 self.pubs.log_info.publish(String(
                     "No current weather data, starting anyway"))

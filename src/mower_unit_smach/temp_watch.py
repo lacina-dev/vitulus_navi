@@ -8,7 +8,13 @@ second later and the program went home all the same.  The motor cools at about
 55 C release in seconds.  That is the test, DEFAULTS in seconds:
 
     TEMP            the mission stands (hold, as for a mux hold), wait_s at most
-    released        status left TEMP, reading <= cool_c: a spike.  The firmware does
+    released        a spike needs both ends of it, the firmware's release alone (one
+                    window <= 55 C, main.cpp:1113) proves nothing: a reading <= low_c
+                    in the low_age_s before the TEMP (it jumped), and clear_n samples
+                    in a row at 0 < t <= cool_c over clear_s after it.  Without the
+                    jump 'temp' at once, with a bad sample the count starts over.
+                    Two windows fall into clear_s, the motor cannot fake them, and
+                    a board that holds them has no TEMP cause left.  The firmware does
                     not restart the blade: True here, only if the blade was running or
                     commanded on, the last command is not False and no map rule
                     holds it
@@ -41,7 +47,8 @@ from std_msgs.msg import Bool, String
 from .rule_gate import RULES
 
 DEFAULTS = {
-    'wait_s': 10.0, 'cool_c': 55.0, 'spinup_s': 30.0, 'spike_max': 3,
+    'wait_s': 10.0, 'cool_c': 55.0, 'low_c': 60.0, 'low_age_s': 30.0, 'clear_n': 3,
+    'clear_s': 3.0, 'spinup_s': 30.0, 'spike_max': 3,
     'spike_window_s': 1800.0, 'on_rpm': 300, 'rpm_tol': 100, 'rpm_max': 7000, 'silent_s': 3.0,
 }
 STOP_REASONS = {'temp': 'interrupted:temp', 'temp_spike': 'interrupted:temp_spike',
@@ -78,6 +85,10 @@ class TempWatch(object):
         self.since = None
         self.was_run = False
         self.commanded = None       # the last /mower/set_motor_on
+        self.low_t = None           # last plausible reading <= low_c outside a wait
+        self.jumped = False         # ... was recent when this TEMP began
+        self.clear_t = None         # first of the good samples in a row
+        self.clear_n = 0
         self.reason = None          # why the mission must end
         self.last_status = None
         self.safety = 'ok'
@@ -131,9 +142,14 @@ class TempWatch(object):
         if self.verdict():
             return self._end(self.verdict())
         last, self.last_status = self.last_status, status
+        if status != 'TEMP' and self.phase != 'wait' and 0.0 < temp <= self.p['low_c']:
+            self.low_t = now
 
         if status == 'TEMP':
+            self.clear_t, self.clear_n = None, 0
             if self.phase != 'wait':
+                self.jumped = (self.low_t is not None
+                               and now - self.low_t <= self.p['low_age_s'])
                 # The status comes at 2 Hz: a spin-up can reach TEMP without a RUN.
                 self.was_run = (last == 'RUN' or self.phase == 'restart'
                                 or self.commanded is True)
@@ -163,9 +179,15 @@ class TempWatch(object):
         if status in NO_BLADE or not 0.0 < temp <= self.p['cool_c']:
             # No proof of a spike, or a board that cannot start the blade.  NaN,
             # 0.0 (no window yet) and -273 C (open NTC) prove nothing.
-            if now - self.since >= self.p['wait_s']:
-                return self._end('temp')
-            return True, []
+            self.clear_t, self.clear_n = None, 0
+            return self._not_yet(now)
+        if not self.jumped:
+            return self._end('temp')        # it climbed there: a low reading now is the lie
+        if self.clear_t is None:
+            self.clear_t = now
+        self.clear_n += 1
+        if self.clear_n < self.p['clear_n'] or now - self.clear_t < self.p['clear_s']:
+            return self._not_yet(now)
         if self._spike(now):
             return self._end('temp_spike')
         if self.was_run and self.commanded is not False and not blade_held:
@@ -174,6 +196,11 @@ class TempWatch(object):
             return True, ['spike', 'blade_on']
         self.phase = None
         return True, ['spike']
+
+    def _not_yet(self, now):
+        if now - self.since >= self.p['wait_s']:
+            return self._end('temp')
+        return True, []
 
     def silent(self):
         """The monitor stopped asking, or the mower fell silent: no hold of ours

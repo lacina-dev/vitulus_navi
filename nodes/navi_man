@@ -2026,7 +2026,7 @@ class Node:
             ready = bool(self._served_site) and self._points_site == self._served_site
         state = {'active_map': self.active_map, 'site': self._points_site,
                  'served': self._served_site, 'ready': ready,
-                 'has_dock': 'DOCK' in names or 'dock' in names,
+                 'has_dock': 'DOCK' in names,    # as CheckForDockPoint: exact
                  'has_docked': 'docked' in names, 'dock_err_m': None}
         if ready and state['has_docked']:
             try:

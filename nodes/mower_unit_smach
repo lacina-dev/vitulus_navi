@@ -9,6 +9,7 @@ Architecture:
     ├── BATTERY_MONITOR
     ├── MOWER_TEMP_MONITOR
     └── STOP_MONITOR
+  (MOWER_LINK, mower_link.py: a timer, it holds the mission and may end it)
   RETURN_TO_DOCK (with embedded STOP monitor)
   CRITICAL_ERROR (decision: try dock or go terminal)
   TERMINAL_ERROR (quarantine: buzzer + wait for /mower_smach/reset)
@@ -29,6 +30,7 @@ from mower_unit_smach.helpers import wait_for_mbf, start_power_watch, run_flags
 from mower_unit_smach.global_stop import GlobalStop
 from mower_unit_smach.hold_gate import HOLD
 from mower_unit_smach.rule_gate import RULES
+from mower_unit_smach.mower_link import LINK
 from mower_unit_smach.temp_watch import TEMP_WATCH
 from mower_unit_smach.stale_blade import StaleBladeWatch
 from mower_unit_smach.states import PreStartCheck
@@ -65,6 +67,7 @@ def main():
     RULES.start()
     blade_watch = StaleBladeWatch(pubs, HOLD, RULES)   # the blade while the rules stop all
     TEMP_WATCH.blade_watch = blade_watch
+    LINK.stale = blade_watch
     wait_for_mbf()
 
     # ===================================================================
@@ -231,6 +234,10 @@ def main():
     def on_shutdown():
         try:
             pubs.mower_set_motor_on.publish(Bool(False))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            LINK.shutdown()
         except Exception:  # noqa: BLE001
             pass
         try:

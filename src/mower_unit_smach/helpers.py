@@ -476,6 +476,14 @@ class MowerPowerWatch(object):
             return last[1]
         return None
 
+    def silent_s(self):
+        """Seconds since the last /mower/status, or since this watch started."""
+        if self.started is None:
+            return None
+        with self.lock:
+            status = self.last_status
+        return self.clock() - (status[0] if status is not None else self.started)
+
     def unpowered(self, program_running=True):
         """(True, why) when the mower verifiably has no power, else (False, '').
 

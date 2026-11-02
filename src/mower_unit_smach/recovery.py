@@ -14,6 +14,7 @@ from nav_msgs.msg import Path
 from vitulus_msgs.msg import Mower
 from mbf_msgs.msg import ExePathAction, ExePathGoal, RecoveryAction, RecoveryGoal
 
+from .hold_gate import HOLD
 from .helpers import (MOWER_ERROR_STATES, get_robot_xy_in_map,
                       nearest_pose_index, mbf_outcome_str)
 from .states import WaitForMowerStatus, RetryLimitedAction
@@ -412,6 +413,13 @@ def build_nav_recovery_sm(pubs):
                         self._client.cancel_goal()
                         self.service_preempt()
                         return 'preempted'
+                    if HOLD.link_wait():    # the robot stands, the goal would time out
+                        self._client.cancel_goal()
+                        self._client.wait_for_result(rospy.Duration(1.0))
+                        if not HOLD.wait(self):
+                            self.service_preempt()
+                            return 'preempted'
+                        self._client.send_goal(goal)
                     rospy.sleep(0.2)
                 result = self._client.get_result()
                 outcome = getattr(result, 'outcome', None) if result else None

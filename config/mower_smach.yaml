@@ -119,3 +119,8 @@ nav_blade_off_wait_s: 6         # s to wait for a dynamic obstacle to self-clear
 nav_backup_speed: 0.1           # m/s reverse speed for the backup maneuver
 nav_backup_distance: 0.4        # m to reverse during the backup maneuver
 nav_retry_max: 2                # same-chunk retries before handing off to detour
+
+# Mower board silent or blade stopped during mowing: src/mower_unit_smach/mower_link.py.
+# Defaults there, seconds: 3 s silence or 6 s without rpm stop the robot, one attempt
+# takes 90 s at most, 3 attempts in 30 min, then interrupted:mower_link.
+# mower_link: {attempt_s: 90.0, max_recoveries: 3, window_s: 1800.0}

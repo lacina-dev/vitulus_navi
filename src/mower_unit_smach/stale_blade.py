@@ -268,6 +268,11 @@ class StaleBladeWatch(object):
         hold.start()
         rospy.Timer(rospy.Duration(0.2), self.tick)
 
+    def deferred(self):
+        """Its True waits behind an area: mower_link's True must not go first."""
+        with self.lock:
+            return self.core.deferred
+
     def on_mission(self, value, guard=False):
         with self.lock:
             return self.core.on_command(value, time.monotonic(), guard)

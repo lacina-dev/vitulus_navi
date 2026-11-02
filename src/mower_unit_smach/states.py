@@ -34,6 +34,7 @@ from rtabmap_msgs.msg import Info
 from .gps_wait import GpsWaitBudget, fmt_mmss
 from .hold_gate import HOLD
 from .rule_gate import RULES, StallAnchor
+from .mower_link import LINK, REASON as REASON_LINK
 from .temp_watch import TEMP_WATCH
 from . import rain_rule
 from .helpers import (
@@ -41,7 +42,8 @@ from .helpers import (
     classify_mbf_result, distance_xy, direction_angle,
     safe_blade_shutdown, segmentize_raw_path, MOWER_ERROR_STATES,
     mbf_outcome_str, get_weather_config, rain_forecast_steps,
-    first_lethal_index, mark_run_phase, rain_data_fresh, stop_at_path_boundary)
+    first_lethal_index, mark_run_phase, rain_data_fresh, stop_at_path_boundary,
+    power_watch, STATUS_SILENT_S)
 
 
 # ===========================================================================
@@ -383,6 +385,15 @@ class PreStartCheck(smach.State):
                     "Rejected: low battery", "battery")
         except rospy.ROSException:
             rospy.logwarn("[PRE_START_CHECK] Power status unavailable, proceeding")
+
+        # --- Mower board: it answers, or nothing is going out ---
+        watch = power_watch()
+        silent_s = watch.silent_s() if watch is not None else None
+        if silent_s is not None and silent_s >= STATUS_SILENT_S:
+            return reject_mission(
+                self, self.pubs,
+                "Start rejected: mower board silent for {:.0f} s".format(silent_s),
+                "Rejected: mower board silent", "mower_link")
 
         self.pubs.log_info.publish(String("Pre-start checks passed"))
         return 'passed'
@@ -844,9 +855,10 @@ class ExecutePathWithFeedback(smach.State):
                              input_keys=['path_chunk', 'paths', 'zone_name', 'index_path',
                                          'final_pose', 'path', 'path_window_start_index',
                                          'restore_height_pending', 'zone_cut_height',
-                                         'consecutive_nav_failures'],
-                             output_keys=['restore_height_pending',
-                                          'consecutive_nav_failures'])
+                                         'consecutive_nav_failures', 'skipped_spans',
+                                         'program'],
+                             output_keys=['restore_height_pending', 'program',
+                                          'consecutive_nav_failures', 'skipped_spans'])
         self._client = actionlib.SimpleActionClient(
             '/move_base_flex/exe_path', ExePathAction)
         self.pubs = pubs
@@ -900,6 +912,36 @@ class ExecutePathWithFeedback(smach.State):
             return False
         return first_lethal_index(self._check_path, ahead) >= 0
 
+    LINK_SPAN_MAX = 400         # poses: nearest_pose_index may land on the next pass
+
+    def _keep_link_span(self, userdata, start_idx):
+        """The line from where the blade was last known up to here goes to the
+        end-of-zone re-mow.  The checkpoint moves back with it: a mission that ends
+        now (interrupted:mower_link) resumes before the gap, the spans do not
+        survive it."""
+        LINK.span_kept()
+        lost = LINK.lost_xy()
+        here = get_robot_xy_in_map(timeout=0.3)
+        path = userdata.path
+        if lost is None or here is None or not path or not path.poses:
+            return
+        hint = max(0, start_idx - 300)
+        first = nearest_pose_index(path, lost[0], lost[1], hint_index=hint)
+        last = nearest_pose_index(path, here[0], here[1], hint_index=first)
+        last = min(last, first + self.LINK_SPAN_MAX)    # the robot stood within seconds
+        if last <= first:
+            return
+        spans = list(userdata.skipped_spans or [])
+        spans.append({'zone': userdata.zone_name, 'path_idx': int(userdata.index_path),
+                      'poses': list(path.poses[first:last + 1]),
+                      'reason': REASON_LINK})
+        userdata.skipped_spans = spans
+        rospy.logwarn('[EXE] no blade over poses [%d:%d] (%.1fm): kept for re-mow',
+                      first, last, (last - first) * 0.03)
+        if first < start_idx:
+            userdata.program.last_result = 'failed: on_path-{}-{}-{}'.format(
+                userdata.zone_name, userdata.index_path, first)
+
     def execute(self, userdata):
         if self.preempt_requested():
             self.service_preempt()
@@ -929,6 +971,8 @@ class ExecutePathWithFeedback(smach.State):
                       goal_xy[0] or float('nan'), goal_xy[1] or float('nan'),
                       ("(%.2f,%.2f)" % start_xy) if start_xy else "None")
 
+        if LINK.span_due() and not HOLD.link_wait():    # lost in a detour or a recovery
+            self._keep_link_span(userdata, start_idx)
         self.last_feedback = None
         self._feedback_sub = rospy.Subscriber(
             '/move_base_flex/exe_path/feedback', ExePathActionFeedback,
@@ -964,11 +1008,16 @@ class ExecutePathWithFeedback(smach.State):
                     rospy.logwarn("[EXE] mux hold at chunk_idx=%d: waiting", start_idx)
                     self._client.cancel_goal()
                     self._client.wait_for_result(rospy.Duration(1.0))
+                    LINK.settle()
+                    if HOLD.link_wait():
+                        self._keep_link_span(userdata, start_idx)
                     HOLD.wait(self, self.pubs.smach_status)
                     return 'replan_needed'
 
                 now = rospy.Time.now()
                 mower = self._mower_status.status if self._mower_status else '?'
+                if LINK.silent():
+                    mower = 'silent'
                 dist_to_goal = (self.last_feedback.dist_to_goal
                                 if self.last_feedback else float('nan'))
 
@@ -1052,6 +1101,7 @@ class ExecutePathWithFeedback(smach.State):
                 if (now - last_sample_time).to_sec() >= self.STALL_SAMPLE_DT:
                     cur_xy = get_robot_xy_in_map(timeout=0.2)
                     if cur_xy is not None:
+                        LINK.note_xy(cur_xy[0], cur_xy[1])
                         if last_xy is not None:
                             moved = distance_xy(cur_xy[0], cur_xy[1],
                                                 last_xy[0], last_xy[1])

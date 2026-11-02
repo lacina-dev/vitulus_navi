@@ -55,14 +55,18 @@ class MowerPublishers:
             '/web_plan/program_new', PlannerProgram, queue_size=2)
 
         # --- Mower hardware control ---
+        # Blade and power are commands, not state: latched, a new serial_node gets the
+        # last one replayed, the mission's True over somebody's False, and a True of
+        # set_power resets a healthy MCU.  The mission waits for the board (status)
+        # before its True, so a command never has to wait for a subscriber.
         self.mower_set_power = rospy.Publisher(
-            '/mower/set_power', Bool, latch=True, queue_size=1)
+            '/mower/set_power', Bool, queue_size=1)
         self.mower_set_height = rospy.Publisher(
             '/mower/set_cut_height', Int16, latch=True, queue_size=1)
         self.mower_set_rpm = rospy.Publisher(
             '/mower/set_motor_rpm', Int16, latch=True, queue_size=1)
         self.mower_set_motor_on = rospy.Publisher(
-            '/mower/set_motor_on', Bool, latch=True, queue_size=1)
+            '/mower/set_motor_on', Bool, queue_size=1)
 
         # --- Debug / visualisation ---
         self.current_path = rospy.Publisher(

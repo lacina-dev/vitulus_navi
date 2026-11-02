@@ -25,6 +25,7 @@ from rtabmap_msgs.msg import Info
 
 from .chain import PROGRAM_CHAIN
 from .hold_gate import HOLD
+from .mower_link import LINK
 from .stale_blade import TERMINAL_REASON
 from .temp_watch import TEMP_WATCH
 from .helpers import (
@@ -1229,6 +1230,10 @@ class ReturnHomeLatch(object):
         with self._lock:
             self.reason = None
 
+    def running(self):
+        child = self._mission_child
+        return child is not None and child.is_running()
+
     def request(self, reason='window'):
         child = self._mission_child
         if child is None or not child.is_running():
@@ -1308,6 +1313,7 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None)
     home_latch.attach(mission_child)
     run_flags.home_latch = home_latch
     TEMP_WATCH.attach(pubs, HOLD, home_latch)
+    LINK.attach(pubs, HOLD, home_latch, TEMP_WATCH)
 
     def save_checkpoint():
         # The periodic save is up to 60 s behind: the robot goes home now and
@@ -1392,6 +1398,7 @@ def build_mission_concurrence(pubs, parent_sm, stop_latch=None, home_latch=None)
         clear_stale_preempt(mission_child)
         stop_latch.reset()
         home_latch.reset()
+        LINK.reset()
         PROGRAM_CHAIN.begin(parent_sm.userdata.program)
 
     cc.register_start_cb(_on_start, cb_args=[])

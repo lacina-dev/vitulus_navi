@@ -34,6 +34,9 @@ class HoldGate(object):
         self._stale = False
         self._blade_wait = False   # stale_blade.py: the blade comes back before the mission
         self._temp_wait = False    # temp_watch.py: firmware TEMP, spike or real?
+        self._link_wait = False    # mower_link.py: nobody can vouch for the blade
+        self._foreign = False      # a mux hold by anybody but mower_link
+        self._own = False          # the mux lists mower_link
         self._last_end = None      # rospy.Time the last hold ended
         self._since = None         # rospy.Time the running hold started
         self._stretch = {}         # id(waiter) -> rospy.Time of its last stretch()
@@ -51,16 +54,23 @@ class HoldGate(object):
 
     def _status_cb(self, msg):
         try:
-            limit = json.loads(msg.data).get('limit') or {}
+            status = json.loads(msg.data)
+            limit = status.get('limit') or {}
             stale = bool(limit.get('stale'))
+            holds = status.get('holds') or {}
+            foreign = any(src != 'mower_link' for src in holds)
+            own = 'mower_link' in holds
         except (ValueError, AttributeError):
             return
         with self._lock:
             self._stale = stale
+            self._foreign = foreign
+            self._own = own
             self._update(rospy.Time.now())
 
     def _update(self, now):
-        held = self._mux_held or self._stale or self._blade_wait or self._temp_wait
+        held = (self._mux_held or self._stale or self._blade_wait or self._temp_wait
+                or self._link_wait)
         if held and not self._held:
             self._since = now
         elif self._held and not held:
@@ -88,6 +98,28 @@ class HoldGate(object):
                 self._temp_wait = waiting
                 self._update(rospy.Time.now())
 
+    def set_link_wait(self, waiting):
+        with self._lock:
+            if waiting != self._link_wait:
+                self._link_wait = waiting
+                self._update(rospy.Time.now())
+
+    def link_wait(self):
+        with self._lock:
+            return self._link_wait
+
+    def own_hold(self):
+        with self._lock:
+            return self._own
+
+    def foreign_hold(self):
+        with self._lock:
+            return self._foreign
+
+    def blade_wait(self):
+        with self._lock:
+            return self._blade_wait
+
     def held(self):
         self.start()
         with self._lock:
@@ -98,6 +130,8 @@ class HoldGate(object):
             return self._held or (self._last_end is not None and self._last_end >= t)
 
     def _why(self, text):
+        if self._link_wait:
+            return 'Held: mower link'
         if self._mux_held:
             return text
         return 'Held: map rules stop' if self._stale else 'Held: blade coming back'

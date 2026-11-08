@@ -1,5 +1,13 @@
 <launch>
   <arg name="map_topic" />
+  <!-- Local traversability map (vitulus_traversability) as a layer of the local costmap. OFF unless the robot sets
+       BOTH VITULUS_TRAVERSABILITY_NAV=true (this layer) and VITULUS_TRAVERSABILITY=true (the node publishing
+       /traversability/local_costmap, started by vitulus_depth_obstacles): with the node off the layer would keep
+       move_base_flex waiting for its first map. Also needs obstacles_engine: depth_obstacles (navi_manager.yaml,
+       not checked here: with rtabmap navi_man does not start the node). On = 1 / true / yes / on (any case, spaces ignored); anything else
+       (unset, empty, false, a typo) = off = parameters exactly as before. README "Traversability layer". -->
+  <arg name="traversability_nav" default="$(optenv VITULUS_TRAVERSABILITY_NAV false)"/>
+  <arg name="traversability_node" default="$(optenv VITULUS_TRAVERSABILITY false)"/>
 
 <!-- work around for footprint reload -->
   <rosparam command="delete" ns="move_base_flex" />
@@ -10,6 +18,10 @@
       <rosparam file="$(find vitulus_navi)/config/costmap_common_params.yaml" command="load" ns="global_costmap" />
       <rosparam file="$(find vitulus_navi)/config/costmap_common_params.yaml" command="load" ns="local_costmap" />
       <rosparam file="$(find vitulus_navi)/config/local_costmap_params.yaml" command="load" />
+      <!-- traversability switch: after local_costmap_params.yaml (replaces local_costmap/plugins) and inside this
+           node, so it survives the "rosparam delete move_base_flex" above (N5) -->
+      <rosparam if="$(eval str(arg('traversability_nav')).strip().lower() in ('1', 'true', 'yes', 'on') and str(arg('traversability_node')).strip().lower() in ('1', 'true', 'yes', 'on'))"
+                file="$(find vitulus_navi)/config/local_costmap_traversability.yaml" command="load" />
       <rosparam file="$(find vitulus_navi)/config/global_costmap_params.yaml" command="load" />
       <rosparam file="$(find vitulus_navi)/config/planners.yaml" command="load"/>
       <rosparam file="$(find vitulus_navi)/config/controllers.yaml" command="load"/>

@@ -1,7 +1,8 @@
 # Local traversability map (package vitulus_traversability, /traversability/local_costmap) as one more layer of the
 # LOCAL costmap of move_base_flex. OFF by default: vitulus_navi_mbf.launch loads this file only when the robot sets
-# BOTH VITULUS_TRAVERSABILITY_NAV=true (this layer) and VITULUS_TRAVERSABILITY=true (the node that publishes the map,
-# vitulus_depth_obstacles); see README "Traversability layer". Not loaded = the costmap is exactly as before.
+# VITULUS_TRAVERSABILITY_NAV=true (this layer) and the node that publishes the map runs (VITULUS_TRAVERSABILITY_NODE=true:
+# the stack start, or VITULUS_TRAVERSABILITY=true: the start from vitulus_depth_obstacles); see README
+# "Traversability layer". Not loaded = the costmap is exactly as before.
 #
 # Loaded inside the move_base_flex node of vitulus_navi_mbf.launch, after local_costmap_params.yaml, so it is set
 # after that launch's "rosparam delete move_base_flex" (parameters loaded from any other launch are wiped there).

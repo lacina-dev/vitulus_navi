@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Traversability switch of vitulus_navi_mbf.launch (README "Traversability layer"): off unless both
-VITULUS_TRAVERSABILITY_NAV and VITULUS_TRAVERSABILITY are on; off = parameters exactly as without the switch; on =
+VITULUS_TRAVERSABILITY_NAV and the node (VITULUS_TRAVERSABILITY or VITULUS_TRAVERSABILITY_NODE) are on; off = parameters exactly as without the switch; on =
 traversability_layer before inflation_layer, its parameters inside /move_base_flex. Also keeps the plugin list of
 config/local_costmap_traversability.yaml in step with config/local_costmap_params.yaml. No ROS master.
 
@@ -25,7 +25,8 @@ NS = '/move_base_flex/local_costmap/'
 
 
 def load_params(env):
-    saved = {k: os.environ.get(k) for k in ('VITULUS_TRAVERSABILITY', 'VITULUS_TRAVERSABILITY_NAV')}
+    saved = {k: os.environ.get(k) for k in ('VITULUS_TRAVERSABILITY', 'VITULUS_TRAVERSABILITY_NAV',
+                                            'VITULUS_TRAVERSABILITY_NODE')}
     try:
         for k in saved:
             os.environ.pop(k, None)
@@ -60,14 +61,21 @@ class Switch(unittest.TestCase):
         self.assertFalse(any('traversability' in k for k in self.base))
         # only one of the two, a typo, "false": all the same as unset
         for env in ({'VITULUS_TRAVERSABILITY_NAV': 'true'}, {'VITULUS_TRAVERSABILITY': 'true'},
+                    {'VITULUS_TRAVERSABILITY_NODE': 'true'},
+                    {'VITULUS_TRAVERSABILITY_NODE': 'true', 'VITULUS_TRAVERSABILITY': 'true'},
+                    {'VITULUS_TRAVERSABILITY_NODE': 'true', 'VITULUS_TRAVERSABILITY_NAV': 'false'},
+                    {'VITULUS_TRAVERSABILITY_NODE': 'false', 'VITULUS_TRAVERSABILITY_NAV': 'true'},
                     {'VITULUS_TRAVERSABILITY': 'true', 'VITULUS_TRAVERSABILITY_NAV': 'ture'},
                     {'VITULUS_TRAVERSABILITY': 'true', 'VITULUS_TRAVERSABILITY_NAV': 'false'},
                     {'VITULUS_TRAVERSABILITY': '', 'VITULUS_TRAVERSABILITY_NAV': ''}):
             self.assertEqual(load_params(env), self.base, env)
 
     def test_on_adds_the_layer_only(self):
-        for val in ('true', '1', ' ON ', 'Yes'):
-            p = load_params({'VITULUS_TRAVERSABILITY': 'true', 'VITULUS_TRAVERSABILITY_NAV': val})
+        cases = [({'VITULUS_TRAVERSABILITY': 'true', 'VITULUS_TRAVERSABILITY_NAV': v}, v) for v in ('true', '1', ' ON ', 'Yes')]
+        # the node started by the stack (vitulus.startup: VITULUS_TRAVERSABILITY_NODE) counts as well
+        cases += [({'VITULUS_TRAVERSABILITY_NODE': 'true', 'VITULUS_TRAVERSABILITY_NAV': 'true'}, 'stack node')]
+        for env, val in cases:
+            p = load_params(env)
             want = names(self.base[NS + 'plugins'])
             want.insert(want.index('inflation_layer'), 'traversability_layer')
             self.assertEqual(names(p[NS + 'plugins']), want, val)

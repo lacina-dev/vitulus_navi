@@ -550,6 +550,12 @@ def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0
     caller = rospy.get_caller_id()
     log_prefix = '[{}][safe_blade_shutdown:{}]'.format(caller, source)
 
+    def zone_over():
+        # The zone is over: no zone fence.  Only after the False: the guard drops
+        # its debt on a zone change, the False must already be on the wire.
+        if pubs is not None and hasattr(pubs, 'zone'):
+            pubs.zone()
+
     if pubs is not None:
         pub_motor = pubs.mower_set_motor_on
     else:
@@ -562,6 +568,7 @@ def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0
         off, why = watch.unpowered(program_running=program_running)
         if off:
             pub_motor.publish(Bool(False))
+            zone_over()
             rospy.loginfo('{} mower unpowered ({}): set_motor_on(False) sent, '
                           'nothing to wait for'.format(log_prefix, why))
             return True
@@ -588,6 +595,7 @@ def safe_blade_shutdown(source='unknown', timeout_motor=5.0, timeout_height=30.0
 
     # 2. Stop the cutting motor
     pub_motor.publish(Bool(False))
+    zone_over()
     rospy.loginfo('{} published set_motor_on(False)'.format(log_prefix))
 
     motor_off_deadline = rospy.Time.now() + rospy.Duration(timeout_motor)

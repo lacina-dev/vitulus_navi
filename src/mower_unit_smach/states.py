@@ -467,6 +467,8 @@ class GetZoneData(smach.State):
                       override)
         userdata.zone_name = zone.name
         userdata.paths = zone.paths
+        # From here the blade cuts only inside this zone (map_rules_guard).
+        self.pubs.zone(userdata.program.name, zone)
 
         if userdata.unfinished_active and current_zone_name == userdata.unfinished_zone:
             resume_path_idx = int(userdata.unfinished_path)
@@ -829,6 +831,15 @@ class TrimAndRetry(smach.State):
 # Path execution (extended with BLOCKED detection)
 # ===========================================================================
 
+def mowing_status(userdata):
+    """The mission's status while a path is mowed (mission.py CHECK_PLANNER_PATH)."""
+    try:
+        return "{}: exe path {}/{}".format(userdata.zone_name, userdata.index_path + 1,
+                                          len(userdata.paths))
+    except Exception:  # noqa: BLE001 - a status line must not end the path
+        return "Mowing"
+
+
 class ExecutePathWithFeedback(smach.State):
     """Execute a path chunk via MBF with feedback monitoring.
 
@@ -1011,7 +1022,9 @@ class ExecutePathWithFeedback(smach.State):
                     LINK.settle()
                     if HOLD.link_wait():
                         self._keep_link_span(userdata, start_idx)
-                    HOLD.wait(self, self.pubs.smach_status)
+                    if HOLD.wait(self, self.pubs.smach_status):
+                        # The hold said "Held: ..."; mowing goes on, say so again.
+                        self.pubs.smach_status.publish(String(mowing_status(userdata)))
                     return 'replan_needed'
 
                 now = rospy.Time.now()

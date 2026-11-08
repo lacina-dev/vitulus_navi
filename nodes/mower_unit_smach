@@ -62,9 +62,10 @@ def main():
     pubs = MowerPublishers()
     pubs.smach_status.publish(String("Starting..."))
     pubs.busy.publish(Bool(False))
+    pubs.zone()                       # a zone of the last life is no zone: no fence
     start_power_watch()
     run_flags.start()
-    RULES.start()
+    RULES.start(HOLD)                 # HOLD: the robot waits at the zone edge for the blade
     blade_watch = StaleBladeWatch(pubs, HOLD, RULES)   # the blade while the rules stop all
     TEMP_WATCH.blade_watch = blade_watch
     LINK.stale = blade_watch

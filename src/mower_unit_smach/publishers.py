@@ -4,6 +4,8 @@ Centralised ROS publishers for the mower SMACH node.
 All publishers are created once at startup and shared across states,
 eliminating per-execute publisher leaks.
 """
+import json
+
 import rospy
 from std_msgs.msg import Bool, String, Int16
 from nav_msgs.msg import Path
@@ -67,7 +69,26 @@ class MowerPublishers:
             '/mower/set_motor_rpm', Int16, latch=True, queue_size=1)
         self.mower_set_motor_on = rospy.Publisher(
             '/mower/set_motor_on', Bool, queue_size=1)
+        # The zone mowed now, for map_rules_guard's zone fence: the blade cuts only
+        # inside it.  Latched JSON {program, zone, frame, points}, {} between zones.
+        self.active_zone = rospy.Publisher(
+            '/mower_smach/active_zone', String, latch=True, queue_size=1)
 
         # --- Debug / visualisation ---
         self.current_path = rospy.Publisher(
             '/test_path', Path, latch=True, queue_size=1)
+
+    def zone(self, program='', zone=None):
+        """Say which zone is mowed now (a MapEditZone), None = none."""
+        self.active_zone.publish(String(zone_payload(program, zone)))
+
+
+def zone_payload(program='', zone=None):
+    """/mower_smach/active_zone of a MapEditZone, '{}' when it has no outline."""
+    if zone is None:
+        return '{}'
+    points = [[round(p.x, 3), round(p.y, 3)] for p in zone.polygon.polygon.points]
+    if len(points) < 3:
+        return '{}'
+    return json.dumps({'program': program or '', 'zone': zone.name,
+                       'frame': zone.polygon.header.frame_id or 'map', 'points': points})

@@ -35,6 +35,7 @@ class HoldGate(object):
         self._blade_wait = False   # stale_blade.py: the blade comes back before the mission
         self._temp_wait = False    # temp_watch.py: firmware TEMP, spike or real?
         self._link_wait = False    # mower_link.py: nobody can vouch for the blade
+        self._rule_wait = False    # rule_gate.py: back in the zone, the blade spins up
         self._foreign = False      # a mux hold by anybody but mower_link
         self._own = False          # the mux lists mower_link
         self._last_end = None      # rospy.Time the last hold ended
@@ -70,7 +71,7 @@ class HoldGate(object):
 
     def _update(self, now):
         held = (self._mux_held or self._stale or self._blade_wait or self._temp_wait
-                or self._link_wait)
+                or self._link_wait or self._rule_wait)
         if held and not self._held:
             self._since = now
         elif self._held and not held:
@@ -104,6 +105,16 @@ class HoldGate(object):
                 self._link_wait = waiting
                 self._update(rospy.Time.now())
 
+    def set_rule_wait(self, waiting):
+        with self._lock:
+            if waiting != self._rule_wait:
+                self._rule_wait = waiting
+                self._update(rospy.Time.now())
+
+    def rule_wait(self):
+        with self._lock:
+            return self._rule_wait
+
     def link_wait(self):
         with self._lock:
             return self._link_wait
@@ -134,6 +145,8 @@ class HoldGate(object):
             return 'Held: mower link'
         if self._mux_held:
             return text
+        if self._rule_wait and not self._stale:
+            return 'Held: blade spinning up'
         return 'Held: map rules stop' if self._stale else 'Held: blade coming back'
 
     def wait(self, state=None, status_pub=None, text='Held: waiting for GPS'):

@@ -1315,6 +1315,11 @@ class GlocServer(object):
             info.update({'state': 'ok', 'rms': round(out['rms'], 3),
                          'n': out['n'], 'corr_m': round(dx, 3),
                          'corr_yaw_deg': round(dyaw, 2),
+                         # signed vector, map frame, after the weak-axis projection
+                         'corr_dx': round(x - pose0[0], 3),
+                         'corr_dy': round(y - pose0[1], 3),
+                         'corr_dyaw_deg': round(math.degrees(math.atan2(
+                             math.sin(th - pose0[2]), math.cos(th - pose0[2]))), 2),
                          'eig_min_frac': round(out['eig_min'] / out['n'], 3),
                          'gps_good': self._gps_good,
                          'gps_stable': self._gps_stable,
@@ -1555,6 +1560,10 @@ class GlocServer(object):
                                                    math.cos(th - pose0[2]))))
                 info['corr_m_sm'] = round(dx, 3)
                 info['corr_yaw_deg_sm'] = round(dyaw, 2)
+                info['corr_dx_sm'] = round(x - pose0[0], 3)
+                info['corr_dy_sm'] = round(y - pose0[1], 3)
+                info['corr_dyaw_deg_sm'] = round(math.degrees(math.atan2(
+                    math.sin(th - pose0[2]), math.cos(th - pose0[2]))), 2)
                 # URGENT-CORR BYPASS (2026-07-12 prevention 2a): a smoothed
                 # correction over track_urgent_corr_m is real drift, not near-minima
                 # jitter — the deadband/persistence gates must NOT starve it while

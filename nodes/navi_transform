@@ -916,6 +916,21 @@ class NavTfNode:
                 self.roslaunch_navsat()
 
 
+    def _nav_ekf_z(self):
+        """T28 (2026-11-08): z for every set_pose into the nav EKF = the EKF's
+        own current z. The odom-frame height must stay continuous (REP-105):
+        writing the GNSS altitude (/odometry/gps z, relative to the navsat
+        datum) stepped /odometry/odom by -32/+26 cm on GPS-ownership resume and
+        on a navsat relaunch, which broke the odom-frame terrain map (T10).
+        Before the first EKF message ekf_wheel_nav_odom_msg is a fresh
+        Odometry(), so this is 0.0 only on the very first start."""
+        return self.ekf_wheel_nav_odom_msg.pose.pose.position.z
+
+    # T28 NOTE: the manual/external set_pose (topic + service) is deliberately
+    # left as is: it goes in frame 'map', and robot_localization transforms it
+    # into odom with map->odom (z = -odom->base z, see transform_map_to_odom),
+    # so a map pose with z = 0 already lands on the EKF's current z. Writing
+    # the EKF z here would double it (+z step).
     def callback_set_pose(self, msg):
         rospy.logdebug("Set pose: %s" % msg.pose.pose)
         self.set_nav_pose(msg.pose.pose)
@@ -2108,7 +2123,8 @@ class NavTfNode:
             pose_srv = SetPoseRequest()
             pose_srv.pose.pose.pose.position.x = self._bridge['x']
             pose_srv.pose.pose.pose.position.y = self._bridge['y']
-            pose_srv.pose.pose.pose.position.z = 0.0
+            # T28: keep the EKF's own z (was 0.0 -> z step to zero)
+            pose_srv.pose.pose.pose.position.z = self._nav_ekf_z()
             pose_srv.pose.pose.pose.orientation.x = self.fused_msg.orientation.x
             pose_srv.pose.pose.pose.orientation.y = self.fused_msg.orientation.y
             pose_srv.pose.pose.pose.orientation.z = self.fused_msg.orientation.z
@@ -2295,7 +2311,7 @@ class NavTfNode:
         pose = Pose()
         pose.position.x = sx
         pose.position.y = sy
-        pose.position.z = self.ekf_wheel_nav_odom_msg.pose.pose.position.z
+        pose.position.z = self._nav_ekf_z()
         pose.orientation = self.fused_msg.orientation
         self._last_rewind_t = now_t
         self.set_wheel_base_nav_pose(pose, frame='odom')
@@ -2360,7 +2376,8 @@ class NavTfNode:
         pose = Pose()
         pose.position.x = tx
         pose.position.y = ty
-        pose.position.z = self.rtk_odom_msg.pose.pose.position.z
+        # T28: GNSS fixes x/y only; z stays the EKF's (GNSS altitude stepped it)
+        pose.position.z = self._nav_ekf_z()
         pose.orientation = self.fused_msg.orientation
         # frame='map' target -> reuse the SAME slewed path as the legacy
         # correction (slew lives in the pose=None branch; here we pass an
@@ -2720,13 +2737,18 @@ class NavTfNode:
             if pos_done and yaw_done:
                 self._map_pose_target = None   # reached target — stop slewing
 
-    def transform_map_to_odom(self, stamp=None):
+    def transform_map_to_odom(self, stamp=None, odom_base_tf=None):
         """Build map->odom for this tick and return it (None indoors).
-        TF-ATOMIC (2026-10-18): broadcast by loop30hz together with odom->base."""
+        TF-ATOMIC (2026-10-18): broadcast by loop30hz together with odom->base.
+        T28: loop30hz passes the odom->base built THIS tick, so map->odom.z
+        (= -odom->base.z, flattens the map-frame height to 0) matches it. The
+        old TF lookup returned the previous tick's odom->base -> every odom z
+        change left a one-tick (~33-50 ms) spike of the same size in map."""
         if stamp is None:
             stamp = rospy.Time.now()
         if not self.is_indoor:
-            odom_base_tf = self.get_base_link_transform()
+            if odom_base_tf is None:
+                odom_base_tf = self.get_base_link_transform()
             # FIX-7: snapshot (x, y, z, yaw) under the lock, then build + broadcast
             # from locals — the broadcast no longer reads the live shared object
             # (nor mutates it: the old code aliased translation by reference and
@@ -2846,7 +2868,8 @@ class NavTfNode:
                     tx, ty = cx + dx * scale, cy + dy * scale
                 pose_srv.pose.pose.pose.position.x = tx
                 pose_srv.pose.pose.pose.position.y = ty
-                pose_srv.pose.pose.pose.position.z = self.rtk_odom_msg.pose.pose.position.z
+                # T28: x/y from RTK, z stays the EKF's (never GNSS altitude)
+                pose_srv.pose.pose.pose.position.z = self._nav_ekf_z()
                 pose_srv.pose.pose.pose.orientation.x = self.fused_msg.orientation.x
                 pose_srv.pose.pose.pose.orientation.y = self.fused_msg.orientation.y
                 pose_srv.pose.pose.pose.orientation.z = self.fused_msg.orientation.z
@@ -3353,7 +3376,7 @@ class NavTfNode:
                 self.dock_anchor_hold()
             except Exception as e:
                 rospy.logwarn_throttle(10.0, "[dock_hold] %s" % e)
-            map_odom_tf = self.transform_map_to_odom(stamp)
+            map_odom_tf = self.transform_map_to_odom(stamp, odom_base_tf)
             if map_odom_tf is not None:
                 tf_out.append(map_odom_tf)
         finally:

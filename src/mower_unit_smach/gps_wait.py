@@ -31,6 +31,60 @@ def fmt_mmss(seconds):
     return "%d:%02d" % (seconds // 60, seconds % 60)
 
 
+# T28: after this long with both receivers in RTK but odometry not ready, the
+# wait names the concrete reason (2026-11-08: 9 min of "odom IMU, inf, inf").
+ODOM_REASON_AFTER_S = 60.0
+ODOM_REASON_REPEAT_S = 60.0
+
+
+def _age_txt(age):
+    return "inf" if age is None or age != age or age > 9999 else "%.0fs" % age
+
+
+def odom_wait_reason(status, values, var_min=0.00043, var_max=0.00079,
+                     var_floor=0.0003, fresh_s=3.0):
+    """Why navi_transform's odometry is not ready, from /nav_tf/odom_status:
+    status 'SAT' = navsat_transform runs; values = [GPS position age s,
+    RTK heading age s, heading variance rad^2] (age = time since navi_transform
+    last fused it; inf = never since its start). The heading is accepted only
+    with variance in [var_min, var_max]; [var_floor, var_min) only after GPS
+    has proven itself in motion. ASCII (Nextion)."""
+    vals = list(values or [])
+    inf = float('inf')
+    fix_age = vals[0] if len(vals) > 0 else inf
+    hdg_age = vals[1] if len(vals) > 1 else inf
+    var = vals[2] if len(vals) > 2 else None
+
+    def var_txt():
+        if var is None or var == inf or var != var:
+            return "heading var unknown"
+        if var < var_floor:
+            return "heading var %.5f below floor %.5f (degenerate)" % (var, var_floor)
+        if var < var_min:
+            return ("heading var %.5f below band %.5f-%.5f (accepted only after "
+                    "GPS proven in motion)" % (var, var_min, var_max))
+        if var > var_max:
+            return "heading var %.5f above band %.5f-%.5f" % (var, var_min, var_max)
+        return "heading var %.5f in band %.5f-%.5f" % (var, var_min, var_max)
+
+    fix_ok = fix_age < fresh_s
+    hdg_ok = hdg_age < fresh_s
+    if status != "SAT":
+        if not hdg_ok:
+            return "navsat not started: waits for an accepted RTK heading, " + var_txt()
+        return ("navsat not started: waits for a stable proven GPS position "
+                "(fix age %s)" % _age_txt(fix_age))
+    if not fix_ok and not hdg_ok:
+        return ("GPS position (age %s) and RTK heading (age %s) not accepted, %s"
+                % (_age_txt(fix_age), _age_txt(hdg_age), var_txt()))
+    if not fix_ok:
+        return ("GPS position not owned yet (probation/stability), fix age %s"
+                % _age_txt(fix_age))
+    if not hdg_ok:
+        return "RTK heading not accepted for %s, %s" % (_age_txt(hdg_age), var_txt())
+    return "odometry stabilizing"
+
+
 class GpsWaitBudget(object):
 
     def __init__(self, start, base_s=600.0, extend_s=900.0, max_s=1500.0,

@@ -26,11 +26,12 @@ from rtabmap_msgs.msg import Info
 from .chain import PROGRAM_CHAIN
 from .hold_gate import HOLD
 from .mower_link import LINK
+from .mower_revive import MowerLinkHome, MowerOnTimeout, PowerOnMower
 from .stale_blade import TERMINAL_REASON
 from .temp_watch import TEMP_WATCH
 from .helpers import (
     classify_mbf_result, safe_blade_shutdown, wait_for_mbf, MOWER_ERROR_STATES,
-    mark_run_phase, mower_status_now, run_flags)
+    run_flags)
 from .states import (
     VerifyAtPose, WaitForMowerStatus, WaitForTopic, WaitForGpsFixState, RetryLimitedAction,
     GetZoneData, GetPathData, CheckDistance, WindowPlannerPath, TrimAndRetry,
@@ -489,24 +490,12 @@ def build_mission_child_sm(pubs):
 
         # ==================== MOWER POWER ====================
 
-        @smach.cb_interface(input_keys=['program'], output_keys=['program'],
-                            outcomes=['done', 'preempted'])
-        def power_on_cb(ud):
-            mark_run_phase(ud.program, 'on_mower')
-            status = mower_status_now()
-            if PROGRAM_CHAIN.board_stays_on(status):
-                rospy.loginfo('[POWER_ON_MOWER] chain: board stays on (%s)', status)
-                return 'done'
-            rospy.loginfo('[POWER_ON_MOWER] Turning on mower')
-            pubs.mower_set_power.publish(Bool(True))
-            pubs.log_info.publish(String("Turn on mower"))
-            pubs.smach_status.publish(String("Turn on mower"))
-            pubs.pm_play_melody.publish(Int16(1))
-            rospy.sleep(2.5)
-            return 'done'
-
-        smach.StateMachine.add('POWER_ON_MOWER', smach.CBState(power_on_cb),
+        # A board that answers: set_power True and READY as always.  A silent one
+        # (T24, mower_revive.py): bat_out through the PM, one retry, then home as
+        # interrupted:mower_link instead of critical.
+        smach.StateMachine.add('POWER_ON_MOWER', PowerOnMower(pubs),
                                transitions={'done': 'WAIT_FOR_MOWER_ON',
+                                            'silent': 'POWER_ON_MOWER_RETRY',
                                             'preempted': 'preempted'})
 
         def _on_mower_ready(_msg):
@@ -521,9 +510,38 @@ def build_mission_child_sm(pubs):
                                transitions={
                                    'reached': 'ZONE_IT',
                                    'error': 'aborted',
-                                   'timeout': 'aborted',
+                                   'timeout': 'MOWER_ON_TIMEOUT',
                                    'preempted': 'preempted'
                                })
+
+        smach.StateMachine.add('MOWER_ON_TIMEOUT', MowerOnTimeout('WAIT_FOR_MOWER_ON'),
+                               transitions={'silent': 'POWER_ON_MOWER_RETRY',
+                                            'abort': 'aborted'})
+
+        smach.StateMachine.add('POWER_ON_MOWER_RETRY',
+                               PowerOnMower(pubs, label='POWER_ON_MOWER_RETRY'),
+                               transitions={'done': 'WAIT_FOR_MOWER_ON_RETRY',
+                                            'silent': 'MOWER_LINK_HOME',
+                                            'preempted': 'preempted'})
+
+        smach.StateMachine.add('WAIT_FOR_MOWER_ON_RETRY',
+                               WaitForMowerStatus('READY', timeout=30.0,
+                                                  extra_check=_on_mower_ready),
+                               transitions={
+                                   'reached': 'ZONE_IT',
+                                   'error': 'aborted',
+                                   'timeout': 'MOWER_ON_TIMEOUT_RETRY',
+                                   'preempted': 'preempted'
+                               })
+
+        smach.StateMachine.add('MOWER_ON_TIMEOUT_RETRY',
+                               MowerOnTimeout('WAIT_FOR_MOWER_ON_RETRY'),
+                               transitions={'silent': 'MOWER_LINK_HOME',
+                                            'abort': 'aborted'})
+
+        smach.StateMachine.add('MOWER_LINK_HOME', MowerLinkHome(pubs),
+                               transitions={'preempted': 'preempted',
+                                            'aborted': 'aborted'})
 
         # ==================== ZONE ITERATOR ====================
 

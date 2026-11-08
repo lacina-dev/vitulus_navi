@@ -31,6 +31,7 @@
   <exec_depend>nonpersistent_voxel_layer</exec_depend>
   <exec_depend>weather_alert</exec_depend>
   <exec_depend>vitulus_msgs</exec_depend>
+  <exec_depend>ublox_msgs</exec_depend>
 
 <!--  <export>-->
 <!--        <costmap_2d plugin="${vitulus_navi}/costmap_plugins.xml"/>-->

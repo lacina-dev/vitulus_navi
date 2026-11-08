@@ -25,6 +25,10 @@ import serial
 import signal
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from sensor_msgs.msg import NavSatFix
+try:
+    from ublox_msgs.msg import NavRELPOSNED9
+except ImportError:          # driver msgs missing: RELPOSNED gate stays off (logged)
+    NavRELPOSNED9 = None
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 import numpy as np
 import math
@@ -429,6 +433,20 @@ class NavTfNode:
         # 5.2-5.5e-4, 55% of samples) — inside this band.
         self._heading_var_min = float(rospy.get_param('~heading_var_min', 0.00043))
         self._heading_var_max = float(rospy.get_param('~heading_var_max', 0.00079))
+        # T28-carr (2026-11-08): the dual-antenna heading is accepted only when
+        # the SAME receiver's NAV-RELPOSNED reports a FIXED carrier solution
+        # (carrSoln == 2) with relPosHeadingValid. heading_fix_usable is the
+        # rover's own NavPVT (/gnss_heading/fix), a different solution; bags
+        # 2026-10-17/08-02: in-band FLOAT heading samples are 12-23 deg off
+        # (p50). The ublox driver publishes navrelposned right before
+        # navheading from the same message; the latest RELPOSNED must be
+        # fresher than ~relpos_max_age_s (5 Hz -> same or previous epoch).
+        # Never received (topic/driver msgs missing) -> gate off, logged.
+        self._heading_require_relpos = bool(rospy.get_param(
+            '~heading_require_relpos_fixed', True))
+        self._relpos_max_age_s = float(rospy.get_param('~relpos_max_age_s', 0.3))
+        self._relpos_flags = None          # latest NAV-RELPOSNED flags
+        self._relpos_rx_t = None           # rospy.get_time() of its arrival
         # HEADING ANCHOR V2 (2026-08-01, courtyard entry-error fix): in-band
         # offsets are no longer applied live — multipath onset near buildings
         # corrupts the last seconds of "in-band" heading BEFORE the variance
@@ -728,6 +746,10 @@ class NavTfNode:
 
         self.navheading_gnss_fix_sub = rospy.Subscriber("/gnss/fix", NavSatFix, self.callback_gnss_fix, queue_size=10)
         self.navheading_gnss_heading_fix_sub = rospy.Subscriber("/gnss_heading/fix", NavSatFix, self.callback_gnss_heading_fix, queue_size=10)
+        if NavRELPOSNED9 is not None:
+            # subscribed BEFORE navheading (driver publishes it first)
+            self.relposned_sub = rospy.Subscriber("/gnss_heading/navrelposned", NavRELPOSNED9,
+                                                  self.callback_relposned, queue_size=10)
         self.navheading_rtk_sub = rospy.Subscriber("/gnss_heading/navheading", Imu, self.callback_navheading, queue_size=10)
         self.imu_sub = rospy.Subscriber("/bno085/imu", Imu, self.callback_imu, queue_size=200)
         self.wheel_odom_sub = rospy.Subscriber("/mobile_base_controller/odom", Odometry, self.callback_wheel_odom, queue_size=200)
@@ -2889,6 +2911,32 @@ class NavTfNode:
             rospy.logerr("Service /ekf_wheel_nav_odometry/set_pose call failed: %s" % e)
 
 
+    def callback_relposned(self, msg):
+        self._relpos_flags = int(msg.flags)
+        self._relpos_rx_t = rospy.get_time()
+
+    def _relpos_heading_ok(self):
+        """T28-carr: True when the latest NAV-RELPOSNED (fresh) is carrSoln
+        FIXED with relPosHeadingValid. Gate off (True) when disabled or when no
+        RELPOSNED was ever received (old behaviour, logged)."""
+        if not self._heading_require_relpos:
+            return True
+        if self._relpos_flags is None:
+            rospy.logwarn_throttle(
+                60.0, '[navheading] no /gnss_heading/navrelposned received — '
+                'carrSoln gate OFF (heading accepted as before)')
+            return True
+        f = self._relpos_flags
+        carr = (f >> 3) & 3                    # FLAGS_CARR_SOLN_MASK 0x18
+        head_valid = bool(f & 0x100)           # FLAGS_REL_POS_HEAD_VALID
+        age = rospy.get_time() - self._relpos_rx_t
+        ok = carr == 2 and head_valid and age <= self._relpos_max_age_s
+        if not ok:
+            rospy.logwarn_throttle(
+                30.0, '[navheading] RELPOSNED carrSoln=%d headingValid=%d age=%.2fs '
+                '— heading REJECTED (needs FIXED + valid)', carr, int(head_valid), age)
+        return ok
+
     def offset_navheading_imu(self, msg):
         """
         Compute offset of the navheading with the imu heading. Do only if the rtk navheading is usable.
@@ -2899,7 +2947,8 @@ class NavTfNode:
         self.imu_delay = delay
         rtk_error_z = msg.orientation_covariance[8]
         self.rtk_err = rtk_error_z
-        if delay <= 6 and self.fix_usable and self.heading_fix_usable:
+        if delay <= 6 and self.fix_usable and self.heading_fix_usable \
+                and self._relpos_heading_ok():
 
             # HEALTHY-BAND acceptance (2026-07-06, user field data): a
             # SUSPICIOUSLY TIGHT yaw variance (< ~0.001; UI 'e' readout

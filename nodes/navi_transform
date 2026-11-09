@@ -387,7 +387,28 @@ class NavTfNode:
         # (GNSS offset_navheading_imu, /nav_tf/set_heading) or the GPS georef path
         # (callback_map_coords) takes map->odom over — otherwise yaw would be
         # counted twice. odom->base is never touched -> no rtabmap feedback loop.
+        # T7d: those resets are now POSITION-CONTINUOUS (map_odom_yaw changes are
+        # applied about the robot, not the map origin, see _set_map_odom_yaw_keep_base)
+        # and the GNSS heading hand-over walks the map-frame heading at
+        # heading_slew_dps (_reanchor_map_yaw).
         self.map_odom_yaw = 0.0
+        # T7d: map->odom has been placed by the dock / an external map pose (not
+        # the boot identity) -> the first GPS georef must SLEW, not snap
+        self._map_odom_placed = False
+        # T7d: the georef waits until the GNSS heading hand-over has brought
+        # map_odom_yaw this close to 0 (it assumes an identity-rotation map->odom)
+        self._georef_max_map_yaw = math.radians(float(rospy.get_param(
+            '~georef_max_map_yaw_deg', 0.5)))
+        # T7d: georef translation slew target, walked in the 30 Hz loop
+        # (slew_georef) instead of 10 cm steps once a second
+        self._georef_target = None
+        self._georef_slew_last_t = None
+        # T7d safety: the georef waits for the heading hand-over at most this
+        # long; after a GPS return with a tracker yaw and no accepted heading
+        # (float / out of band / anchor frozen) it would wait forever -> level
+        # map_odom_yaw about the robot (position kept, heading steps) and go on
+        self._georef_wait_max_s = float(rospy.get_param('~georef_wait_max_s', 10.0))
+        self._georef_wait_since = None
         # GPS-acquisition hysteresis: GPS corrections (map_coords georef AND the
         # loop3sec RTK set_pose) may act only after the position fix has been
         # continuously usable this long. At acquisition the fused heading (and
@@ -1216,6 +1237,8 @@ class NavTfNode:
                 cur.y = ty
                 self.map_odom_yaw = m
                 self._map_pose_target = None   # dock owns it; drop any slew
+                self._map_odom_placed = True
+                self._georef_target = None
         if refuse:
             self._dock_hold_refusals += 1
             rospy.logerr_throttle(
@@ -1415,6 +1438,10 @@ class NavTfNode:
                 self.map_odom_transform.transform.translation.x = tx
                 self.map_odom_transform.transform.translation.y = ty
                 self._map_pose_target = None   # instant source wins; drop pending slew
+            # T7d: map->odom placed by a map pose; a pending georef slew must
+            # not drag it (cleared inside the same critical section)
+            self._map_odom_placed = True
+            self._georef_target = None
         # WP2: correction ACCEPTED and applied — stamp this source for arbitration.
         if source in self._map_pose_last_accept:
             self._map_pose_last_accept[source] = rospy.get_time()
@@ -1534,6 +1561,27 @@ class NavTfNode:
         if not self.position_fix_usable:
             self.map_coords_msg = msg
             return
+        # T7d: the georef target below assumes map->odom without rotation. While
+        # the GNSS heading hand-over (_reanchor_map_yaw) is still walking
+        # map_odom_yaw (the dock / tracker yaw) to 0, only keep the message —
+        # resetting it here rotated map->odom about the map origin (1.29 m /
+        # +15.8 deg jump at UNDOCK, 2026-11-09 01:09:06).
+        if abs(self.map_odom_yaw) > self._georef_max_map_yaw:
+            now_w = rospy.get_time()
+            if self._georef_wait_since is None:
+                self._georef_wait_since = now_w
+            if now_w - self._georef_wait_since < self._georef_wait_max_s:
+                rospy.loginfo_throttle(
+                    5.0, '[map->odom] georef waits: heading hand-over still turning '
+                    'map->odom (%.1f deg)', math.degrees(self.map_odom_yaw))
+                self.map_coords_msg = msg
+                return
+            rospy.logwarn('[map->odom] georef waited %.0f s for the heading hand-over '
+                          '(map->odom yaw %.1f deg) - levelling it about the robot',
+                          now_w - self._georef_wait_since, math.degrees(self.map_odom_yaw))
+            with self._map_odom_lock:
+                self._set_map_odom_yaw_keep_base(0.0)
+        self._georef_wait_since = None
         trans = None
         try:
             trans = self.tf2_Buffer.lookup_transform('utm', 'odom', rospy.Time(0))
@@ -1575,16 +1623,25 @@ class NavTfNode:
             # so a snap here re-pinned map->odom visibly. Rate-limit the
             # translation approach; only a kidnap-size mismatch snaps.
             now_g = rospy.get_time()
+            # T7d: drop the small residual map->odom yaw ABOUT THE ROBOT first
+            # (position kept), then slew the translation from there.
+            if self.map_odom_yaw != 0.0:
+                with self._map_odom_lock:
+                    self._set_map_odom_yaw_keep_base(0.0)
             cur = self.map_odom_transform.transform.translation
             d_x, d_y, d_z = p_x - cur.x, p_y - cur.y, p_z - cur.z
             dist_g = math.hypot(d_x, d_y)
-            first = self._georef_last_t is None
+            # T7d: the first georef snaps only onto a map->odom nobody placed yet
+            # (boot identity); after the dock / a map pose placed it, it slews
+            # like every later one (snap only beyond georef_kidnap_m).
+            first = self._georef_last_t is None and not self._map_odom_placed
+            georef_target = None
             if not first and dist_g <= self._georef_kidnap_m:
-                dt_g = min(now_g - self._georef_last_t, 3.0)
-                max_step = self._georef_slew_mps * max(dt_g, 0.1)
-                if dist_g > max_step:
-                    s = max_step / dist_g
-                    p_x, p_y, p_z = cur.x + d_x * s, cur.y + d_y * s, cur.z + d_z * s
+                # T7d: walk there at georef_slew_mps in the 30 Hz loop
+                # (slew_georef); this callback runs ~1 Hz and used to apply the
+                # whole second's 10 cm in one step.
+                georef_target = (p_x, p_y, p_z)
+                p_x, p_y, p_z = cur.x, cur.y, cur.z
             elif not first:
                 rospy.logwarn('[map->odom] georef mismatch %.2f m > kidnap '
                               '%.2f m — snapping', dist_g, self._georef_kidnap_m)
@@ -1610,6 +1667,7 @@ class NavTfNode:
                 # correction (its translation math above assumes the
                 # identity-rotation broadcast).
                 self.map_odom_yaw = 0.0
+                self._georef_target = georef_target
             # DRIFT-BUDGET: GPS georef is a trusted absolute anchor — restart
             # the odometry drift budget (and the DOCKFIX ratchet) for tracker
             # corrections.
@@ -2710,6 +2768,33 @@ class NavTfNode:
         else:
             return None
 
+    def slew_georef(self):
+        """T7d: walk map->odom's translation toward the last georef target at
+        georef_slew_mps, integrated in the 30 Hz loop (~3 mm per tick at
+        0.1 m/s) - the georef callback runs ~1 Hz."""
+        if getattr(self, '_georef_target', None) is None:
+            self._georef_slew_last_t = None
+            return
+        now = rospy.get_time()
+        last, self._georef_slew_last_t = getattr(self, '_georef_slew_last_t', None), now
+        dt = 1.0 / 30.0 if last is None else min(max(now - last, 1.0 / 60.0), 0.5)
+        with self._map_odom_lock:
+            tgt = self._georef_target          # read under the lock (set_map_pose may clear it)
+            if tgt is None:
+                return
+            cur = self.map_odom_transform.transform.translation
+            d_x, d_y, d_z = tgt[0] - cur.x, tgt[1] - cur.y, tgt[2] - cur.z
+            dist = math.hypot(d_x, d_y)
+            step = self._georef_slew_mps * dt
+            if dist <= step:
+                cur.x, cur.y, cur.z = tgt
+                self._georef_target = None
+            else:
+                f = step / dist
+                cur.x += d_x * f
+                cur.y += d_y * f
+                cur.z += d_z * f
+
     def slew_map_pose(self):
         """SMOOTH (2026-07-12): walk the live map->odom (translation + map_odom_yaw)
         toward the last slewed set_map_pose target (tracker) at a bounded rate,
@@ -2986,6 +3071,47 @@ class NavTfNode:
                     # trusted history to verify against yet
                     self._apply_heading_target(target)
 
+    def _odom_base_xy(self):
+        p = self.ekf_wheel_nav_odom_msg.pose.pose.position
+        return p.x, p.y
+
+    def _set_map_odom_yaw_keep_base(self, yaw_new):
+        """T7d: set map_odom_yaw and move the map->odom translation so the
+        robot's MAP position does not change: P = R(yaw)*ob + t stays, i.e.
+        t' = P - R(yaw')*ob (the rotation happens about the robot, not about
+        the map origin). Caller holds _map_odom_lock."""
+        ox, oy = self._odom_base_xy()
+        t = self.map_odom_transform.transform.translation
+        c, s = math.cos(self.map_odom_yaw), math.sin(self.map_odom_yaw)
+        px, py = c * ox - s * oy + t.x, s * ox + c * oy + t.y
+        c2, s2 = math.cos(yaw_new), math.sin(yaw_new)
+        t.x = px - (c2 * ox - s2 * oy)
+        t.y = py - (s2 * ox + c2 * oy)
+        self.map_odom_yaw = yaw_new
+
+    def _reanchor_map_yaw(self, diff_old, target, max_step):
+        """T7d: GNSS heading hand-over without a jump. The robot's map-frame
+        heading offset is H = diff_yaw + map_odom_yaw (fused heading + map->odom
+        yaw). It moves toward the GNSS target by at most max_step per sample;
+        whatever diff_yaw did this sample is compensated in map_odom_yaw, which
+        thus reaches exactly 0 once both have converged. Position kept
+        (_set_map_odom_yaw_keep_base). With map_odom_yaw already 0 (GNSS owns
+        the heading) nothing changes against before: diff_yaw alone."""
+        if self.map_odom_yaw == 0.0:
+            return              # GNSS already owns the heading: as before
+        with self._map_odom_lock:
+            if self.map_odom_yaw == 0.0:
+                return
+            h = diff_old + self.map_odom_yaw
+            d = math.atan2(math.sin(target - h), math.cos(target - h))
+            h_new = h + max(-max_step, min(max_step, d))
+            yaw_new = h_new - self.diff_yaw
+            yaw_new = math.atan2(math.sin(yaw_new), math.cos(yaw_new))
+            if abs(yaw_new) < 1e-9:
+                yaw_new = 0.0
+            if yaw_new != self.map_odom_yaw:
+                self._set_map_odom_yaw_keep_base(yaw_new)
+
     def _apply_heading_target(self, target):
         """Slew diff_yaw toward an ACCEPTED offset target + the re-anchor side
         effects. Split out of offset_navheading_imu so heading anchor v2 can
@@ -2999,14 +3125,18 @@ class NavTfNode:
         err = math.atan2(math.sin(target - self.diff_yaw),
                          math.cos(target - self.diff_yaw))
         max_step = math.radians(self._heading_slew_dps) * 0.1  # called ~10 Hz w/ heading fixes
+        diff_old = self.diff_yaw
         if self.init or abs(err) <= math.radians(2.0):
             self.diff_yaw = target
         else:
             self.diff_yaw += max(-max_step, min(max_step, err))
         self.init = False
-        # GNSS re-anchors heading inside odom->base -> drop any map->odom
-        # yaw correction or the angle would be applied twice.
-        self.map_odom_yaw = 0.0
+        # GNSS re-anchors heading inside odom->base -> the map->odom yaw
+        # correction must go to 0 or the angle would be applied twice. T7d: not
+        # at once (that turned map->odom about the map origin while diff_yaw
+        # was still slewing: 1.29 m / +15.8 deg at UNDOCK) — the map-frame
+        # heading walks to the GNSS one at the same rate, the robot stays put.
+        self._reanchor_map_yaw(diff_old, target, max_step)
         # Acquisition gate flag set HERE — only when the dual-antenna
         # heading anchor has ACTUALLY been applied (drive 5: a single
         # good-covariance heading sample set the old flag while diff_yaw
@@ -3073,8 +3203,10 @@ class NavTfNode:
         self.diff_yaw = wanted - imu_yaw
         self.init = False
         # heading re-anchored inside odom->base -> reset the map->odom yaw
-        # correction (same double-count rule as the GNSS path).
-        self.map_odom_yaw = 0.0
+        # correction (same double-count rule as the GNSS path). T7d: about the
+        # robot (position kept); the heading itself jumps to `wanted` on purpose.
+        with self._map_odom_lock:
+            self._set_map_odom_yaw_keep_base(0.0)
         # external anchor = new heading era -> drop buffered GNSS offsets so
         # anchor v2 cannot verify a window that straddles the re-anchor
         self._ha_buf.clear()
@@ -3418,6 +3550,7 @@ class NavTfNode:
         odom_base_tf = self.transform_odom_to_base_link(stamp)
         try:
             self.slew_map_pose()
+            self.slew_georef()     # T7d
             # DOCKFIX-2026-08-29 (A2): the continuous dock hold runs AFTER the slew
             # (so it overrides any leftover slew step) and BEFORE the broadcast, so
             # the transform published this tick is the held one.

@@ -108,8 +108,10 @@ def make_node(nt):
     n._map_pose_target = None
     n._georef_target = None
     n._georef_slew_last_t = None
-    n._georef_wait_max_s = 10.0
-    n._georef_wait_since = None
+    n._georef_stall_s = 10.0
+    n._georef_stall_ref = None
+    n._yaw_level = False
+    n._yaw_level_last_t = None
     # georef
     n._map_coords_rx_t = 0.0
     n._gps_stable = lambda: True
@@ -132,12 +134,13 @@ def make_node(nt):
     return n
 
 
-def map_pose(n):
+def map_pose(n, ekf_yaw=None):
     t = n.map_odom_transform.transform.translation
     c, s = math.cos(n.map_odom_yaw), math.sin(n.map_odom_yaw)
     x = c * OB[0] - s * OB[1] + t.x
     y = s * OB[0] + c * OB[1] + t.y
-    yaw = n.map_odom_yaw + (IMU + n.diff_yaw)        # ideal EKF: odom yaw = imu + diff
+    # ideal EKF: odom yaw = imu + diff; or the given (lagging) EKF yaw
+    yaw = n.map_odom_yaw + ((IMU + n.diff_yaw) if ekf_yaw is None else ekf_yaw)
     return x, y, yaw
 
 
@@ -149,13 +152,17 @@ def georef_msg():
     return m
 
 
-def simulate(nt, seconds=40.0, target=TARGET):
-    """30 Hz ticks; heading at 10 Hz from 1 s, georef at 1 Hz from 6.6 s."""
+def simulate(nt, seconds=40.0, target=TARGET, hdg_period=0.1, ekf_tau=0.0, stats=None):
+    """30 Hz ticks; heading every hdg_period from 1 s, georef at 1 Hz from 6.6 s.
+    ekf_tau > 0: the nav EKF yaw follows imu + diff_yaw with that time constant
+    (field: the EKF lags the fused heading). stats: dict, gets 'level_big' = the
+    levelling engaged while |map_odom_yaw| > 0.5 deg (the safety net fired)."""
     # georef target (identity rotation): base = ob + p -> p = P0 + off - ob
     nt.georef_map_odom_xy = lambda *a, **k: (P0[0] + GEOREF_OFF[0] - OB[0],
                                              P0[1] + GEOREF_OFF[1] - OB[1])
     n = make_node(nt)
-    prev = map_pose(n)
+    ekf = IMU + n.diff_yaw
+    prev = map_pose(n, ekf)
     worst_d, worst_a, worst_t = 0.0, 0.0, None
     tick = 1.0 / 30.0
     k = 0
@@ -167,13 +174,19 @@ def simulate(nt, seconds=40.0, target=TARGET):
         if t >= next_hdg:
             noise = D(0.2) * math.sin(7.0 * t)
             n._apply_heading_target(target + noise)
-            next_hdg += 0.1
+            next_hdg += hdg_period
         if t >= next_geo:
             n.callback_map_coords(georef_msg())
             next_geo += 1.0
         if hasattr(n, 'slew_georef'):
             n.slew_georef()                 # loop30hz
-        cur = map_pose(n)
+        if hasattr(n, 'slew_yaw_level'):
+            n.slew_yaw_level()
+        if stats is not None and getattr(n, '_yaw_level', False) and abs(n.map_odom_yaw) > D(0.5):
+            stats['level_big'] = True
+        fused = IMU + n.diff_yaw
+        ekf = fused if ekf_tau <= 0 else ekf + (fused - ekf) * min(1.0, tick / ekf_tau)
+        cur = map_pose(n, ekf)
         dd = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
         da = abs(math.atan2(math.sin(cur[2] - prev[2]), math.cos(cur[2] - prev[2])))
         if dd > worst_d:
@@ -181,7 +194,7 @@ def simulate(nt, seconds=40.0, target=TARGET):
         worst_a = max(worst_a, da)
         prev = cur
         k += 1
-    return n, worst_d, worst_a, worst_t, map_pose(n)
+    return n, worst_d, worst_a, worst_t, map_pose(n, ekf)
 
 
 def main():
@@ -246,22 +259,41 @@ def main():
     n.callback_map_coords(georef_msg())
     check('waits while map_odom_yaw is still turning (> 0.5 deg)',
           n.map_odom_yaw == MO0 and n._georef_last_t is None)
-    print('GPS back after an outage: tracker yaw, no accepted heading -> georef waits max 10 s')
+    print('normal slow hand-over (field 01:42: samples ~3 Hz, 15.7 deg in > 10 s, EKF lag 0.5 s)')
+    st = {}
+    n, wd, wa, wt, end = simulate(nt, seconds=60.0, hdg_period=0.33, ekf_tau=0.5, stats=st)
+    check('no map->base step > 1 deg per cycle', wa <= D(1.0), '(max %.2f deg)' % math.degrees(wa))
+    check('no position step > 5 cm', wd <= 0.05, '(max %.3f m)' % wd)
+    check('safety net did NOT fire (no levelling while |yaw| > 0.5 deg)', not st.get('level_big'))
+    check('hand-over finished (map_odom_yaw 0)', n.map_odom_yaw == 0.0)
+
+    print('stalled hand-over: GPS back, tracker yaw -15.7 deg, no accepted heading')
     nt.georef_map_odom_xy = lambda *a, **k: (P0[0] + 0.3 - OB[0], P0[1] - OB[1])
-    n = make_node(nt)                       # map_odom_yaw -15.7 deg (tracker), no heading samples
+    n = make_node(nt)
     CLOCK[0] = 1000.0
     before = map_pose(n)
-    for i in range(10):                     # 1 Hz georef for 9 s: waits
-        n.callback_map_coords(georef_msg())
-        CLOCK[0] += 1.0
-    check('waits < 10 s (map_odom_yaw unchanged)', n.map_odom_yaw == MO0 and n._georef_target is None)
-    n.callback_map_coords(georef_msg())     # t = 10 s
-    after = map_pose(n)
-    check('after 10 s: map_odom_yaw levelled to 0', n.map_odom_yaw == 0.0)
-    check('... position kept while levelling', math.hypot(after[0] - before[0], after[1] - before[1]) < 1e-9)
-    check('... georef released (slew target set)', n._georef_target is not None
-          and abs(n._georef_target[0] - (P0[0] + 0.3 - OB[0])) < 1e-9)
-    check('... wait clock reset', n._georef_wait_since is None)
+    prev = before
+    worst_a = worst_d = 0.0
+    level_at = None
+    for k in range(30 * 30):                # 30 s at 30 Hz, georef 1 Hz
+        CLOCK[0] = 1000.0 + k / 30.0
+        if k % 30 == 0:
+            n.callback_map_coords(georef_msg())
+        n.slew_georef()
+        n.slew_yaw_level()
+        if level_at is None and n._yaw_level:
+            level_at = k / 30.0
+        cur = map_pose(n)
+        worst_a = max(worst_a, abs(math.atan2(math.sin(cur[2] - prev[2]), math.cos(cur[2] - prev[2]))))
+        if n._georef_target is None and n._georef_last_t is None:
+            worst_d = max(worst_d, math.hypot(cur[0] - prev[0], cur[1] - prev[1]))
+        prev = cur
+    check('waits ~10 s before levelling (stall)', level_at is not None and 9.9 <= level_at <= 10.1,
+          '(%s s)' % level_at)
+    check('levelling smooth: no step > 0.5 deg per cycle', worst_a <= D(0.5), '(max %.2f deg)' % math.degrees(worst_a))
+    check('position kept while levelling', worst_d < 1e-6, '(max %.2g m)' % worst_d)
+    check('map_odom_yaw 0 and georef released afterwards', n.map_odom_yaw == 0.0 and
+          (n._georef_target is not None or n._georef_last_t is not None))
     nt.georef_map_odom_xy = lambda *a, **k: (5.0, 5.0)
 
     n = make_node(nt)
@@ -298,8 +330,12 @@ def main():
     old = os.environ.get('T7D_OLD_NAVI_TF')
     if old is None:
         try:
-            src = subprocess.check_output(['git', '-C', os.path.join(HERE, '..'), 'show',
-                                           'HEAD:nodes/navi_transform'], stderr=subprocess.DEVNULL)
+            repo = os.path.join(HERE, '..')
+            c = subprocess.check_output(['git', '-C', repo, 'log', '-1', '--format=%H',
+                                         '--grep=(T7d)', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
+            ref = (c + '^') if c else 'HEAD'
+            src = subprocess.check_output(['git', '-C', repo, 'show', ref + ':nodes/navi_transform'],
+                                          stderr=subprocess.DEVNULL)
             fd, old = tempfile.mkstemp(suffix='_navi_transform_old')
             os.write(fd, src)
             os.close(fd)

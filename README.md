@@ -44,6 +44,91 @@ the `costmap_2d::` name is only the pluginlib registration). Install it with:
 sudo apt install ros-noetic-nonpersistent-voxel-layer
 ```
 
+## Magnetometer heading watchdog (`navi_transform`, off by default)
+
+An independent check of the navigation heading: `navi_transform` compares the
+map heading of the robot (yaw of map → base_link) with the magnetometer heading
+`/bno085/mag_heading` (`vitulus_imu`, same yaw convention as
+`/gnss_heading/navheading`, so `d = wrap(mag_yaw + 90° − nav_yaw)`). **It only
+reports**: four fields in `/nav_tf/loc_status` and one log line when a
+disagreement starts / ends. It never changes `diff_yaw`, map → odom, the EKF or
+anything a controller reads. Enable with `~mag_check_enable` (`true`) on the
+`navi_transform` node in `launch/navi_man.launch`; with it off nothing is
+subscribed and `loc_status` has no `mag_*` field (the payload is unchanged).
+
+| `loc_status` field | |
+|---|---|
+| `mag_state` | state of the magnetometer heading: `ok` / `disturbed` / `uncalibrated` / `stale` (also when its status topic is silent > 3 s) |
+| `mag_check` | `ok` = compared now; else why not: `dock` (dock status 0/1/2, dock hold, or dock status never received / older than `~dock_status_stale_s` — unknown is not compared), `unanchored` (heading has no absolute anchor yet, or indoor), `error` (a heading is not a finite number, or the check itself failed), `stale` (no heading message for 1 s, or the magnetometer status topic silent > 3 s), `not_ok` (magnetometer not `ok`), `settle` (less than `~mag_check_settle_s` after leaving the dock or after a heading step) |
+| `mag_diff_deg` | `d` in degrees (magnetometer − navigation, + = magnetometer more to the left); `null` when not compared |
+| `mag_disagree` | `true` when the comparisons of the last `~mag_disagree_window_s` show a lasting `|d|` > `~mag_disagree_deg`; how it starts and ends is below |
+
+Parameters (`~`): `mag_check_enable` (false), `mag_disagree_deg` (25),
+`mag_disagree_s` (5), `mag_disagree_window_s` (120), `mag_disagree_share` (0.8),
+`mag_check_settle_s` (8), `mag_disagree_hold_s` (60), `mag_clear_ratio` (0.6),
+`mag_clear_s` (3), `mag_step_deg` (8), `mag_step_window_s` (3),
+`mag_max_age_s` (1), `mag_status_max_age_s` (3), `mag_heading_topic`,
+`mag_status_topic`.
+
+**When it reports.** While driving the magnetometer is `ok` only in stretches
+(median ~1 s; 8–38 % of the time on the 2026-11-08 drives, 46 % while mowing on
+2026-11-14), so the decision is taken over a sliding window of the valid
+comparisons of the last 120 s. A comparison counts for the time since the
+previous one (the first of a stretch for 0.1 s, any for at most 1 s; a clock
+that goes backwards empties the window). `mag_disagree` rises on a comparison
+over the limit when, going back from it, there is a span holding at least 5 s
+of comparison time over the limit which is at least 80 % of all the comparison
+time of that span. So:
+
+- a lasting error is reported once 5 s of comparisons have been collected:
+  after ~5 s with the magnetometer `ok` all the time, ~25 s at 20 % `ok`,
+  ~50 s at 10 %, ~100 s at 5 %; agreement before the error began does not
+  delay it;
+- **not reported:** an error while the magnetometer gives less than 5 s of `ok`
+  per 120 s (under ~4 %), or is not `ok` at all (near the dock, strong
+  disturbance); an error under the limit (25°); anything in the dock, during
+  `settle`, or with an unknown dock state;
+- short excursions between agreeing comparisons are not reported (e.g. 1 s
+  over the limit in every 10 s, or 4.5 s over between 3 s of agreement);
+  excursions that make up ≥ 80 % of everything compared are — also when
+  nothing but they was compared for 2 min.
+
+**How a report ends.** The same rule mirrored: 3 s (`mag_clear_s`) of
+comparisons with `|d|` < 0.6 × the limit (15°) making up ≥ 80 % of the span —
+3 s after agreement returns, ~30 s at 10 % `ok`. Also at once on a new heading
+era (`dock` / `unanchored` / `settle`), and 60 s after the last valid
+comparison when comparisons stop altogether. A heading that stays 15–25° off
+after a report keeps it raised on purpose: the two headings still do not
+agree, and `mag_diff_deg` shows by how much.
+
+**Heading step** (starts `settle`): the watchdog sees it itself, no hook in the
+heading code — `diff_yaw + map_odom_yaw` moved ≥ 8° net within 3 s
+(`set_heading`, GNSS hand-over slew at 5°/s, map-pose yaw correction), or the
+heading got its first anchor. The running RTK re-anchors do not count (on the
+drives `diff_yaw` moved up to 2° per sample and 5° net within 1–2 s); a slew
+slower than ~2.7°/s is not seen. An offset that keeps turning faster than that
+(it should not exist) would hold the watchdog in `settle` for as long as it
+lasts.
+
+**On recorded drives** (everything through the node's watchdog path):
+
+| | 2026-11-08 22:00 | 2026-11-08 23:58 | 2026-11-14 mowing |
+|---|---|---|---|
+| navigation heading | node heading code replayed over the bag | same | real (`/odometry/ekf_wheel_nav_odom`, `/tf`, dock status) |
+| magnetometer heading | today's `vitulus_imu` code over the bag | same, and the topic in the bag | the topic in the bag |
+| `mag_check` `ok` / `not_ok` / `settle` (anchored, out of the dock) | 35–38 % / 59–61 % / ≤ 1 % | 8–17 % / 82–92 % / ≤ 1 % | 59 % / 40 % / 1 % (mowing: 46 % / 53 % / 1 %) |
+| reports at 25° | 0 | 0 | 0 (also 0 at 20° and 15°) |
+| largest `|d|` while compared | 8.9° | 22.3° (see below) | 15.8° while mowing, 10.2° otherwise (p99 11.2° / 6.8°) |
+| 30° error put into the navigation heading: time to the report | median 5.1 s, max 8.7 s | median 10–53 s, max 135 s | median 8.5 s, p90 19 s, max 35 s (mowing: 11.3 / 20.4 / 35.2 s) |
+
+On the 23:58 drive the replayed node heading was 18.5° off the RTK heading for
+~30 s after its first anchor (the heading gates on `/gnss*/fix` are not in the
+bag, so the live node may have refused that sample); the watchdog showed up to
+22.3° there — no report at 25°, a report with a 20° or 15° limit, and nothing
+else in the stack would have noticed. The same 30° error entering through
+`diff_yaw` is a heading step, so it is reported 8 s later. Test:
+`tools/test_t35_mag_check.py`.
+
 ## Traversability layer (local costmap, off by default)
 
 The local traversability map of `vitulus_traversability` (`/traversability/local_costmap`, 6 × 6 m in `odom`,

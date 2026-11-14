@@ -303,6 +303,193 @@ def georef_status(datum, georef, fix, ant_xy, loc, now_s, fix_max_age_s=3.0):
     return out
 
 
+# ---- T35 magnetometer heading watchdog (pure; tools/test_t35_mag_check.py) --
+# REPORT ONLY: compares the navigation heading with the independent
+# magnetometer heading (/bno085/mag_heading) and flags a gross disagreement in
+# /nav_tf/loc_status. Nothing here feeds diff_yaw, map->odom, the EKF or any
+# controller.
+
+MAG_CHECK_DEFAULTS = {
+    'disagree_deg': 25.0,   # |d| above this ...
+    'disagree_s': 5.0,      # ... for this much comparison time ...
+    'window_s': 120.0,      # ... within the last window_s (sliding) ...
+    'share': 0.8,           # ... and for at least this share of all the
+                            # comparison time since then -> disagree
+    'settle_s': 8.0,        # no comparison this long after an undock / heading step
+    'max_age_s': 1.0,       # mag heading message older than this -> stale
+    'clear_ratio': 0.6,     # disagree clears the same way with clear_s of
+    'clear_s': 3.0,         # comparison time below ratio * disagree_deg
+    'hold_s': 60.0,         # ... or this long after the last valid comparison
+    'max_dt_s': 1.0,        # one comparison counts for at most this long
+    'sample_dt_s': 0.1,     # the first comparison of a stretch counts for this
+                            # (magnetometer heading period)
+}
+
+
+def mag_check_new_state():
+    return {'disagree': False,
+            'win': (),              # valid comparisons: (t, counted time, class)
+            'last_valid': None,     # time of the last valid comparison
+            'run': False}           # the previous step was a valid comparison
+
+
+def mag_heading_diff(nav_yaw, mag_yaw):
+    """d = wrap(mag_yaw + 90 deg - nav_yaw) [rad]. mag_yaw is in the
+    /gnss_heading/navheading convention, so it enters the map frame the same
+    way the RTK heading does in offset_navheading_imu (+90 deg); nav_yaw is the
+    map->base_link yaw."""
+    d = mag_yaw + math.pi / 2.0 - nav_yaw
+    return math.atan2(math.sin(d), math.cos(d))
+
+
+def _mag_window_add(st, now, cls, c):
+    """Put one valid comparison (cls: 1 over the limit, -1 under the clear
+    limit, 0 between) into the sliding window. A comparison counts for the
+    time since the previous one when that was the previous step (at most
+    max_dt_s), else for sample_dt_s. A clock that went backwards empties the
+    window."""
+    win, last = st['win'], st['last_valid']
+    if last is not None and now < last:
+        win, last = (), None
+    if st['run'] and last is not None:
+        dt = min(now - last, c['max_dt_s'])
+    else:
+        dt = min(c['sample_dt_s'], c['max_dt_s'])
+    t_min = now - c['window_s']
+    st['win'] = tuple(w for w in win if w[0] >= t_min) + ((now, dt, cls),)
+    st['last_valid'], st['run'] = now, True
+
+
+def _mag_window_holds(win, cls, need_s, share):
+    """True when, counted back from the newest comparison to some comparison
+    of class cls, that class has at least need_s of comparison time and at
+    least `share` of all the comparison time over that span."""
+    acc = total = 0.0
+    for _, dt, k in reversed(win):
+        total += dt
+        if k == cls:
+            acc += dt
+            if acc >= need_s and acc >= share * total:
+                return True
+    return False
+
+
+def mag_check_step(st, now, nav_yaw, mag_yaw, mag_state, mag_age_s, in_dock,
+                   anchored, since_event_s, cfg=None):
+    """One step of the magnetometer heading watchdog.
+
+    st             state from mag_check_new_state() (not modified)
+    now            time [s]
+    nav_yaw        map->base_link yaw [rad]
+    mag_yaw        magnetometer yaw [rad], or None when never received
+    mag_state      'ok' / 'disturbed' / 'uncalibrated' / 'stale' / None
+    mag_age_s      age of the magnetometer heading message [s], or None
+    in_dock        docked / dock manoeuvre / dock hold / dock state unknown
+    anchored       the navigation heading has an absolute anchor (not init)
+    since_event_s  time since the last undock / heading step [s], or None
+
+    Returns (new_state, out); out = {'check', 'diff_deg', 'disagree', 'edge'}:
+    check  'ok' (compared) or why not: 'dock' / 'unanchored' / 'error' (a
+           heading is not a finite number) / 'stale' / 'not_ok' / 'settle'
+    diff_deg  d in degrees, None when not compared
+    edge   'raised' / 'cleared' on a change of disagree, else None
+
+    The comparison is valid only with check == 'ok'; the magnetometer is `ok`
+    in short stretches only, so the decision is taken over the valid
+    comparisons of the last window_s (sliding window, see _mag_window_holds):
+      raise  on a comparison over the limit, when going back from it there is
+             a span with at least disagree_s of comparison time with
+             |d| > disagree_deg, which is at least `share` of all the
+             comparison time of that span (a lasting error is found however
+             sparse the stretches; short excursions between agreeing
+             stretches are not; agreement BEFORE the error began does not
+             delay the report);
+      clear  the same with clear_s of |d| < clear_ratio * disagree_deg.
+    Steps without a valid comparison add nothing. A new heading era (dock /
+    unanchored / settle) empties the window and drops a standing disagree at
+    once; it is also dropped hold_s after the last valid comparison."""
+    c = dict(MAG_CHECK_DEFAULTS)
+    if cfg:
+        c.update(cfg)
+    st = dict(st)
+    was = st['disagree']
+    if in_dock:
+        check = 'dock'
+    elif not anchored:
+        check = 'unanchored'
+    elif not _mag_finite(nav_yaw) or (mag_yaw is not None and not _mag_finite(mag_yaw)):
+        check = 'error'
+    elif mag_yaw is None or mag_age_s is None or not (0.0 <= mag_age_s <= c['max_age_s']) \
+            or mag_state == 'stale':
+        check = 'stale'
+    elif mag_state != 'ok':
+        check = 'not_ok'
+    elif since_event_s is not None and since_event_s < c['settle_s']:
+        check = 'settle'
+    else:
+        check = 'ok'
+    diff_deg = None
+    if check == 'ok':
+        diff_deg = math.degrees(mag_heading_diff(nav_yaw, mag_yaw))
+        a = abs(diff_deg)
+        cls = 1 if a > c['disagree_deg'] else \
+            (-1 if a < c['clear_ratio'] * c['disagree_deg'] else 0)
+        _mag_window_add(st, now, cls, c)
+        if not st['disagree']:
+            if cls > 0 and _mag_window_holds(st['win'], 1, c['disagree_s'], c['share']):
+                st['disagree'] = True
+        elif cls < 0 and _mag_window_holds(st['win'], -1, c['clear_s'], c['share']):
+            st['disagree'] = False
+    elif check in ('dock', 'unanchored', 'settle'):
+        st['win'], st['last_valid'], st['run'] = (), None, False
+        st['disagree'] = False
+    else:
+        st['run'] = False
+        last = st['last_valid']
+        if last is not None and now < last:         # clock went backwards
+            st['last_valid'] = last = now
+        if st['disagree'] and (last is None or now - last >= c['hold_s']):
+            st['disagree'] = False
+    edge = None
+    if st['disagree'] != was:
+        edge = 'raised' if st['disagree'] else 'cleared'
+    return st, {'check': check, 'diff_deg': diff_deg,
+                'disagree': st['disagree'], 'edge': edge}
+
+
+def _mag_finite(v):
+    return isinstance(v, (int, float)) and math.isfinite(v)
+
+
+def mag_heading_step_event(hist, now, h, window_s=3.0, step_rad=math.radians(8.0)):
+    """True when the heading offset h (diff_yaw + map_odom_yaw: everything in
+    the map heading that is NOT the gyro) has moved by >= step_rad NET over
+    window_s: against the oldest sample inside the window, or against the
+    previous sample when that is older still. That is a set_heading, a GNSS
+    hand-over slew, a map-pose yaw correction. The running RTK re-anchors do
+    not count: on the 2026-11-08 drives diff_yaw moved by up to 2 deg per
+    sample and up to 5 deg net within 1-2 s. hist is a list of (t, h) kept by
+    the caller and updated in place; a non-finite h or a clock that went
+    backwards restarts it (no event)."""
+    if not _mag_finite(h) or (hist and now < hist[-1][0]):
+        del hist[:]
+        if _mag_finite(h):
+            hist.append((now, h))
+        return False
+    while len(hist) > 1 and (now - hist[1][0]) > window_s:
+        hist.pop(0)                 # keep one sample at / beyond the window edge
+    event = False
+    if hist:
+        ref = hist[0][1]
+        if len(hist) > 1 and (now - hist[0][0]) > window_s:
+            ref = hist[1][1]        # oldest inside the window
+        event = abs(math.atan2(math.sin(h - ref), math.cos(h - ref))) >= step_rad
+    if event:
+        del hist[:]
+    hist.append((now, h))
+    return event
+
+
 class NavTfNode:
 
     def __init__(self):
@@ -920,6 +1107,11 @@ class NavTfNode:
         # owner-change edge publish_loc_status is called immediately so an
         # ownership transition is not smeared into the next 1 Hz tick.
         self._last_published_owner = None
+        # T35: magnetometer heading watchdog. REPORT ONLY (mag_* fields of
+        # loc_status + one log line per edge); it never writes diff_yaw,
+        # map->odom, the EKF or anything a controller reads. Off by default:
+        # then nothing is subscribed and loc_status carries no mag_* field.
+        self._mag_check_setup()
         # Runtime on/off for live bridging (Phase 1 go-live). Publish std_msgs/Bool
         # to /nav_tf/bridge_live_enable to toggle without a restart.
         self.bridge_live_enable_sub = rospy.Subscriber("/nav_tf/bridge_live_enable", Bool, self.callback_bridge_live_enable, queue_size=1)
@@ -2143,10 +2335,166 @@ class NavTfNode:
                 'budget_used_m': round(self._budget_used_m, 3),
                 'budget_used_deg': round(self._budget_used_deg, 2),
             }
+            if getattr(self, '_mag_check_enable', False):
+                status.update(self._mag_check_fields())   # T35, report only
             self._last_published_owner = owner    # FIX4: keep edge detector in sync
             self.loc_status_pub.publish(String(data=json.dumps(status)))
         except Exception as e:
             rospy.logwarn_throttle(10.0, "[loc_status] %s" % e)
+
+    # ---- T35: magnetometer heading watchdog (report only) -------------------
+
+    def _mag_check_setup(self):
+        """The one switch: without ~mag_check_enable nothing else of the
+        watchdog runs (no subscriber, no state, no loc_status field)."""
+        self._mag_check_enable = bool(rospy.get_param('~mag_check_enable', False))
+        if self._mag_check_enable:
+            self._mag_check_init()
+
+    def _mag_check_init(self):
+        """Parameters, state and the two subscribers. Called only with
+        ~mag_check_enable; a disabled watchdog leaves no trace in the node."""
+        self._mag_cfg = {
+            'disagree_deg': float(rospy.get_param('~mag_disagree_deg', 25.0)),
+            'disagree_s': float(rospy.get_param('~mag_disagree_s', 5.0)),
+            'settle_s': float(rospy.get_param('~mag_check_settle_s', 8.0)),
+            'max_age_s': float(rospy.get_param('~mag_max_age_s', 1.0)),
+            'clear_ratio': float(rospy.get_param('~mag_clear_ratio', 0.6)),
+            'clear_s': float(rospy.get_param('~mag_clear_s', 3.0)),
+            'window_s': float(rospy.get_param('~mag_disagree_window_s', 120.0)),
+            'share': float(rospy.get_param('~mag_disagree_share', 0.8)),
+            'hold_s': float(rospy.get_param('~mag_disagree_hold_s', 60.0)),
+        }
+        self._mag_status_max_age_s = float(rospy.get_param('~mag_status_max_age_s', 3.0))
+        # heading step = net move of diff_yaw + map_odom_yaw (see mag_heading_step_event)
+        self._mag_step_rad = math.radians(float(rospy.get_param('~mag_step_deg', 8.0)))
+        self._mag_step_window_s = float(rospy.get_param('~mag_step_window_s', 3.0))
+        self._mag_lock = threading.Lock()
+        self._mag_st = mag_check_new_state()
+        self._mag_yaw = None
+        self._mag_cov_yaw = None
+        self._mag_rx_t = None
+        self._mag_state = None
+        self._mag_state_rx_t = None
+        self._mag_h_hist = []
+        self._mag_evt_t = None
+        self._mag_was_anchored = False
+        heading_topic = rospy.get_param('~mag_heading_topic', '/bno085/mag_heading')
+        status_topic = rospy.get_param('~mag_status_topic', '/bno085/mag_heading/status')
+        self.mag_heading_sub = rospy.Subscriber(
+            heading_topic, Imu, self.callback_mag_heading, queue_size=5)
+        self.mag_status_sub = rospy.Subscriber(
+            status_topic, String, self.callback_mag_status, queue_size=2)
+        rospy.loginfo(
+            '[mag_check] magnetometer heading watchdog ENABLED (report only): '
+            '%s, disagree > %.0f deg for %.1fs of comparisons within %.0fs, '
+            'settle %.1fs', heading_topic, self._mag_cfg['disagree_deg'],
+            self._mag_cfg['disagree_s'], self._mag_cfg['window_s'],
+            self._mag_cfg['settle_s'])
+
+    def callback_mag_status(self, msg):
+        try:
+            state = json.loads(msg.data).get('state')
+        except (ValueError, AttributeError):
+            return
+        self._mag_state = state if isinstance(state, str) else None
+        self._mag_state_rx_t = rospy.get_time()
+
+    def callback_mag_heading(self, msg):
+        q = msg.orientation
+        if not all(math.isfinite(v) for v in (q.x, q.y, q.z, q.w)) \
+                or (q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) < 0.5:
+            return
+        self._mag_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        self._mag_cov_yaw = msg.orientation_covariance[8]
+        self._mag_rx_t = rospy.get_time()
+        try:
+            self._mag_check_tick()
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[mag_check] %s" % e)
+
+    def _mag_state_now(self, now):
+        """State of the magnetometer heading for the watchdog: the status
+        topic's `state` ('stale' when the status itself is missing or old); a
+        message that does not carry the small `ok` covariance is not `ok`
+        whatever the 1 Hz status still says."""
+        if self._mag_state is None or self._mag_state_rx_t is None \
+                or (now - self._mag_state_rx_t) > self._mag_status_max_age_s:
+            return 'stale'
+        if self._mag_state == 'ok' and (self._mag_cov_yaw is None
+                                        or not self._mag_cov_yaw < 100.0):
+            return 'disturbed'
+        return self._mag_state
+
+    def _mag_check_tick(self):
+        """Collect the inputs (read only) and run one mag_check_step. Called on
+        every magnetometer heading message (~10 Hz) and from loc_status (1 Hz,
+        so a silent magnetometer turns `stale`)."""
+        with self._mag_lock:
+            now = rospy.get_time()
+            q = self.ekf_wheel_nav_odom_msg.pose.pose.orientation
+            if all(math.isfinite(v) for v in (q.x, q.y, q.z, q.w)) \
+                    and (q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) > 0.5:
+                odom_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+            else:
+                odom_yaw = float('nan')     # -> mag_check 'error', not compared
+            map_odom_yaw = self.map_odom_yaw
+            nav_yaw = odom_yaw + map_odom_yaw
+            # indoors map->odom is not this node's -> no map heading to check
+            anchored = (not self.init) and (not self.is_indoor)
+            # dock state unknown (feed never seen / stale) = do not compare,
+            # the same fail-closed reading as _tracker_pose_suppressed
+            dock_unknown = self._dock_status_val is None \
+                or not self._dock_status_rx_t \
+                or (now - self._dock_status_rx_t) > self._dock_status_stale_s
+            in_dock = dock_unknown or self._dock_status_val in (0, 1, 2) \
+                or self._dock_hold_active
+            # heading steps: first anchor, set_heading, hand-over slew, map-pose yaw
+            stepped = mag_heading_step_event(
+                self._mag_h_hist, now, self.diff_yaw + map_odom_yaw,
+                self._mag_step_window_s, self._mag_step_rad)
+            if stepped or (anchored and not self._mag_was_anchored):
+                self._mag_evt_t = now
+            self._mag_was_anchored = anchored
+            evt = max(self._mag_evt_t or 0.0, self._dock_free_since or 0.0)
+            since_event = (now - evt) if evt else None
+            mag_age = (now - self._mag_rx_t) if self._mag_rx_t is not None else None
+            mag_state = self._mag_state_now(now)
+            self._mag_st, out = mag_check_step(
+                self._mag_st, now, nav_yaw, self._mag_yaw, mag_state, mag_age,
+                in_dock, anchored, since_event, self._mag_cfg)
+            out['mag_state'] = mag_state
+        if out['edge'] == 'raised':
+            rospy.logwarn(
+                '[mag_check] heading DISAGREES with the magnetometer: mag - nav = '
+                '%+.1f deg (> %.0f deg for %.1fs of comparisons); nav yaw %.1f deg, mag yaw(map) '
+                '%.1f deg, diff_yaw %.3f, map_odom_yaw %.3f — report only',
+                out['diff_deg'], self._mag_cfg['disagree_deg'],
+                self._mag_cfg['disagree_s'], math.degrees(nav_yaw),
+                math.degrees(nav_yaw) + out['diff_deg'], self.diff_yaw, map_odom_yaw)
+        elif out['edge'] == 'cleared':
+            rospy.loginfo(
+                '[mag_check] heading disagreement CLEARED (check=%s, mag - nav = %s deg)',
+                out['check'],
+                '%+.1f' % out['diff_deg'] if out['diff_deg'] is not None else 'n/a')
+        return out
+
+    def _mag_check_fields(self):
+        """mag_* fields of /nav_tf/loc_status (only with the watchdog enabled)."""
+        try:
+            out = self._mag_check_tick()
+            d = out.get('diff_deg')
+            return {
+                'mag_state': str(out.get('mag_state', 'stale')),
+                'mag_diff_deg': round(d, 1) if _mag_finite(d) else None,
+                'mag_disagree': bool(out.get('disagree')),
+                'mag_check': str(out.get('check')),
+            }
+        except Exception as e:
+            # never a stale result, never a broken loc_status
+            rospy.logwarn_throttle(10.0, "[mag_check] %s" % e)
+            return {'mag_state': 'stale', 'mag_diff_deg': None,
+                    'mag_disagree': False, 'mag_check': 'error'}
 
     def publish_georef_status(self):
         """/nav_tf/georef_status (vitulus-field#32): which UTM frame the map

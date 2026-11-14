@@ -258,7 +258,7 @@ def test_bundle():
     chk = mcv.check([geo['farthest']], collected=col, start='dock')
     row = (chk.get('points') or [{}])[0]
     ok('bundle: ten bod je volný, v ZoneB a dosažitelný od doku',
-       row.get('free') and row.get('in_zones') == ['ZoneB']
+       row.get('free') and 'ZoneB' in (row.get('in_zones') or [])   # the owner's live site may add zones over it
        and (row.get('reach') or {}).get('reachable'))
     ok('celý render šel bez ROSu (rospy se nenačetl)', 'rospy' not in sys.modules)
     print('  ukázková PNG: %s' % SAMPLES)

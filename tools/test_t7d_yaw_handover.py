@@ -75,6 +75,7 @@ DIFF0 = D(40.0)                   # diff_yaw before (arbitrary; imu = odom_yaw -
 IMU = ODOM_YAW0 - DIFF0
 TARGET = DIFF0 + MO0 + D(0.3)     # GNSS: consistent heading, 0.3 deg real error
 GEOREF_OFF = (0.16, 0.0)          # real position difference GPS vs dock
+PRE_T7D = '8b4d293c91016e3ded5ff0d91792274f25444f79'   # main right before T7d (3246ba6^)
 
 
 def load(name, path):
@@ -331,10 +332,9 @@ def main():
     if old is None:
         try:
             repo = os.path.join(HERE, '..')
-            c = subprocess.check_output(['git', '-C', repo, 'log', '-1', '--format=%H',
-                                         '--grep=(T7d)', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
-            ref = (c + '^') if c else 'HEAD'
-            src = subprocess.check_output(['git', '-C', repo, 'show', ref + ':nodes/navi_transform'],
+            # the last commit BEFORE T7d, by hash: "the parent of the newest
+            # (T7d) commit" became the first T7d fix once a second one landed
+            src = subprocess.check_output(['git', '-C', repo, 'show', PRE_T7D + ':nodes/navi_transform'],
                                           stderr=subprocess.DEVNULL)
             fd, old = tempfile.mkstemp(suffix='_navi_transform_old')
             os.write(fd, src)

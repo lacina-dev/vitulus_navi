@@ -18,6 +18,8 @@ Zdroje čísel: **[B]** = `~/bags/nav_test/nav_baseline_2026-11-15_a.bag` (2× d
 | D2 kurz mezi vzorky RTK z IMU | `heading_imu_interp` | **zapnuto** | 3 jízdy proti 3 výchozím: skoky kurzu mapy nad 0,3° 31–40 → 4–24, zamrznutí kotvy kurzu 5–7 → 2, zastaralé TF 3–10 % → 0,7–2,8 % | `git revert 91a24d7` |
 | D3 dotáčení při předání podle EKF | `handover_follow_ekf` | vypnuto | 1 jízda, nerozlišitelné od rozptylu | – |
 | D4 plynulý první zápis dokové pózy | `dock_engage_slew_mps` | vypnuto (0) | neměřeno | – |
+| E5 navsat ve vlastním vlákně | `navsat_async` | vypnuto | jen zkouška mimo robota: mezera smyčky 0,8 s → 0,04 s | `git revert 1f14df6` |
+| E6 vyhlazení cíle kurzu | `heading_target_smooth` | vypnuto | jen přehrání jízd: skoky kurzu 147–515 → 22–79 | `git revert bc5652f` |
 | Hlídač kurzu magnetometrem (T35) | `mag_check_enable`, `mag_disagree_deg` 15 | **zapnuto**, jen hlásí | zpětný přepočet jízd: 0 planých poplachů i při 10° | `git revert d1f73c9` |
 
 Past měření (15. 11.): běh `nav_s3_d3_1` jel ve skutečnosti s D2, měřicí skript restartoval cizí proces (hledání PID bez ukotvení). Skóre toho běhu se počítá k D2.
@@ -414,8 +416,8 @@ Seřazeno podle přínosu a rizika. „Vratná" = jde udělat jako jeden commit 
 | 2 | **D3** při předání dotáčet `map→odom` podle skutečného natočení EKF | nadbytečné otáčení 40–47° → < 5° | střední (zásah do vysílaného TF) | NT:3479-3506, 3234 | ano (`handover_follow_ekf`) | ve větvi `t36-d`, vypnuto |
 | 3 | **D4** první zápis držení doku rozložit plynule | skok 17–24 cm za tik → < 1 cm za tik | nízké | NT:1428-1440 | ano (`dock_engage_slew_mps`) | ve větvi `t36-d`, vypnuto |
 | 4 | **D1** rychlosti v `/odometry/odom` brát z kol | propad rychlosti 2–5 % → 0 % | nízké až střední (TEB čte rychlost odtud) | NT:3093-3095 | ano (`odom_twist_from_wheels`) | ve větvi `t36-d`, vypnuto |
-| 5 | Spouštět navsat mimo smyčku TF (vlákno, nebo hned při startu s čekáním na datum) | mezera `/tf` 1,1–1,4 s → < 0,1 s | nízké | NT:1142-1157, 3971 | ano | nové |
-| 6 | Vyhladit cíl kurzu (průměr ověřeného okna místo jednoho vzorku; malé chyby neaplikovat naráz) | rozkmit ve stoje 2,8° → < 1°; kroků kurzu > 0,3°: 476–542 → < 50 | střední (zpoždění kurzu v zatáčkách) | NT:3526, 3556-3571 | ano | nové |
+| 5 | Spouštět navsat mimo smyčku TF (vlákno, nebo hned při startu s čekáním na datum) | mezera `/tf` 1,1–1,4 s → < 0,1 s | nízké | NT:1142-1157, 3971 | ano | v `main` (1f14df6), vypnuto, `navsat_async`; roslaunch na odděleném masteru: mezera smyčky 0,80–0,86 s → 0,04 s; jízdou neměřeno. Před trvalým zapnutím: navsat zastavený během startu může zůstat běžet bez vlastníka (díra je i ve starém kódu), opakování po chybě nemá strop |
+| 6 | Vyhladit cíl kurzu (průměr ověřeného okna místo jednoho vzorku; malé chyby neaplikovat naráz) | rozkmit ve stoje 2,8° → < 1°; kroků kurzu > 0,3°: 476–542 → < 50 | střední (zpoždění kurzu v zatáčkách) | NT:3526, 3556-3571 | ano | v `main` (bc5652f), vypnuto, `heading_target_smooth`; přehrání 3 jízd: kroků > 0,3° 147–515 → 22–79, rozkmit ve stoje 1,8–2,7° → 0,75–1,7°; jízdou neměřeno. Sledovat: změna odchylky pod 1° se dorovnává ~12 s místo 2,5 s (při rychlém driftu gyra pila do 1°), podíl „smoothed / old way“ v logu |
 | 7 | Kotvu polohy zapisovat bez kroků (malý podíl každý tik, nebo opravu nést v `map→odom` a EKF nechat spojitý) | kroky EKF > 1 cm: 83–93/min na GPS → < 5/min | vysoké (jádro lokalizace; druhá varianta mění, co je `odom`) | NT:2832-2856, 3337-3383 | ano, za vypínačem | nové, nejdřív návrh |
 | 8 | TF `odom→base_link` vysílat s razítkem zprávy EKF (z callbacku EKF) | opakovaná póza 10,5 % → 0 % | střední (TEB `transform_tolerance` 0,05 s, časování konzumentů) | NT:3064-3097, 3932-3968 | ano | nové |
 | 9 | Zkrátit fix → `owner=gps` po výjezdu (zkoušku jízdou započítat už z výjezdu, hystereze od fixu) | 8–14 s → < 5 s | střední (past odrazů u doku, incident 2,4 m 2026-07-05) | NT:1255-1262, 2945-3029 | ano | nové |

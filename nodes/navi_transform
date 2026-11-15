@@ -609,6 +609,26 @@ class NavTfNode:
         self._georef_stall_ref = None      # (|map_odom_yaw|, t) of the last progress
         self._yaw_level = False            # slew_yaw_level active
         self._yaw_level_last_t = None
+        # T36 D3 (off by default = broadcast as before): during the GNSS heading
+        # hand-over every sample moves diff_yaw by a step and map_odom_yaw by the
+        # opposite step at once, but the nav EKF (odom->base) follows the new
+        # fused heading only 70-700 ms later -> the heading of map->base
+        # sawtooths by the step (0.5 deg) for the whole hand-over. On: the
+        # BROADCAST map->odom is turned about the robot by the part of diff_yaw
+        # the EKF has not taken yet (measured: fused heading - EKF yaw), so the
+        # heading of map->base stays smooth; it fades out when the hand-over
+        # ends. diff_yaw, map_odom_yaw and map_odom_transform - everything the
+        # node decides on - are exactly as with the parameter off, and the
+        # robot's map position is not moved. See handover_follow.
+        self._hf_enable = bool(rospy.get_param('~handover_follow_ekf', False))
+        self._hf_max = math.radians(float(rospy.get_param('~handover_follow_max_deg', 5.0)))
+        self._hf_t_sample = None           # time of the last hand-over heading sample
+        self._hf_s = None                  # smoothed heading sum the broadcast follows
+        self._hf_c = 0.0                   # rotation added to the broadcast map->odom now
+        self._hf_bound = None              # fade-out envelope of _hf_c
+        self._hf_meas = None               # last (EKF yaw - IMU yaw)
+        self._hf_last_t = None
+        self._hf_prev_b = None             # map->odom yaw broadcast last tick
         # GPS-acquisition hysteresis: GPS corrections (map_coords georef AND the
         # loop3sec RTK set_pose) may act only after the position fix has been
         # continuously usable this long. At acquisition the fused heading (and
@@ -3209,6 +3229,121 @@ class NavTfNode:
             if new == 0.0:
                 self._yaw_level = False
 
+    # ---- T36 D3: smooth map->base heading during the GNSS heading hand-over ----
+
+    def _hf_ekf_minus_imu(self, odom_base_tf):
+        """EKF yaw of the odom->base sent this tick minus the IMU yaw at the
+        stamp of that EKF message (latest IMU message moved there by its gyro
+        rate). None when the two cannot be paired within 0.1 s."""
+        if odom_base_tf is None:
+            return None
+        q = odom_base_tf.transform.rotation
+        ekf_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        t_e = None
+        for i in (-1, -2, -3):          # the EKF message this tick's TF was built from
+            try:
+                ts, yaw = self._nav_yaw_hist[i]
+            except IndexError:
+                break
+            if abs(yaw - ekf_yaw) < 1e-9:
+                t_e = ts
+                break
+        imu = self.imu_msg
+        t_i = imu.header.stamp.to_sec()
+        if t_e is None or t_i <= 0.0 or abs(t_e - t_i) > 0.1:
+            return None
+        o = imu.orientation
+        imu_yaw = euler_from_quaternion([o.x, o.y, o.z, o.w])[2] \
+            + imu.angular_velocity.z * (t_e - t_i)
+        return math.atan2(math.sin(ekf_yaw - imu_yaw), math.cos(ekf_yaw - imu_yaw))
+
+    def _hf_reset(self):
+        self._hf_s = None
+        self._hf_c = 0.0
+        self._hf_bound = None
+
+    def handover_follow(self, map_odom_tf, odom_base_tf):
+        """T36 D3 (30 Hz, only with ~handover_follow_ekf): turn the map->odom
+        about to be BROADCAST about the robot by c so that the heading of
+        map->base is  s + imu_yaw  instead of  map_odom_yaw + ekf_yaw:
+          s  the heading sum map_odom_yaw + diff_yaw the hand-over commands,
+             low-passed and limited to 0.1 deg per tick,
+          c = s - (ekf_yaw - imu_yaw) - map_odom_yaw, i.e. the part of diff_yaw
+             the EKF has not taken yet (+ the smoothing of s).
+        Active while hand-over samples arrive (_reanchor_map_yaw, within 1 s),
+        map_odom_yaw != 0 and the dock does not hold the pose. After that c
+        fades out under an envelope shrinking 0.03 deg per tick (still taking
+        the EKF's late steps), then the broadcast is the node's own map->odom
+        again. |c| is limited to ~handover_follow_max_deg (an EKF that far
+        behind the fused heading is not smoothed any further). Node state is
+        never written here; the robot's map position stays (rotation about
+        odom->base of this tick)."""
+        now = rospy.get_time()
+        last, self._hf_last_t = self._hf_last_t, now
+        k = 1.0 if last is None else min(max((now - last) * 30.0, 0.5), 3.0)   # ticks
+        q = map_odom_tf.transform.rotation
+        mo = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        meas = self._hf_ekf_minus_imu(odom_base_tf)
+        prev_meas, self._hf_meas = self._hf_meas, meas
+        prev_b, self._hf_prev_b = self._hf_prev_b, mo
+        t_s = self._hf_t_sample
+        following = meas is not None and q.z != 0.0 and t_s is not None \
+            and 0.0 <= (now - t_s) <= 1.0 and not self._dock_hold_active
+        if following:
+            if self._hf_s is None:
+                # starts where the broadcast was (the sample that started the
+                # hand-over has already stepped map_odom_yaw)
+                self._hf_s = (mo if prev_b is None else prev_b) + meas
+            d = mo + self.diff_yaw - self._hf_s
+            d = math.atan2(math.sin(d), math.cos(d)) * min(1.0, 0.06 * k)   # ~0.5 s low-pass
+            lim = math.radians(0.1) * k
+            self._hf_s += max(-lim, min(lim, d))
+            c = self._hf_s - meas - mo
+            c = math.atan2(math.sin(c), math.cos(c))
+            self._hf_bound = None
+            if abs(c) > self._hf_max:
+                rospy.logwarn_throttle(
+                    10.0, '[handover_follow] EKF yaw is %.1f deg behind the fused heading '
+                    '- smoothing limited to %.1f deg', math.degrees(c),
+                    math.degrees(self._hf_max))
+                c = math.copysign(self._hf_max, c)
+        else:
+            self._hf_s = None
+            if self._hf_c == 0.0:
+                return
+            if self._dock_hold_active or odom_base_tf is None:
+                self._hf_reset()            # the dock pose goes out exactly
+                return
+            c, bound = self._hf_c, self._hf_bound
+            if bound is None:
+                # first tick after following: stay where the broadcast was (the
+                # last sample has just stepped map_odom_yaw to 0)
+                c = math.atan2(math.sin(prev_b - mo), math.cos(prev_b - mo))
+                c = max(-self._hf_max, min(self._hf_max, c))
+                bound = abs(c)
+            if meas is not None and prev_meas is not None:
+                c -= math.atan2(math.sin(meas - prev_meas), math.cos(meas - prev_meas))
+            bound -= math.radians(0.03) * k
+            if bound <= 0.0:
+                self._hf_reset()
+                return
+            c = max(-bound, min(bound, c))
+            self._hf_bound = bound
+        self._hf_c = c
+        if c == 0.0:
+            return
+        self._hf_prev_b = mo + c
+        ox = odom_base_tf.transform.translation.x
+        oy = odom_base_tf.transform.translation.y
+        t = map_odom_tf.transform.translation
+        c0, s0 = math.cos(mo), math.sin(mo)
+        px, py = c0 * ox - s0 * oy + t.x, s0 * ox + c0 * oy + t.y
+        c1, s1 = math.cos(mo + c), math.sin(mo + c)
+        t.x = px - (c1 * ox - s1 * oy)
+        t.y = py - (s1 * ox + c1 * oy)
+        qn = quaternion_from_euler(0.0, 0.0, mo + c)
+        q.x, q.y, q.z, q.w = qn[0], qn[1], qn[2], qn[3]
+
     def slew_georef(self):
         """T7d: walk map->odom's translation toward the last georef target at
         georef_slew_mps, integrated in the 30 Hz loop (~3 mm per tick at
@@ -3617,6 +3752,8 @@ class NavTfNode:
         with self._map_odom_lock:
             if self.map_odom_yaw == 0.0:
                 return
+            if getattr(self, '_hf_enable', False):     # T36 D3: a hand-over sample
+                self._hf_t_sample = rospy.get_time()
             h = diff_old + self.map_odom_yaw
             d = math.atan2(math.sin(target - h), math.cos(target - h))
             h_new = h + max(-max_step, min(max_step, d))
@@ -4085,6 +4222,11 @@ class NavTfNode:
             except Exception as e:
                 rospy.logwarn_throttle(10.0, "[dock_hold] %s" % e)
             map_odom_tf = self.transform_map_to_odom(stamp, odom_base_tf)
+            if map_odom_tf is not None and getattr(self, '_hf_enable', False):
+                try:
+                    self.handover_follow(map_odom_tf, odom_base_tf)   # T36 D3
+                except Exception as e:
+                    rospy.logwarn_throttle(10.0, "[handover_follow] %s" % e)
             if map_odom_tf is not None:
                 tf_out.append(map_odom_tf)
         finally:

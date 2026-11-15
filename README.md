@@ -229,3 +229,30 @@ carries the traversability cost (lethal 100 → 100, graded 50 → 49, unknown �
 parameter from before is gone; with the real `traversability_local` and no camera at all the local costmap is
 published (neutral grid); with no traversability publisher at all it is not published (move_base_flex waits) and
 comes up when a map arrives.
+
+## Smooth map heading during the GNSS heading hand-over (`navi_transform`, off by default)
+
+After the dock the absolute heading sits in the yaw of map → odom
+(`map_odom_yaw`); GNSS takes it over by moving it into `diff_yaw` in steps of
+0.5° per heading sample. `map_odom_yaw` steps at once, the nav EKF (odom →
+base_link) takes the new fused heading 70–700 ms later, so the heading of the
+robot in the map twitches by the step for the whole hand-over (2026-11-14:
+14.6 s, 32 steps, up to 0.6° per 30 Hz tick). With `~handover_follow_ekf`
+(`true`) the **broadcast** map → odom is turned about the robot by the part of
+`diff_yaw` the EKF has not taken yet (fused heading − EKF yaw, measured every
+tick), and the commanded heading sum is low-passed (~0.5 s, ≤ 0.1° per tick).
+The correction fades out (0.03° per tick) once the hand-over ends, heading
+samples stop for 1 s, or the dock holds the pose; it is limited to
+`~handover_follow_max_deg` (5).
+
+Only the transform that is sent changes: `diff_yaw`, `map_odom_yaw`,
+`map_odom_transform`, the georef, the levelling and every gate decide exactly
+as with the parameter off, and the robot's map position is not moved (the
+rotation is about odom → base_link of the same tick). During the hand-over the
+yaw of map → odom in TF therefore differs from `map_odom_yaw` by up to a few
+degrees. Replayed over the 2026-11-14 hand-over (EKF modelled 70 / 300 /
+700 ms behind): largest step 0.5–1.0° → 0.04° per tick, swing 0.85–1.9° →
+0.35° (the real change of the heading sum). Not covered: after the hand-over
+GNSS corrections up to 2° go straight to `diff_yaw` as before.
+**Switch off:** remove the parameter or set it to `false` and restart
+`navi_transform`. Test: `tools/test_t36_d3_handover_follow.py`.

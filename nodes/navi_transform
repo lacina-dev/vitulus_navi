@@ -668,6 +668,21 @@ class NavTfNode:
         self._relpos_max_age_s = float(rospy.get_param('~relpos_max_age_s', 0.3))
         self._relpos_flags = None          # latest NAV-RELPOSNED flags
         self._relpos_rx_t = None           # rospy.get_time() of its arrival
+        # T36 D2 (off by default = pairing as before): a heading sample used to
+        # be paired with the LAST IMU message and taken only when that one was
+        # at most 6 ms older - with the IMU at ~100 Hz about half of the samples
+        # (heading 4.4 Hz) were thrown away, and the GNSS heading hand-over,
+        # which moves 0.5 deg per taken sample, took twice as long. On: the
+        # IMU yaw is interpolated at the stamp of the heading sample from the
+        # two IMU messages around it (each within heading_imu_interp_max_gap_s),
+        # so every sample that passes the other gates is used.
+        self._hi_enable = bool(rospy.get_param('~heading_imu_interp', False))
+        self._hi_max_gap_s = float(rospy.get_param('~heading_imu_interp_max_gap_s', 0.05))
+        self._hi_lock = threading.Lock()
+        self._hi_hist = deque(maxlen=32)   # (imu stamp, imu yaw), filled only when enabled
+        self._hi_pending = None            # (heading stamp, rtk yaw) waiting for the next IMU
+        self._hi_used = 0                  # samples paired / dropped (no IMU around)
+        self._hi_dropped = 0
         # HEADING ANCHOR V2 (2026-08-01, courtyard entry-error fix): in-band
         # offsets are no longer applied live — multipath onset near buildings
         # corrupts the last seconds of "in-band" heading BEFORE the variance
@@ -3066,6 +3081,8 @@ class NavTfNode:
         (roll, pitch, yaw) = euler_from_quaternion(
             [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
         self.imu_yaw = yaw
+        if getattr(self, '_hi_enable', False):     # T36 D2
+            self._hi_imu_sample(msg.header.stamp.to_sec(), yaw)
         self.publish_fused_navheading()
 
     def transform_odom_to_base_link(self, stamp=None):
@@ -3446,6 +3463,74 @@ class NavTfNode:
                 '— heading REJECTED (needs FIXED + valid)', carr, int(head_valid), age)
         return ok
 
+    # ---- T36 D2: IMU yaw interpolated at the stamp of the heading sample ----
+
+    def _hi_imu_sample(self, t, yaw):
+        """IMU callback (only with ~heading_imu_interp): keep a short yaw
+        history and finish a heading sample that waited for the IMU message
+        after its stamp."""
+        with self._hi_lock:
+            self._hi_hist.append((t, yaw))
+            pair = self._hi_take_pair()
+        if pair is not None:
+            self._hi_apply(*pair)
+
+    def _hi_heading_sample(self, msg):
+        """A heading sample that passed every gate of offset_navheading_imu.
+        Its stamp is usually a few ms NEWER than the last IMU message, so it
+        waits (at most one IMU period) for the IMU message after it."""
+        rtk_yaw = euler_from_quaternion([msg.orientation.x, msg.orientation.y,
+                                         msg.orientation.z, msg.orientation.w])[2]
+        with self._hi_lock:
+            if self._hi_pending is not None:
+                self._hi_dropped += 1      # the IMU never got past the previous one
+            self._hi_pending = (msg.header.stamp.to_sec(), rtk_yaw)
+            pair = self._hi_take_pair()
+        if pair is not None:
+            self._hi_apply(*pair)
+
+    def _hi_take_pair(self):
+        """Caller holds _hi_lock. Returns (rtk_yaw, imu_yaw at the heading
+        stamp) once the IMU history reaches past the pending sample; None while
+        it does not, or when the sample is dropped: no IMU message on one of
+        its sides, or the nearest one farther than heading_imu_interp_max_gap_s."""
+        pend, hist = self._hi_pending, self._hi_hist
+        if pend is None or not hist or hist[-1][0] < pend[0]:
+            return None
+        self._hi_pending = None
+        t, rtk_yaw = pend
+        before, after = None, None
+        for sample in reversed(hist):
+            if sample[0] >= t:
+                after = sample
+            else:
+                before = sample
+                break
+        if before is None:
+            before = after if after[0] == t else None
+        if before is None or (t - before[0]) > self._hi_max_gap_s \
+                or (after[0] - t) > self._hi_max_gap_s:
+            self._hi_dropped += 1
+            return None
+        span = after[0] - before[0]
+        f = 0.0 if span <= 0.0 else (t - before[0]) / span
+        self._hi_used += 1
+        # along the shorter arc of the circle (yaw wraps at +-pi)
+        return rtk_yaw, before[1] + f * math.atan2(math.sin(after[1] - before[1]),
+                                                    math.cos(after[1] - before[1]))
+
+    def _hi_apply(self, rtk_yaw, imu1_yaw):
+        """The tail of offset_navheading_imu (same offset convention), with
+        the interpolated IMU yaw."""
+        self.nav_last_fused_time = rospy.Time.now()
+        rtk_yaw = rtk_yaw % (2 * math.pi)
+        imu1_yaw = imu1_yaw % (2 * math.pi)
+        target = (rtk_yaw - imu1_yaw) + 1.5708  # 90 degrees
+        if self._ha_enable and not self.init:
+            self._heading_anchor_v2(target)
+        else:
+            self._apply_heading_target(target)
+
     def offset_navheading_imu(self, msg):
         """
         Compute offset of the navheading with the imu heading. Do only if the rtk navheading is usable.
@@ -3456,7 +3541,8 @@ class NavTfNode:
         self.imu_delay = delay
         rtk_error_z = msg.orientation_covariance[8]
         self.rtk_err = rtk_error_z
-        if delay <= 6 and self.fix_usable and self.heading_fix_usable \
+        interp = getattr(self, '_hi_enable', False)    # T36 D2: no 6 ms pairing gate
+        if (interp or delay <= 6) and self.fix_usable and self.heading_fix_usable \
                 and self._relpos_heading_ok():
 
             # HEALTHY-BAND acceptance (2026-07-06, user field data): a
@@ -3473,6 +3559,11 @@ class NavTfNode:
                     30.0, '[navheading] suspiciously TIGHT yaw var %.5f '
                     '(< %.5f) — degenerate solution, heading REJECTED',
                     rtk_error_z, self._heading_var_min)
+            if interp and self._heading_var_min <= rtk_error_z <= self._heading_var_max:
+                # T36 D2: all gates passed as before; only the IMU yaw it is
+                # paired with is interpolated at the sample's stamp
+                self._hi_heading_sample(msg)
+                return
             if self._heading_var_min <= rtk_error_z <= self._heading_var_max:
                 self.nav_last_fused_time = rospy.Time.now()
                 (imu_roll, imu_pitch, imu1_yaw) = euler_from_quaternion([self.imu_msg.orientation.x,

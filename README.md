@@ -151,6 +151,26 @@ else in the stack would have noticed. The same 30° error entering through
 `diff_yaw` is a heading step, so it is reported 8 s later. Test:
 `tools/test_t35_mag_check.py`.
 
+## GNSS heading paired with an interpolated IMU yaw (`navi_transform`, off by default)
+
+The heading offset `diff_yaw` is the GNSS heading minus the IMU yaw. A heading
+sample (`/gnss_heading/navheading`, 4.4 Hz) used to be paired with the last IMU
+message and thrown away when that one was more than 6 ms older; with the IMU at
+~100 Hz that drops about half of the good samples, and the hand-over of the
+heading to GNSS after the dock, which moves 0.5° per used sample, takes twice
+as long. With `~heading_imu_interp` (`true`) the IMU yaw is interpolated at the
+stamp of the sample from the IMU messages before and after it (along the
+circle); a sample without an IMU message within `~heading_imu_interp_max_gap_s`
+(0.05) on both sides is dropped. The sample waits for the IMU message after it
+(one IMU period, ~10 ms). The other gates (RTK fix, RELPOSNED carrSoln, the
+yaw-variance band, the heading anchor window) decide exactly as before. On the
+2026-11-14 drive replayed through the node: used samples 58 % → 100 % of those
+passing the other gates, hand-over of 15.7° in 7.8 s instead of 11.6 s (14.6 s
+on the robot). While driving more samples are used too (20 instead of 14 in a
+28 s stretch), `diff_yaw` stays in the same range. Off: no IMU history is kept.
+**Switch off:** remove the parameter or set it to `false` and restart
+`navi_transform`. Test: `tools/test_t36_d2_heading_interp.py`.
+
 ## Traversability layer (local costmap, off by default)
 
 The local traversability map of `vitulus_traversability` (`/traversability/local_costmap`, 6 × 6 m in `odom`,

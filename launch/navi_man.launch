@@ -38,6 +38,12 @@
                  tracker correction consumes it (it used to refill it).
                  ROLLBACK: tracker_budget_ratchet:=false -->
             <param name="tracker_budget_ratchet" value="true"/>
+            <!-- T35 2026-11-15 hlidac kurzu magnetometrem: jen hlasi do
+                 /nav_tf/loc_status (pole mag_*), do rizeni nezasahuje. Prah 15 deg:
+                 zpetny prepocet jizd 14.-15. 11. dal 0 planych poplachu i pri 10 deg.
+                 ROLLBACK: mag_check_enable:=false (uzel pak nema odberatele ani pole). -->
+            <param name="mag_check_enable" value="true"/>
+            <param name="mag_disagree_deg" value="15.0"/>
         </node>
         <!-- lidar global localization scorer (passive; apply is margin-gated) -->
         <node name="gloc_server" pkg="vitulus_navi" type="gloc_server" respawn="true" respawn_delay="2" output="log">

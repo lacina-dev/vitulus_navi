@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Jednotkove testy tools/nav_score.py na malych syntetickych datech.
+Bez ROS: testuji se ciste funkce metrik a score() nad vytahem (dict poli).
+Spusteni: python3 tools/test_nav_score.py   (nebo pytest tools/test_nav_score.py)
+"""
+import io
+import json
+import math
+import os
+import struct
+import sys
+import unittest
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nav_score as ns  # noqa: E402
+
+T0 = 1000.0
+
+
+def drive(n=600, v=0.3, hz=30.0, yaw=0.0):
+    """Rovna jizda rychlosti v: vraci (t, x, y) po 1/hz."""
+    t = T0 + np.arange(n) / hz
+    s = v * (t - T0)
+    return t, s * math.cos(yaw), s * math.sin(yaw)
+
+
+def odo(t, x, y, yaw=0.0, v=0.3, w=0.0, z=0.0):
+    """Pole odometrie N x 9 (bag_t, stamp, x, y, z, yaw, vx, vy, wz)."""
+    n = len(t)
+    f = lambda a: np.full(n, a, dtype=float) if np.isscalar(a) else np.asarray(a, dtype=float)
+    return np.column_stack([t, t, f(x), f(y), f(z), f(yaw), f(v), np.zeros(n), f(w)])
+
+
+def tfrows(t, x, y, yaw=0.0, z=0.0):
+    """Pole TF N x 6 (bag_t, stamp, x, y, z, yaw)."""
+    n = len(t)
+    f = lambda a: np.full(n, a, dtype=float) if np.isscalar(a) else np.asarray(a, dtype=float)
+    return np.column_stack([t, t, f(x), f(y), f(z), f(yaw)])
+
+
+def imu(t, yaw=0.0, w=0.0):
+    n = len(t)
+    f = lambda a: np.full(n, a, dtype=float) if np.isscalar(a) else np.asarray(a, dtype=float)
+    return np.column_stack([t, t, f(yaw), f(w)])
+
+
+def base_extract(n=600, v=0.3):
+    """Cista jizda: kola, EKF i TF se presne shoduji, map->odom je nulovy."""
+    t, x, y = drive(n, v)
+    D = {'wheel': odo(t, x, y, v=v), 'ekf': odo(t, x, y, v=v), 'odom': odo(t, x, y, v=v),
+         'imu': imu(t), 'mo': tfrows(t, 0.0, 0.0), 'ob': tfrows(t, x, y), 'counts': {}}
+    return D, t, x, y
+
+
+class Helpers(unittest.TestCase):
+    def test_wrap(self):
+        self.assertAlmostEqual(float(ns.wrap(3 * math.pi + 0.1)), -math.pi + 0.1)
+
+    def test_wheel_path_integrates_speed(self):
+        t, x, y = drive(300, 0.2)
+        _, s = ns.wheel_path(odo(t, x, y, v=0.2))
+        self.assertAlmostEqual(s[-1], 0.2 * (t[-1] - t[0]), places=6)
+
+    def test_wheel_path_sign(self):
+        t, x, y = drive(300, -0.2)
+        _, s = ns.wheel_path(odo(t, x, y, v=-0.2))
+        self.assertLess(s[-1], 0)
+
+    def test_first_sustained_skips_short_run(self):
+        t = np.arange(0, 100, 1.0)
+        c = np.zeros(100, dtype=bool)
+        c[5:8] = True          # 2 s, kratky
+        c[40:80] = True
+        self.assertEqual(ns.first_sustained(t, c, 0.0, 10.0), 40.0)
+        self.assertIsNone(ns.first_sustained(t, np.zeros(100, dtype=bool), 0.0, 10.0))
+
+
+class Jumps(unittest.TestCase):
+    def test_clean_drive_has_no_jumps(self):
+        D, *_ = base_extract()
+        m = ns.score(D)['metrics']
+        for p in ('mo', 'ob', 'mb'):
+            self.assertEqual(m[p + '_n_gt1cm'], 0, p)
+            self.assertLess(m[p + '_pos_max_cm'], 0.01, p)
+            self.assertEqual(m[p + '_n_yaw_gt03'], 0, p)
+        self.assertEqual(m['ekf_steps_gt1cm_per_min'], 0.0)
+
+    def test_map_odom_jump_is_attributed_to_mo(self):
+        D, t, x, y = base_extract()
+        mx = np.zeros(len(t))
+        mx[300:] = 0.20                       # skok map->odom o 20 cm v jednom tiku
+        D['mo'] = tfrows(t, mx, 0.0)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['mo_pos_max_cm'], 20.0, places=3)
+        self.assertEqual(m['mo_n_gt3cm'], 1)
+        self.assertEqual(m['ob_n_gt1cm'], 0)
+        self.assertAlmostEqual(m['mb_pos_max_cm'], 20.0, places=3)
+        self.assertEqual(m['mb_n_gt3cm'], 1)
+
+    def test_ekf_step_is_attributed_to_ob(self):
+        D, t, x, y = base_extract()
+        x2 = x.copy()
+        x2[200:] += 0.04                      # set_pose: krok EKF o 4 cm
+        D['ekf'] = odo(t, x2, y)
+        D['odom'] = odo(t, x2, y)
+        D['ob'] = tfrows(t, x2, y)
+        m = ns.score(D)['metrics']
+        self.assertEqual(m['ob_n_gt3cm'], 1)
+        self.assertAlmostEqual(m['ob_pos_max_cm'], 4.0, places=3)
+        self.assertEqual(m['mo_n_gt1cm'], 0)
+        drive_min = (t[-1] - t[0]) / 60.0
+        self.assertAlmostEqual(m['ekf_steps_gt3cm_per_min'], 1.0 / drive_min, delta=0.05)
+        self.assertAlmostEqual(m['ekf_steps_gt1cm_per_min'], 1.0 / drive_min, delta=0.05)
+
+    def test_smooth_slew_is_not_a_jump(self):
+        D, t, x, y = base_extract()
+        # map->odom se plynule posune o 30 cm rychlosti 0,1 m/s (3,3 mm za tik)
+        mx = np.clip((t - T0 - 5.0) * 0.1, 0.0, 0.30)
+        D['mo'] = tfrows(t, mx, 0.0)
+        m = ns.score(D)['metrics']
+        self.assertEqual(m['mo_n_gt1cm'], 0)
+        self.assertLess(m['mo_pos_max_cm'], 0.4)
+
+    def test_map_odom_rotation_moves_robot(self):
+        # otoceni map->odom o 2 st kolem pocatku mapy s robotem 6 m daleko = skok ~21 cm
+        D, t, x, y = base_extract()
+        myaw = np.zeros(len(t))
+        myaw[590:] = math.radians(2.0)
+        D['mo'] = tfrows(t, 0.0, 0.0, myaw)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['mo_yaw_max_deg'], 2.0, places=3)
+        self.assertAlmostEqual(m['mo_pos_max_cm'], 100 * 2 * x[590] * math.sin(math.radians(1.0)),
+                               delta=0.5)
+
+    def test_yaw_step_counted_only_when_calm(self):
+        D, t, x, y = base_extract()
+        oyaw = np.zeros(len(t))
+        oyaw[250:] = math.radians(1.0)        # krok kurzu 1 st pri rovne jizde
+        D['ob'] = tfrows(t, x, y, oyaw)
+        D['ekf'] = odo(t, x, y, oyaw)
+        m = ns.score(D)['metrics']
+        self.assertEqual(m['ob_n_yaw_gt03'], 1)
+        self.assertAlmostEqual(m['ob_yaw_max_deg'], 1.0, places=3)
+        # tentyz krok pri otaceni (gyro i kola hlasi 0,5 rad/s) se nepocita
+        D['imu'] = imu(t, w=0.5)
+        D['wheel'] = odo(t, x, y, w=0.5)
+        m = ns.score(D)['metrics']
+        self.assertEqual(m['ob_n_yaw_gt03'], 0)
+
+    def test_pose_time_matching_removes_aliasing(self):
+        # /tf kazdy treti tik zopakuje predchozi pozu EKF (nesoubeh smycek)
+        D, t, x, y = base_extract()
+        idx = np.arange(len(t))
+        src = idx - (idx % 3 == 2)
+        tf_t = t + 0.004
+        ob = np.column_stack([tf_t, tf_t, x[src], y[src], np.zeros(len(t)), np.zeros(len(t))])
+        D['ob'] = ob
+        D['mo'] = np.column_stack([tf_t, tf_t] + [np.zeros(len(t))] * 4)
+        R = ns.score(D)
+        self.assertGreater(R['meta']['tf_pose_time_matched_pct'], 99.0)
+        self.assertEqual(R['metrics']['ob_n_gt1cm'], 0)
+        self.assertLess(R['metrics']['ob_pos_max_cm'], 0.01)
+        self.assertAlmostEqual(R['metrics']['tf_stale_pct'], 100.0 / 3, delta=1.0)
+
+
+class ZeroTwist(unittest.TestCase):
+    def test_zero_twist_share(self):
+        t, x, y = drive(400, 0.3)
+        wheel = odo(t, x, y, v=0.3)
+        v = np.full(len(t), 0.3)
+        v[::10] = 0.0                         # kazdy desaty vzorek ma nulovou rychlost
+        self.assertAlmostEqual(ns.zero_twist_pct(odo(t, x, y, v=v), wheel), 10.0, places=6)
+
+    def test_standing_zero_twist_not_counted(self):
+        t = T0 + np.arange(300) / 30.0
+        wheel = odo(t, 0.0, 0.0, v=0.0)
+        self.assertIsNone(ns.zero_twist_pct(odo(t, 0.0, 0.0, v=0.0), wheel))
+
+    def test_fallback_to_ekf_topic_is_noted(self):
+        D, *_ = base_extract()
+        del D['odom']
+        R = ns.score(D)
+        self.assertEqual(R['metrics']['odom_zero_twist_pct'], 0.0)
+        self.assertIn('odom_zero_twist_pct', R['notes'])
+
+
+class Owner(unittest.TestCase):
+    def _loc(self, D, t, owners, anchor=None, heading=None):
+        lt = T0 + np.arange(len(owners), dtype=float)
+        D['loc_t'] = lt
+        D['loc_owner'] = np.array(owners)
+        D['loc_anchor_age'] = np.full(len(lt), 0.1) if anchor is None else np.asarray(anchor, float)
+        D['loc_heading_age'] = np.full(len(lt), 0.1) if heading is None else np.asarray(heading, float)
+        return lt
+
+    def test_transitions_and_rate(self):
+        D, t, x, y = base_extract()
+        self._loc(D, t, ['dr'] * 5 + ['gps'] * 5 + ['dr'] * 5 + ['gps'] * 5)
+        m = ns.score(D)['metrics']
+        self.assertEqual(m['owner_changes'], 3)
+        self.assertAlmostEqual(m['owner_dr_gps_per_hour'], 3 / (19.0 / 3600.0), places=3)
+
+    def test_takeover_gap_and_settle(self):
+        D, t, x, y = base_extract()
+        lt = self._loc(D, t, ['dr'] * 8 + ['gps'] * 12)
+        t_take = lt[8]
+        # EKF je do prevzeti 10 cm vedle GPS, pak se 2 s plynule dorovnava
+        off = 0.10 * np.clip(1.0 - (t - t_take) / 2.0, 0.0, 1.0)
+        D['ekf'] = odo(t, x, y + off)
+        D['ob'] = tfrows(t, x, y + off)
+        tg = t[::6]
+        D['gps'] = np.column_stack([tg, tg, x[::6], y[::6], np.zeros(len(tg))])
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['takeover_gap_med_cm'], 10.0, delta=0.2)
+        self.assertAlmostEqual(m['takeover_settle_max_s'], 1.0, delta=0.25)   # pod 5 cm po 1 s
+        self.assertLess(m['gps_gap_med_cm'], 1.0)
+
+    def test_anchor_freezes(self):
+        D, t, x, y = base_extract()
+        age = [0.1] * 20
+        age[6:9] = [6.0, 7.0, 8.0]            # jedna epizoda > 5 s
+        age[14] = 9.0                         # druha
+        self._loc(D, t, ['gps'] * 20, anchor=age, heading=[float('nan')] * 20)
+        R = ns.score(D)
+        m = R['metrics']
+        self.assertEqual(m['anchor_freezes'], 2)
+        self.assertEqual(m['anchor_age_max_s'], 9.0)
+        self.assertIsNone(m['heading_anchor_age_max_s'])
+        self.assertIn('heading_anchor_age_max_s', R['notes'])
+
+
+class Dock(unittest.TestCase):
+    def _dock(self, t, seq):
+        """seq = [(od_s, hodnota)], 10 Hz."""
+        dt = T0 + np.arange(0, t[-1] - T0, 0.1)
+        v = np.zeros(len(dt))
+        for (a, val) in seq:
+            v[dt >= T0 + a] = val
+        return np.column_stack([dt, v])
+
+    def test_edges(self):
+        d = np.array([[0, 0], [1, 0], [2, 1], [3, 3], [4, 2], [5, 0], [6, 0]], dtype=float)
+        und, dk = ns.dock_edges(d)
+        self.assertEqual(und, [2.0])
+        self.assertEqual(dk, [5.0])
+
+    def test_dock_jump(self):
+        D, t, x, y = base_extract()
+        D['dock'] = self._dock(t, [(0, 3), (10, 0)])
+        mx = np.zeros(len(t))
+        my = np.zeros(len(t))
+        i = int(np.searchsorted(t, T0 + 12.0))    # 2 s po hrane (debounce drzeni doku)
+        mx[i:], my[i:] = 0.15, 0.20
+        D['mo'] = tfrows(t, mx, my)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['dock_jump_cm'], 25.0, places=3)
+        self.assertAlmostEqual(m['dock_shift_cm'], 25.0, places=3)
+
+    def test_undock_times(self):
+        n = 1800                                   # 60 s
+        t = T0 + np.arange(n) / 30.0
+        v = np.where(((t - T0 > 6) & (t - T0 < 10)) | (t - T0 > 42), 0.3, 0.0)
+        x = np.concatenate([[0], np.cumsum(v[:-1] * np.diff(t))])
+        D = {'wheel': odo(t, x, 0.0, v=v), 'ekf': odo(t, x, 0.0, v=v), 'imu': imu(t),
+             'mo': tfrows(t, 0.0, 0.0), 'ob': tfrows(t, x, 0.0), 'counts': {}}
+        D['dock'] = self._dock(t, [(0, 0), (5, 1), (40, 3)])
+        tp = T0 + np.arange(0, 60, 0.2)
+        carr = np.where(((tp - T0 > 2) & (tp - T0 < 7)) | (tp - T0 > 25), 2, 1)   # kratky fix v doku
+        D['pvt'] = np.column_stack([tp, np.full(len(tp), 3), carr, np.full(len(tp), 0.014)])
+        D['loc_t'] = T0 + np.arange(60, dtype=float)
+        D['loc_owner'] = np.array(['dock'] * 5 + ['dr'] * 25 + ['gps'] * 30)
+        D['loc_anchor_age'] = np.full(60, 0.1)
+        D['loc_heading_age'] = np.full(60, 0.1)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['to_rtk_fixed_s'], 20.0, delta=0.3)
+        self.assertAlmostEqual(m['to_owner_gps_s'], 25.0, delta=0.01)
+        self.assertAlmostEqual(m['to_undocked_s'], 35.0, delta=0.11)
+        self.assertAlmostEqual(m['to_depart_s'], 37.0, delta=0.15)
+        self.assertAlmostEqual(m['undock_standing_s'], 31.0, delta=0.3)
+
+    def test_yaw_handover_smooth_and_jittery(self):
+        n = 900
+        t = T0 + np.arange(n) / 30.0
+        D = {'wheel': odo(t, 0.0, 0.0, v=0.0), 'ekf': odo(t, 0.0, 0.0, v=0.0), 'imu': imu(t),
+             'counts': {}}
+        D['dock'] = self._dock(t, [(0, 0), (5, 1)])
+        # map->odom se od 10. s otaci z 10 st na 0 rychlosti 5 st/s (2 s)
+        myaw = np.radians(np.clip(10.0 - 5.0 * (t - T0 - 10.0), 0.0, 10.0))
+        D['mo'] = tfrows(t, 0.0, 0.0, myaw)
+        # plynule: odom->base se otaci presne opacne -> kurz v mape stoji
+        D['ob'] = tfrows(t, 0.0, 0.0, math.radians(10.0) - myaw)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['yaw_handover_s'], 2.0, delta=0.1)
+        self.assertAlmostEqual(m['yaw_handover_turn_deg'], 10.0, delta=0.2)
+        self.assertLess(m['yaw_handover_excess_deg'], 0.01)
+        # cukave: odom->base dobiha po krocich 0,5 st jednou za 0,2 s
+        lag = np.radians(np.floor((10.0 - np.degrees(myaw)) / 0.5 - 1e-9).clip(0) * 0.5)
+        D['ob'] = tfrows(t, 0.0, 0.0, lag)
+        m = ns.score(D)['metrics']
+        self.assertGreater(m['yaw_handover_excess_deg'], 5.0)
+        self.assertGreater(m['yaw_handover_max_step_deg'], 0.3)
+
+    def test_standing_jitter(self):
+        n = 600
+        t = T0 + np.arange(n) / 30.0
+        yaw = np.radians(0.5) * np.sign(np.sin(2 * math.pi * (t - T0)))   # +-0,5 st, 1 Hz
+        D = {'wheel': odo(t, 0.0, 0.0, v=0.0), 'ekf': odo(t, 0.0, 0.0, yaw, v=0.0),
+             'imu': imu(t), 'mo': tfrows(t, 0.0, 0.0), 'ob': tfrows(t, 0.0, 0.0, yaw), 'counts': {}}
+        D['loc_t'] = T0 + np.arange(20, dtype=float)
+        D['loc_owner'] = np.array(['gps'] * 20)
+        D['loc_anchor_age'] = np.full(20, 0.1)
+        D['loc_heading_age'] = np.full(20, 0.1)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['gps_standing_yaw_p2p_deg'], 1.0, delta=0.01)
+        self.assertAlmostEqual(m['gps_standing_yaw_std_deg'], 0.5, delta=0.05)
+        self.assertLess(m['gps_standing_pos_p95_cm'], 0.001)
+
+
+class Missing(unittest.TestCase):
+    def test_missing_topics_are_none_not_zero(self):
+        D, *_ = base_extract()
+        R = ns.score(D)
+        m, notes = R['metrics'], R['notes']
+        for k in ('owner_changes', 'takeover_gap_med_cm', 'gps_gap_p95_cm', 'dock_jump_cm',
+                  'to_rtk_fixed_s', 'anchor_age_max_s', 'no_progress_n', 'rewindow_n',
+                  'mbf_fail_n', 'yaw_handover_s', 'gps_standing_yaw_std_deg'):
+            self.assertIsNone(m[k], k)
+            self.assertIn(ns.NA, notes[k], k)
+
+    def test_every_spec_key_is_reported(self):
+        D, *_ = base_extract()
+        m = ns.score(D)['metrics']
+        for key, label, _, _ in ns.SPEC:
+            if label is not None:
+                self.assertIn(key, m, key)
+
+    def test_no_tf_no_wheel(self):
+        R = ns.score({'counts': {}})
+        self.assertTrue(all(v is None for v in R['metrics'].values()))
+
+    def test_table_prints_not_in_recording(self):
+        D, *_ = base_extract()
+        R = ns._jsonable(ns.score(D))
+        out = io.StringIO()
+        ns.print_table(R, out)
+        txt = out.getvalue()
+        self.assertIn(ns.NA, txt)
+        line = [l for l in txt.splitlines() if 'no goal progress' in l][0]
+        self.assertNotRegex(line, r'\s0\s*$')
+
+    def test_rosout_counts(self):
+        D, *_ = base_extract()
+        D['rosout_text'] = np.array(['[EXE] no goal progress 8.1s -> re-window from current pos',
+                                     'x', '[EXE] no goal progress 6.0s -> recovery/detour'])
+        m = ns.score(D)['metrics']
+        self.assertEqual(m['no_progress_n'], 2)
+        self.assertEqual(m['rewindow_n'], 1)
+
+    def test_z_drift_and_tf_gap(self):
+        D, t, x, y = base_extract()
+        D['ekf'] = odo(t, x, y, z=np.linspace(0.0, 0.5, len(t)))
+        t2 = t.copy()
+        t2[400:] += 1.5                       # mezera 1,5 s v /tf
+        D['mo'] = tfrows(t2, 0.0, 0.0)
+        D['ob'] = tfrows(t2, x, y)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['z_drift_m'], 0.5, places=6)
+        self.assertAlmostEqual(m['tf_gap_max_s'], 1.5 + 1 / 30.0, places=3)
+
+
+class Compare(unittest.TestCase):
+    def test_compare_marks_direction(self):
+        D, *_ = base_extract()
+        A = ns._jsonable(ns.score(D))
+        B = json.loads(json.dumps(A))
+        A['metrics']['mb_n_gt1cm'], B['metrics']['mb_n_gt1cm'] = 100, 20
+        A['metrics']['dock_jump_cm'], B['metrics']['dock_jump_cm'] = 5.0, 19.0
+        A['metrics']['z_drift_m'], B['metrics']['z_drift_m'] = -0.5, 0.1     # |z| mensi = lepsi
+        A['metrics']['tf_gap_max_s'], B['metrics']['tf_gap_max_s'] = 0.050, 0.052   # v toleranci
+        out = io.StringIO()
+        up, dn = ns.compare(A, B, out)
+        self.assertEqual((up, dn), (2, 1))
+        txt = out.getvalue()
+        self.assertIn('ZLEPSENI', [l for l in txt.splitlines() if 'map->base: kroku > 1 cm' in l][0])
+        self.assertIn('ZHORSENI', [l for l in txt.splitlines() if 'skok polohy za tik' in l][0])
+        self.assertIn('nelze porovnat', txt)
+
+
+class RawParsers(unittest.TestCase):
+    @staticmethod
+    def _hdr(stamp, frame):
+        sec = int(stamp)
+        return struct.pack('<III', 7, sec, int(round((stamp - sec) * 1e9))) + \
+            struct.pack('<I', len(frame)) + frame
+
+    def test_parse_odom(self):
+        q = (0.0, 0.0, math.sin(0.25), math.cos(0.25))      # yaw 0,5 rad
+        buf = self._hdr(12.5, b'odom') + struct.pack('<I', 9) + b'base_link' + \
+            struct.pack('<7d', 1.0, 2.0, 3.0, *q) + b'\0' * 288 + \
+            struct.pack('<6d', 0.4, 0.0, 0.0, 0.0, 0.0, -0.2) + b'\0' * 288
+        st, x, y, z, yaw, vx, vy, wz = ns.parse_odom(buf)
+        self.assertAlmostEqual(st, 12.5)
+        self.assertEqual((x, y, z, vx, vy, wz), (1.0, 2.0, 3.0, 0.4, 0.0, -0.2))
+        self.assertAlmostEqual(yaw, 0.5)
+
+    def test_parse_imu(self):
+        q = (0.0, 0.0, math.sin(-0.5), math.cos(-0.5))
+        buf = self._hdr(3.25, b'imu_link') + struct.pack('<4d', *q) + b'\0' * 72 + \
+            struct.pack('<3d', 0.0, 0.0, 0.7) + b'\0' * 72 + b'\0' * 96
+        st, yaw, wz = ns.parse_imu(buf)
+        self.assertAlmostEqual(st, 3.25)
+        self.assertAlmostEqual(yaw, -1.0)
+        self.assertEqual(wz, 0.7)
+
+    def test_parse_tf(self):
+        one = lambda p, c, x: self._hdr(5.0, p) + struct.pack('<I', len(c)) + c + \
+            struct.pack('<7d', x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        buf = struct.pack('<I', 2) + one(b'map', b'odom', 1.5) + one(b'/odom', b'base_link', 2.5)
+        out = ns.parse_tf(buf)
+        self.assertEqual([(o[0], o[1], o[3]) for o in out],
+                         [(b'map', b'odom', 1.5), (b'odom', b'base_link', 2.5)])
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=1)

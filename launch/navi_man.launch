@@ -39,6 +39,10 @@
             <param name="dock_gate_non_dock" value="true"/>
             <param name="dock_micro_m" value="0.05"/>
             <param name="dock_micro_deg" value="1.0"/>
+            <!-- T36 E5 2026-11-16 navsat_transform se spousti ve vlastnim vlakne: 2 jizdy
+                 proti 8 ostatnim, nejvetsi mezera /tf 0.95-1.36 s -> 0.13-0.14 s.
+                 ROLLBACK: navsat_async:=false -->
+            <param name="navsat_async" value="true"/>
             <!-- Fail-closed dock feed: absent/stale 10 Hz dock_status keeps the
                  suppression ON instead of opening the gates.
                  ROLLBACK: dock_status_fail_closed:=false -->

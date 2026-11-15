@@ -499,6 +499,32 @@ def mag_heading_step_event(hist, now, h, window_s=3.0, step_rad=math.radians(8.0
     return event
 
 
+# ---- T36 E6: smoothed GNSS heading target (pure, see
+#      vitulus_navi/tools/test_t36_e6_heading_smooth.py) ----------------------
+
+def heading_smooth_turning(yaw_prev, yaw, dt, rate_rad_s, gap_s=0.4):
+    """Did the IMU yaw turn faster than rate_rad_s between two heading samples
+    dt apart? Over a gap longer than gap_s any turn above rate * gap_s counts
+    (a turn made while no heading sample came must not hide in a long dt)."""
+    d = math.atan2(math.sin(yaw - yaw_prev), math.cos(yaw - yaw_prev))
+    return abs(d) > rate_rad_s * min(max(dt, 0.0), gap_s)
+
+
+def heading_smooth_step(diff_yaw, window, dt, tau_s, max_err_rad):
+    """One step of diff_yaw toward the CIRCULAR mean of the verified window of
+    offset targets: the share dt / tau_s of the error (first-order low-pass,
+    tau_s <= 0 = the whole error). Returns the new diff_yaw, or None when the
+    error is above max_err_rad - the offset really moved, the caller applies
+    the newest sample the old way."""
+    mean = math.atan2(sum(math.sin(v) for v in window),
+                      sum(math.cos(v) for v in window))
+    err = math.atan2(math.sin(mean - diff_yaw), math.cos(mean - diff_yaw))
+    if abs(err) > max_err_rad:
+        return None
+    share = 1.0 if tau_s <= 0.0 else min(1.0, max(dt, 0.0) / tau_s)
+    return diff_yaw + share * err
+
+
 class NavTfNode:
 
     def __init__(self):
@@ -745,6 +771,39 @@ class NavTfNode:
         self._ha_buf = deque(maxlen=200)   # (wall_t, target_offset_rad), in-band only
         self._ha_last_applied_t = None     # wall time a verified anchor last applied
         self._ha_frozen_since = None       # wall time the current freeze began
+        # T36 E6 (off by default = the newest sample of the verified window is
+        # applied as before): one heading sample carries ~0.5 deg of noise at
+        # rest (more in a turn) and a sample within 2 deg of diff_yaw is
+        # applied at once, so the heading of a STANDING robot wanders by
+        # ~2.8 deg and steps by more than 0.3 deg several times a second. On:
+        # the target is the circular mean of the verified window and diff_yaw
+        # takes only the share dt / heading_target_smooth_tau_s of the error
+        # per sample.
+        # What is averaged is the OFFSET rtk - imu, not the heading: the IMU
+        # carries every turn at full rate, so the heading itself is not
+        # delayed. The offset does move in a turn (measured: -20..-30 ms x
+        # turn rate from the stamp of the heading sample, ~1 deg across a
+        # turn), therefore the mean takes only the samples of the window taken
+        # AFTER the last time the IMU yaw turned faster than
+        # heading_target_smooth_turn_dps; with fewer than
+        # heading_target_smooth_min_samples of them, during a hand-over
+        # (map_odom_yaw != 0) and when the mean is more than
+        # heading_target_smooth_max_deg off diff_yaw the sample goes the old
+        # way - at once, exactly as with the parameter off.
+        # Needs heading_anchor_v2 (its verified window); works with
+        # heading_imu_interp on and off (time based, not per sample).
+        self._hs_enable = bool(rospy.get_param('~heading_target_smooth', False))
+        self._hs_tau_s = float(rospy.get_param('~heading_target_smooth_tau_s', 4.0))
+        self._hs_turn_rate = math.radians(float(rospy.get_param(
+            '~heading_target_smooth_turn_dps', 5.0)))
+        self._hs_max_err = math.radians(float(rospy.get_param(
+            '~heading_target_smooth_max_deg', 1.0)))
+        self._hs_min_samples = int(rospy.get_param('~heading_target_smooth_min_samples', 3))
+        self._hs_prev = None        # (wall t, imu yaw) at the previous in-band sample
+        self._hs_turn_ts = deque(maxlen=64)   # wall times of the samples taken in a turn
+        self._hs_last_t = None      # wall time of the last verified sample
+        self._hs_n_smooth = 0       # verified samples applied smoothed / the old way
+        self._hs_n_raw = 0
         # CONTINUOUS SAME-TIME ANCHORING (2026-07-11, user-approved redesign).
         # OLD live correction wrote rtk(NOW) into the nav EKF (loop3sec). NEW:
         # the pose written at time t is GPS_pose(t-anchor_lag) composed with the
@@ -4070,6 +4129,8 @@ class NavTfNode:
         apply only a LAG-old value whose surrounding window verifies; on a
         failing window FREEZE diff_yaw at the last verified anchor."""
         now = time.time()
+        if getattr(self, '_hs_enable', False):     # T36 E6
+            self._hs_note_turn(now)
         self._ha_buf.append((now, target))
         horizon = self._ha_lag_s + self._ha_window_s + 2.0
         while self._ha_buf and (now - self._ha_buf[0][0]) > horizon:
@@ -4092,6 +4153,8 @@ class NavTfNode:
                               now - self._ha_frozen_since)
                 self._ha_frozen_since = None
             self._ha_last_applied_t = now
+            if getattr(self, '_hs_enable', False) and self._hs_apply(now, win):   # T36 E6
+                return
             self._apply_heading_target(win[-1][1])
         else:
             if self._ha_frozen_since is None:
@@ -4134,6 +4197,42 @@ class NavTfNode:
         self._ha_frozen_since = None
         rospy.loginfo("[navi_tf] heading anchored to external map yaw %.3f rad (diff_yaw=%.3f)"
                       % (msg.data, self.diff_yaw))
+
+    # ---- T36 E6: smoothed GNSS heading target --------------------------------
+
+    def _hs_note_turn(self, now):
+        """Every in-band heading sample (only with ~heading_target_smooth):
+        note the samples before which the IMU yaw turned above the rate."""
+        yaw = self.imu_yaw
+        if self._hs_prev is not None and heading_smooth_turning(
+                self._hs_prev[1], yaw, now - self._hs_prev[0], self._hs_turn_rate):
+            self._hs_turn_ts.append(now)
+        self._hs_prev = (now, yaw)
+
+    def _hs_apply(self, now, win):
+        """A verified window (heading anchor v2). True = diff_yaw took a
+        smoothed step and the sample is done; False = not the case for
+        smoothing, the caller applies the newest sample as before."""
+        dt = 0.0 if self._hs_last_t is None else min(now - self._hs_last_t, 0.5)
+        self._hs_last_t = now
+        new = None
+        if self.map_odom_yaw == 0.0:
+            # only the samples of the window taken after the last turn in it
+            cut = max([t for t in self._hs_turn_ts if t <= win[-1][0]] or [0.0])
+            quiet = [v for (t, v) in win if t > cut]
+            if len(quiet) >= self._hs_min_samples:
+                new = heading_smooth_step(self.diff_yaw, quiet, dt,
+                                          self._hs_tau_s, self._hs_max_err)
+        if new is None:
+            self._hs_n_raw += 1
+            return False
+        self._hs_n_smooth += 1
+        self.diff_yaw = new
+        self._heading_good_after_acq = True     # as _apply_heading_target
+        rospy.loginfo_throttle(
+            60.0, '[navheading] target smoothing: %d samples smoothed, %d the old way'
+            % (self._hs_n_smooth, self._hs_n_raw))
+        return True
 
     def print_info(self):
 

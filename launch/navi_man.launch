@@ -14,6 +14,11 @@
                  (sigma 1.2-1.6 deg) — 1.5 deg okno NIKDY neproslo (vecny freeze).
                  6 deg = ~2.5 sigma; multipath rampu (>1 deg/s) chyti i tak. -->
             <param name="heading_anchor_spread_max_deg" value="6.0"/>
+            <!-- T36 D2 2026-11-15 kurz mezi vzorky RTK dopocitany z IMU: 3 jizdy proti
+                 3 vychozim, skoky kurzu mapy nad 0.3 deg 31-40 -> 4-24, zamrznuti kotvy
+                 kurzu 5-7 -> 2, zastarale TF 3-10 % -> 0.7-2.8 %.
+                 ROLLBACK: heading_imu_interp:=false -->
+            <param name="heading_imu_interp" value="true"/>
             <!-- DOCKFIX-2026-08-29 — dock localization hardening.
                  A2 continuous dock hold: while docked (debounced) map->odom is
                  recomputed every 30 Hz tick from the DOCKED waypoint composed

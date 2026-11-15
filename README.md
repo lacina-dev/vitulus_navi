@@ -44,6 +44,28 @@ the `costmap_2d::` name is only the pluginlib registration). Install it with:
 sudo apt install ros-noetic-nonpersistent-voxel-layer
 ```
 
+## Measured twist in `/odometry/odom` (`navi_transform`, off by default)
+
+`/odometry/odom` is the message of the nav EKF republished by `navi_transform`.
+The EKF zeroes its velocity state on every `set_pose` (the GPS anchor writes one
+up to 10 times a second), so on GPS the twist it reports drops to 0 while the
+robot drives: on the 2026-11-14 drive linear.x was exactly 0 in 5.8 % of the
+30 Hz ticks with the wheels turning, and angular.z was under half of the gyro
+rate in 38 % of the ticks while turning. With `~odom_twist_from_wheels` (`true`)
+the node publishes a copy of the message whose twist is the measured one:
+linear.x of `/mobile_base_controller/odom` (signed, negative when reversing) and
+angular.z of the `/bno085/imu` gyro; on the same drive both shares are 0 %.
+Header, pose, both covariances and the TF are unchanged, and the EKF itself is
+not touched. When either source is missing, not finite or older than
+`~odom_twist_max_age_s` (0.2) the EKF message goes out as before.
+
+Readers of the twist: the TEB local planner (`odom_topic`: the start velocity of
+every plan, so it stops planning from a standstill that is not there) and the
+agent's telemetry (`speed`, `yaw_rate`). `traversability_local`,
+`terrain_recorder` and rtabmap's `data_odom_sync` read the pose only.
+**Switch off:** remove the parameter or set it to `false` and restart
+`navi_transform`. Test: `tools/test_t36_d1_odom_twist.py`.
+
 ## Magnetometer heading watchdog (`navi_transform`, off by default)
 
 An independent check of the navigation heading: `navi_transform` compares the

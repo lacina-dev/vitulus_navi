@@ -542,6 +542,13 @@ class NavTfNode:
         self.marker_fuse = Marker()
         self.imu_queue_size = 10
         self.wheel_odom_msg = Odometry()
+        # T36 D1 (off by default = /odometry/odom is the EKF message as before):
+        # the nav EKF zeroes its velocity state on every set_pose (the GPS
+        # anchor), so the twist it reports drops to 0 while the robot drives.
+        # On: /odometry/odom carries the measured twist instead - linear.x of
+        # the wheel odometry, angular.z of the IMU gyro (both in base_link).
+        self._odom_twist_wheels = bool(rospy.get_param('~odom_twist_from_wheels', False))
+        self._odom_twist_max_age_s = float(rospy.get_param('~odom_twist_max_age_s', 0.2))
         self.rtk_odom_msg = Odometry()
         self.rtk_odom_msg.pose.pose.orientation.w = 1
         self.rtk_odom_heading_msg = Odometry()
@@ -3092,9 +3099,39 @@ class NavTfNode:
             # print(msg.pose.pose)
             msg.header.frame_id = "odom"
             msg.child_frame_id = "base_link"
-            self.odometry_odom_pub.publish(msg)
+            self.odometry_odom_pub.publish(
+                self._odom_with_measured_twist(msg, stamp)
+                if getattr(self, '_odom_twist_wheels', False) else msg)
             return static_transformStamped
         return None
+
+    def _odom_with_measured_twist(self, msg, stamp):
+        """T36 D1 (~odom_twist_from_wheels): a COPY of the EKF odometry message
+        whose twist is the measured one - linear.x from the wheel odometry
+        (/mobile_base_controller/odom, signed: negative when reversing),
+        angular.z from the IMU gyro (/bno085/imu); both are body rates in
+        base_link, the frame the twist of this message is in. Header, pose and
+        both covariances are the EKF's (shared, not copied); the EKF message
+        itself is not touched. Returns `msg` unchanged (the EKF twist, as
+        before) when either source is missing, not finite or older than
+        ~odom_twist_max_age_s."""
+        now = stamp.to_sec()
+        wheel, imu = self.wheel_odom_msg, self.imu_msg
+        if abs(now - wheel.header.stamp.to_sec()) > self._odom_twist_max_age_s \
+                or abs(now - imu.header.stamp.to_sec()) > self._odom_twist_max_age_s:
+            return msg
+        v, w = wheel.twist.twist.linear.x, imu.angular_velocity.z
+        if not (math.isfinite(v) and math.isfinite(w)):
+            return msg
+        out = Odometry()
+        out.header = msg.header
+        out.child_frame_id = msg.child_frame_id
+        out.pose = msg.pose
+        out.twist.covariance = msg.twist.covariance
+        src, tw = msg.twist.twist, out.twist.twist
+        tw.linear.x, tw.linear.y, tw.linear.z = v, src.linear.y, src.linear.z
+        tw.angular.x, tw.angular.y, tw.angular.z = src.angular.x, src.angular.y, w
+        return out
 
     def get_base_link_transform(self, stamp=None):
         """odom->base_link. With a stamp (AUDIT P0-2, 2026-08-08) the lookup is

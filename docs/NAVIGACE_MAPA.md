@@ -10,19 +10,21 @@ Zdroje čísel: **[B]** = `~/bags/nav_test/nav_baseline_2026-11-15_a.bag` (2× d
 
 ---
 
-## Stav vypínačů úprav (15. 11. 2026 12:35)
+## Stav vypínačů úprav (16. 11. 2026 00:40)
 
 | Úprava | Parametr | Stav | Důkaz | Vrácení |
 |---|---|---|---|---|
 | D1 rychlost odometrie z kol při výpadku EKF | `odom_twist_from_wheels` | **zapnuto** | jízda: výpadky nulové rychlosti 2,0 % → 0,03 % | `git revert 3ef52fc` |
 | D2 kurz mezi vzorky RTK z IMU | `heading_imu_interp` | **zapnuto** | 3 jízdy proti 3 výchozím: skoky kurzu mapy nad 0,3° 31–40 → 4–24, zamrznutí kotvy kurzu 5–7 → 2, zastaralé TF 3–10 % → 0,7–2,8 % | `git revert 91a24d7` |
-| D3 dotáčení při předání podle EKF | `handover_follow_ekf` | vypnuto | 1 jízda, nerozlišitelné od rozptylu | – |
-| D4 plynulý první zápis dokové pózy | `dock_engage_slew_mps` | vypnuto (0) | neměřeno | – |
-| E5 navsat ve vlastním vlákně | `navsat_async` | vypnuto | jen zkouška mimo robota: mezera smyčky 0,8 s → 0,04 s | `git revert 1f14df6` |
-| E6 vyhlazení cíle kurzu | `heading_target_smooth` | vypnuto | jen přehrání jízd: skoky kurzu 147–515 → 22–79 | `git revert bc5652f` |
+| D3 dotáčení při předání podle EKF | `handover_follow_ekf` | vypnuto | série 4 (2 proti 2): nadbytečné otáčení 34 a 25° → 10 a 8°, ale rozkmit kurzu ve stoje nejasný (std 1,04 a 0,51° proti 0,45 a 0,39°) – doměřit | – |
+| D4 plynulý první zápis dokové pózy | `dock_engage_slew_mps` 0,10 | **zapnuto** | série 4 (2 proti 2): skok při zadokování 16,1 a 6,4 cm → 0,37 a 0,38 cm; 3,3 a 2,4° → 0,38 a 0,28° | `git revert 856fd6b` |
+| E5 navsat ve vlastním vlákně | `navsat_async` | **zapnuto** | série 4 (2 proti 8): největší mezera `/tf` 0,95–1,36 s → 0,13–0,14 s | `git revert c998e8d` |
+| E6 vyhlazení cíle kurzu | `heading_target_smooth` | vypnuto | série 4 (2 proti 2): kroky kurzu > 0,3° 387 a 209 → 184 a 186, rozkmit ve stoje 5,7 a 3,7° → 4,1 a 2,8°; rozdíl v rozptylu jízd, kroky EKF > 3 cm mírně víc – doměřit | – |
 | Hlídač kurzu magnetometrem (T35) | `mag_check_enable`, `mag_disagree_deg` 15 | **zapnuto**, jen hlásí | zpětný přepočet jízd: 0 planých poplachů i při 10° | `git revert d1f73c9` |
 
 Past měření (15. 11.): běh `nav_s3_d3_1` jel ve skutečnosti s D2, měřicí skript restartoval cizí proces (hledání PID bez ukotvení). Skóre toho běhu se počítá k D2.
+
+Série 4 (15.–16. 11., 10 jízd, výchozí = D1+D2): zátěž stroje 14–43 (první kolo souběžně s testy agentů), závěry jen z rozdílů shodných v obou kolech. Skóre `nav_s4_*`.
 
 ## 1. Rámce a kdo je píše
 

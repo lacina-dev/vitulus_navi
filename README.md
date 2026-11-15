@@ -31,6 +31,37 @@ reachable from the web node can arm a fence (AGENT.md §11.1, §11.5). The
 canonical geofence *loader* the supervisor consumes remains the agent's
 `geofence.py`; the copies here are used only to pre-validate proposals.
 
+## Walked first write of the dock anchor (`navi_transform`, off by default)
+
+While docked, the robot's map pose is put on the `DOCKED` waypoint by two
+writers: the pulse of `dock_localization_seed` (`/nav_tf/set_map_pose_dock`,
+0.1–1.3 s after the docked edge, only without good GPS) and then the dock hold
+of `navi_transform` (30 Hz, from 2 s after the edge). Whichever writes first
+used to move the pose by the whole error collected on the way in within one tick
+(recorded: 23.8 cm / 2.0°, 19.0 cm / 0.8°, 17.1 cm / 2.3°, all three by the
+seed's pulse). With `~dock_engage_slew_mps` > 0 (e.g. `0.10`) that first
+correction is walked: the error is kept as an offset from the waypoint and
+shrunk straight to zero at this speed and `~dock_engage_slew_dps` (5), at most
+one 30 Hz step per tick (0.33 cm / 0.17° at 0.10 m/s). A pulse that comes while
+docked starts the walk instead of writing; the hold takes a running walk over
+from where it is when it engages, and after the walk it is the usual exact hold.
+Further pulses are ignored while a walk runs. On the three replayed dockings:
+17–24 cm → at most 0.40 cm per tick, done in 1.9–2.6 s (the heading keeps the
+EKF's own tick noise, up to 0.3–0.5° at rest with or without this, plus at most
+0.17° of the walk).
+
+Immediate as before: `0` (default); a fresh start (map → odom not placed by
+anyone yet); an error over `~dock_engage_slew_max_m` (1.0) or
+`~dock_engage_slew_max_deg` (15); a dock pulse when the robot is not docked or
+the dock feed is stale. The sanity bound `~dock_anchor_max_hold_m`, the
+debounce, `dock_hold_active` / `dock_suppressing` in `loc_status` and the
+release on undock are unchanged. The walk ends at once – the pose stays where it
+got, up to the rest of the error short of the waypoint, and nothing is left
+blocked – on undock, on a stale dock feed, on a map change, and before the hold
+engages also when anyone else writes map → odom.
+**Switch off:** remove the parameter or set it to `0` and restart
+`navi_transform`. Test: `tools/test_t36_d4_dock_engage.py`.
+
 ## Dependencies note
 
 The global costmap uses the memoryless obstacle layer registered as

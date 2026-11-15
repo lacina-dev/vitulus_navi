@@ -1089,6 +1089,25 @@ class NavTfNode:
         # teleporting the pose — degrade to "reject", never to "confidently wrong".
         self._dock_anchor_max_hold_m = float(
             rospy.get_param('~dock_anchor_max_hold_m', 3.0))
+        # T36 D4 (0 = off = the first write is immediate, as before): the first
+        # write of the dock anchor after docking moved the robot's map pose by
+        # the whole error collected on the way in at once (17-24 cm and
+        # 0.8-2.3 deg in one 30 Hz tick). On the robot that first write is the
+        # dock seed's pulse (/nav_tf/set_map_pose_dock, 0.1-1.3 s after the
+        # docked edge), and only without it the hold's first engage (after
+        # dock_anchor_debounce_s). > 0: either of them is walked at this speed
+        # (and dock_engage_slew_dps) - only while docked, when map->odom has
+        # been placed by someone and the correction is under
+        # dock_engage_slew_max_m / _max_deg; after a fresh start and above
+        # those it stays immediate. See _dock_engage_pulse / _walk_tick / _step.
+        self._dock_engage_slew_mps = float(rospy.get_param('~dock_engage_slew_mps', 0.0))
+        self._dock_engage_slew_dps = float(rospy.get_param('~dock_engage_slew_dps', 5.0))
+        self._dock_engage_slew_max_m = float(rospy.get_param('~dock_engage_slew_max_m', 1.0))
+        self._dock_engage_slew_max_deg = float(rospy.get_param('~dock_engage_slew_max_deg', 15.0))
+        self._dock_engage_off = None       # (x, y, yaw) still to walk, None = no walk
+        self._dock_engage_last_t = None
+        self._dock_engage_anchor = None    # pose the seed's pulse asked for (walk before the hold)
+        self._dock_engage_wrote = None     # map->odom the walk wrote last tick (before the hold)
         self._dock_anchor_point = rospy.get_param('~dock_anchor_point', 'DOCKED')
         self._dock_anchor_refresh_s = float(
             rospy.get_param('~dock_anchor_refresh_s', 30.0))
@@ -1431,8 +1450,165 @@ class NavTfNode:
         # a different map places the dock somewhere else entirely — the next
         # engage is an initial PLACEMENT again, not creep (see dock_anchor_hold)
         self._dock_hold_active = False
+        self._dock_engage_off = None       # T36 D4: a walk to the old map's dock ends
         rospy.loginfo('[dock_hold] %s -> "%s": re-fetching the "%s" '
                       'waypoint', what, name, self._dock_anchor_point)
+
+    def _dock_engage_docked(self):
+        """T36 D4: docked by a fresh dock feed (the hold's own condition
+        without the debounce) - the only state in which a walk may run."""
+        if not self._dock_anchor_enable:
+            return False
+        if self._dock_status_val != 0 or self._docked_since is None:
+            return False
+        return not (self._dock_status_rx_t and (
+            rospy.get_time() - self._dock_status_rx_t > self._dock_status_stale_s))
+
+    def _dock_engage_error(self, anchor, ob):
+        """T36 D4: (x, y, yaw) of the robot's map pose off `anchor` when that is
+        to be walked - map->odom placed by someone and the error within
+        dock_engage_slew_max_m / _max_deg - else None (= immediate write)."""
+        with self._map_odom_lock:
+            t = self.map_odom_transform.transform.translation
+            mx, my, myaw = t.x, t.y, self.map_odom_yaw
+        c, s = math.cos(myaw), math.sin(myaw)
+        e_x = mx + c * ob[0] - s * ob[1] - anchor[0]
+        e_y = my + s * ob[0] + c * ob[1] - anchor[1]
+        e_yaw = myaw + ob[2] - anchor[2]
+        e_yaw = math.atan2(math.sin(e_yaw), math.cos(e_yaw))
+        if self._map_odom_placed \
+                and math.hypot(e_x, e_y) <= self._dock_engage_slew_max_m \
+                and abs(e_yaw) <= math.radians(self._dock_engage_slew_max_deg):
+            return (e_x, e_y, e_yaw)
+        return None
+
+    def _dock_engage_shrink(self):
+        """T36 D4: one 30 Hz step of the running walk - the offset shrinks
+        straight to zero by at most dock_engage_slew_mps / _dps. Returns the
+        offset left, None = arrived (the walk is over)."""
+        off = self._dock_engage_off
+        if off is None:
+            return None
+        now = rospy.get_time()
+        last, self._dock_engage_last_t = self._dock_engage_last_t, now
+        # a late tick does not get a bigger step (<= 0.33 cm at 0.10 m/s)
+        dt = 1.0 / 30.0 if last is None else min(max(now - last, 1.0 / 60.0), 1.0 / 30.0)
+        step = self._dock_engage_slew_mps * dt
+        yaw_step = math.radians(self._dock_engage_slew_dps) * dt
+        dist = math.hypot(off[0], off[1])
+        if dist <= step and abs(off[2]) <= yaw_step:
+            self._dock_engage_off = None
+            return None
+        f = 0.0 if dist <= step else (dist - step) / dist
+        off = (off[0] * f, off[1] * f,
+               off[2] - math.copysign(min(abs(off[2]), yaw_step), off[2]))
+        self._dock_engage_off = off
+        return off
+
+    def _dock_engage_start(self, e, who):
+        self._dock_engage_last_t = None
+        self._dock_engage_wrote = None
+        self._dock_engage_off = e
+        if math.hypot(e[0], e[1]) > 0.005 or abs(e[2]) > math.radians(0.3):
+            rospy.loginfo('[dock_hold] %s: walking the map pose %.3f m / %.1f deg '
+                          'to the dock anchor at %.2f m/s, %.1f deg/s', who,
+                          math.hypot(e[0], e[1]), math.degrees(e[2]),
+                          self._dock_engage_slew_mps, self._dock_engage_slew_dps)
+
+    def _dock_engage_pulse(self, wanted, ob):
+        """T36 D4: a dock-source map pose (the dock seed's pulse) in
+        callback_set_map_pose. True = taken over by the walk, the caller writes
+        nothing: either a walk is running (the hold's or an earlier pulse's -
+        an instant write would jump to the waypoint and the next tick back onto
+        the walk), or this pulse starts one - docked, the hold not engaged yet,
+        map->odom placed and the error within the bounds; the 30 Hz loop
+        (_dock_engage_walk_tick) then walks the pose to `wanted`. False = the
+        instant write as before: not docked (also ends a walk left over from
+        the dock), fresh start, over the bounds, hold engaged and settled."""
+        if not self._dock_engage_docked():
+            self._dock_engage_off = None
+            return False
+        if self._dock_engage_off is not None:
+            return True
+        if self._dock_hold_active:
+            return False
+        e = self._dock_engage_error(wanted, ob)
+        if e is None:
+            return False
+        self._dock_engage_anchor = wanted
+        self._dock_engage_start(e, 'dock seed pulse')
+        return True
+
+    def _dock_engage_walk_tick(self):
+        """T36 D4 (30 Hz, the dock hold not owning the pose - debounce, no
+        DOCKED waypoint cached): the walk a dock seed pulse started. Places the
+        robot on pulse pose + the shrinking offset from the live odom->base,
+        exactly like the hold, with the hold's bookkeeping (dock source stamped,
+        drift budget restarted). Ends without a write when the robot is not
+        docked any more (the pose stays where the walk got and nothing is left
+        blocked) or when anyone else has written map->odom since the last tick.
+        The hold's first engage takes a running walk over from where it is."""
+        if self._dock_engage_off is None:
+            return
+        if not self._dock_engage_docked():
+            self._dock_engage_off = None
+            return
+        anchor = self._dock_engage_anchor
+        if anchor is None:                 # the hold's own walk, hold lost its waypoint
+            self._dock_engage_off = None
+            return
+        ob = self.get_base_link_transform()
+        if ob is None:
+            return
+        q = ob.transform.rotation
+        ob = (ob.transform.translation.x, ob.transform.translation.y,
+              euler_from_quaternion([q.x, q.y, q.z, q.w])[2])
+        with self._map_odom_lock:
+            cur = self.map_odom_transform.transform.translation
+            wrote = self._dock_engage_wrote
+            if wrote is not None and wrote != (cur.x, cur.y, self.map_odom_yaw):
+                self._dock_engage_off = None       # someone else owns it now
+                return
+            off = self._dock_engage_shrink() or (0.0, 0.0, 0.0)
+            tx, ty, m = dock_hold_map_odom(
+                (anchor[0] + off[0], anchor[1] + off[1], anchor[2] + off[2]), ob)
+            cur.x = tx
+            cur.y = ty
+            self.map_odom_yaw = m
+            self._dock_engage_wrote = (tx, ty, m)
+            self._map_pose_target = None
+            self._map_odom_placed = True
+            self._georef_target = None
+            self._yaw_level = False
+        self._map_pose_last_accept['dock'] = rospy.get_time()
+        self._budget_path_m = 0.0
+        self._budget_rot_deg = 0.0
+        self._budget_used_m = 0.0
+        self._budget_used_deg = 0.0
+
+    def _dock_engage_step(self, anchor, ob, first_engage, tx, ty, m):
+        """T36 D4 (~dock_engage_slew_mps > 0): the map->odom the engaged hold
+        writes this tick. Normally the full hold (tx, ty, m) as given. On the
+        first engage of a docking, when map->odom is already placed and the
+        robot's map pose is within dock_engage_slew_max_m / _max_deg of the
+        dock anchor, that error is kept as an offset from the anchor and
+        shrunk to zero - at most dock_engage_slew_mps and dock_engage_slew_dps,
+        straight - and the hold places the robot on anchor + offset (exactly,
+        from the live odom->base, like the hold itself). Offset zero: the usual
+        hold. Decided anew at every first engage from the pose as it is, so a
+        walk the seed's pulse started simply goes on from where it got, and a
+        walk cut short by an undock leaves nothing behind."""
+        if first_engage:
+            self._dock_engage_off = None
+            self._dock_engage_anchor = None
+            e = self._dock_engage_error(anchor, ob)
+            if e is not None:
+                self._dock_engage_start(e, 'engage')
+        off = self._dock_engage_shrink()
+        if off is None:
+            return tx, ty, m                        # arrived / no walk: exact hold
+        return dock_hold_map_odom(
+            (anchor[0] + off[0], anchor[1] + off[1], anchor[2] + off[2]), ob)
 
     def dock_anchor_hold(self):
         """A2 (30 Hz): while docked, map->odom == docked_waypoint (.) inv(odom->base)
@@ -1444,9 +1620,13 @@ class NavTfNode:
                 rospy.logwarn('[dock_hold] RELEASED (dock_status=%s) — pose '
                               'returns to the normal arbiter',
                               self._dock_status_val)
+            if getattr(self, '_dock_engage_slew_mps', 0.0) > 0.0:      # T36 D4
+                self._dock_engage_walk_tick()
             return
         anchor = self._dock_anchor_pose
         if anchor is None:
+            if getattr(self, '_dock_engage_slew_mps', 0.0) > 0.0:      # T36 D4
+                self._dock_engage_walk_tick()
             rospy.logwarn_throttle(
                 30.0, '[dock_hold] docked but the "%s" waypoint is not available '
                 '— dock hold INACTIVE (pose runs on odometry)',
@@ -1468,6 +1648,10 @@ class NavTfNode:
         # from the dock). That placement is the same unconditional ground-truth
         # snap the old one-shot dock seed did; it is logged loudly instead.
         first_engage = not self._dock_hold_active
+        if getattr(self, '_dock_engage_slew_mps', 0.0) > 0.0:      # T36 D4
+            tx, ty, m = self._dock_engage_step(
+                anchor, (ob.transform.translation.x, ob.transform.translation.y,
+                         odom_yaw), first_engage, tx, ty, m)
         with self._map_odom_lock:
             cur = self.map_odom_transform.transform.translation
             hold_m = math.hypot(tx - cur.x, ty - cur.y)
@@ -1607,6 +1791,11 @@ class NavTfNode:
             rospy.loginfo_throttle(
                 10.0, "[set_map_pose] '%s' micro-correction %.3f m / %.2f deg "
                 "allowed near dock", source, _sd, math.degrees(_sy))
+        if source == 'dock' and getattr(self, '_dock_engage_slew_mps', 0.0) > 0.0 \
+                and self._dock_engage_pulse(
+                    (msg.pose.position.x, msg.pose.position.y, wanted_yaw),
+                    (ob_x, ob_y, odom_yaw)):
+            return      # T36 D4: walked by the 30 Hz loop instead of the instant write
         # SMOOTH (2026-07-12): a slewed source records the TARGET; slew_map_pose()
         # in the 30 Hz loop walks the live map->odom toward it at bounded speed so
         # the pose no longer snaps to each 1 Hz tracker minimum. A big mismatch

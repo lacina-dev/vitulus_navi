@@ -28,6 +28,11 @@
             <param name="dock_anchor_enable" value="true"/>
             <param name="dock_anchor_debounce_s" value="2.0"/>
             <param name="dock_anchor_max_hold_m" value="3.0"/>
+            <!-- T36 D4 2026-11-16 prvni zapis dokove pozy po zadokovani plynule (0.10 m/s)
+                 misto skoku: 2 jizdy proti 2, skok pri zadokovani 16.1 a 6.4 cm -> 0.37 a
+                 0.38 cm, natoceni 3.3 a 2.4 deg -> 0.38 a 0.28 deg.
+                 ROLLBACK: dock_engage_slew_mps:=0.0 -->
+            <param name="dock_engage_slew_mps" value="0.10"/>
             <!-- A3: no non-dock source may write map->odom around dock ops
                  (was tracker-only); micro refinements still pass.
                  ROLLBACK: dock_gate_non_dock:=false -->

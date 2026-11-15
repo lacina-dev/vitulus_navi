@@ -10,6 +10,18 @@ Zdroje čísel: **[B]** = `~/bags/nav_test/nav_baseline_2026-11-15_a.bag` (2× d
 
 ---
 
+## Stav vypínačů úprav (15. 11. 2026 12:35)
+
+| Úprava | Parametr | Stav | Důkaz | Vrácení |
+|---|---|---|---|---|
+| D1 rychlost odometrie z kol při výpadku EKF | `odom_twist_from_wheels` | **zapnuto** | jízda: výpadky nulové rychlosti 2,0 % → 0,03 % | `git revert 3ef52fc` |
+| D2 kurz mezi vzorky RTK z IMU | `heading_imu_interp` | **zapnuto** | 3 jízdy proti 3 výchozím: skoky kurzu mapy nad 0,3° 31–40 → 4–24, zamrznutí kotvy kurzu 5–7 → 2, zastaralé TF 3–10 % → 0,7–2,8 % | `git revert 91a24d7` |
+| D3 dotáčení při předání podle EKF | `handover_follow_ekf` | vypnuto | 1 jízda, nerozlišitelné od rozptylu | – |
+| D4 plynulý první zápis dokové pózy | `dock_engage_slew_mps` | vypnuto (0) | neměřeno | – |
+| Hlídač kurzu magnetometrem (T35) | `mag_check_enable`, `mag_disagree_deg` 15 | **zapnuto**, jen hlásí | zpětný přepočet jízd: 0 planých poplachů i při 10° | `git revert d1f73c9` |
+
+Past měření (15. 11.): běh `nav_s3_d3_1` jel ve skutečnosti s D2, měřicí skript restartoval cizí proces (hledání PID bez ukotvení). Skóre toho běhu se počítá k D2.
+
 ## 1. Rámce a kdo je píše
 
 ### 1.1 Transformace
@@ -63,7 +75,7 @@ Spouští je `navi_transform` při svém startu (NT:498, 1135-1140; `launch/vitu
 | Lidar tracker (gloc) | `/nav_tf/set_map_pose_tracker` | 5 Hz | `map→odom` plynule | jen bez použitelného fixu (`track_active_mode fix_lost`, GL:403), rozpočet driftu |
 | Lidar relock (gloc) | `/nav_tf/set_map_pose_relock` | – | `map→odom` | **vypnuto** (`relock_enable false`, ML:58); zbývá ruční `/gloc/apply` |
 | rtabmap | `/nav_tf/set_map_pose_rtabmap` | – | – | neběží |
-| Magnetometr | `/bno085/mag_heading` | 7,7 Hz | nikam | jen publikuje; hlídač `mag_check_enable` výchozí vypnuto (NT:2350) |
+| Magnetometr | `/bno085/mag_heading` | 7,7 Hz | nikam | jen publikuje; hlídač `mag_check_enable` **zapnut 15. 11.** v ML (práh 15°, jen hlásí do `loc_status`) (NT:2350) |
 | VO, lidar ICP | `/vo/odom`, `/licp/odom_cov` | – | navigační EKF (rychlosti) | most do pózy vypnut (`~bridge/live_enable`, `~bridge/compute_enable` false, NT:2023, 2030) |
 
 ### 2.2 Vlastník pózy (`owner` v `/nav_tf/loc_status`)
@@ -262,7 +274,7 @@ Nárazník, zvednutí a tlačítko STOP v softwaru nenalezeny (hardwarový STOP:
 | `dock_anchor_enable` / `_debounce_s` / `_max_hold_m` | true / 2,0 / 3,0 | držení doku | ML:26-28 |
 | `dock_gate_non_dock`, `dock_micro_m/deg` | true, 0,05 / 1,0 | potlačení ostatních u doku | ML:32-34 |
 | `dock_status_fail_closed`, `_stale_s` | true, 5,0 | bez stavu doku se opravy zahazují | ML:38-39 |
-| `rewind_enable`, `bridge/live_enable`, `bridge/compute_enable`, `mag_check_enable` | false | vypnuté větve | NT:749, 2023, 2030, 2350 |
+| `rewind_enable`, `bridge/live_enable`, `bridge/compute_enable` | false | vypnuté větve | NT:749, 2023, 2030, 2350 |
 | gloc `relock_enable` | **false** (launch) | automatický relock | ML:58 |
 | gloc `track_rate_hz`, `track_active_mode` | 5, `fix_lost` | kdy tracker opravuje | GL:135, 403 |
 | EKF `frequency`, `two_d_mode` | 30, false | – | EKF:11-13, 93-95 |
@@ -334,7 +346,7 @@ U [B] jsou časy po opuštění doku maximum ze dvou výjezdů; druhý výjezd: 
 - `relock_enable false` (ML:58; teleport 4,68 m 2026-07-19). Následek: robot ztracený bez GPS se sám nenajde.
 - rtabmap: kanály `set_map_pose_rtabmap`, `rtabmap_confident`, `/rtabmap/initialpose` existují, nikdo je neplní.
 - `/nav_tf/set_heading`, `/nav_tf/set_dock_pose` (NT:1180, 3585): bez volajícího [živě].
-- `gnss_watchdog` vypnutý (`vitulus_gnss/launch/vitulus_ardusimple_gnss.launch:28`); `mag_check_enable` vypnutý.
+- `gnss_watchdog` vypnutý (`vitulus_gnss/launch/vitulus_ardusimple_gnss.launch:28`); `mag_check_enable` od 15. 11. zapnutý (jen hlásí).
 - `src/vitulus_navi/smach_states/*` nikdo neimportuje. `TrajectoryPlannerROS`, parametry DWA/Neo/Graceful, blok `laser_layer` (`local_costmap_params.yaml:29-46`): načtené, nepoužité.
 - `dock_smach:722` `# TODO: Implement lidar map navigation` (stav vrací úspěch po 1 s).
 - Zavádějící jména: `loop3sec` běží 10 Hz (NT:3808-3814); uzel se v kódu hlásí jako `GNSS_node`, v grafu je `/navi_transform`.
@@ -354,7 +366,7 @@ U [B] jsou časy po opuštění doku maximum ze dvou výjezdů; druhý výjezd: 
 | Rozbor: „`dr↔gps` až 30× za hodinu" | **Částečně**: 17 a 25 za hodinu v obou nahrávkách; 30 neověřeno. |
 | Rozbor: „no goal progress 195× na 2 444 m" | **Potvrzeno** [S]; jde o události `rewindow`. |
 | Rozbor: „nesoulad dok/GPS/lidar 14–54 cm" | **Částečně**: skok při zadokování 17–24 cm [B, M]; 54 cm neověřeno. |
-| Zadání: „D1–D4 už běží" | **Neplatí pro živý robot.** D1–D4 jsou commity ve větvi `t36-d` (`09b2090`, `60d4c10`, `9278038`, `41dacd9`), vše výchozí vypnuto; živý uzel běží z `main` @ `30eca80` a parametry nemá nastavené [živě]. |
+| Zadání: „D1–D4 už běží" | **Neplatí pro živý robot.** D1–D4 jsou commity ve větvi `t36-d` (`09b2090`, `60d4c10`, `9278038`, `41dacd9`), vše výchozí vypnuto; živý uzel běží z `main` @ `30eca80` a parametry nemá nastavené [živě]. | **Stav 15. 11. 12:35:** D1–D4 jsou v `main`; v ML zapnuto D1 (`3ef52fc`) a D2 (`91a24d7`), D3 a D4 vypnuté do změření.
 | Paměť: „restart navi_man = sirotek depth_obstacles", „catkin stub" | Neověřováno (mimo rozsah); ber jako platné pasti. |
 
 ---

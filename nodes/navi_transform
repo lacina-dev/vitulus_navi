@@ -70,6 +70,15 @@ def pol2cart(rho, phi):
     return x, y
 
 
+def navsat_async_should_start(launched, starting, fused_fix_s, fused_nav_s, now_s, retry_t):
+    """T36 E5 (~navsat_async): start a navsat launch thread now? The launch
+    condition is the one of init_navsat (position and heading fused within the
+    last second, navsat not launched); on top of it only one launch at a time
+    and not before retry_t (set after a failed launch)."""
+    return (not launched and not starting and now_s >= retry_t
+            and fused_fix_s < 1.0 and fused_nav_s < 1.0)
+
+
 # ---- DOCKFIX-2026-08-29: pure helpers (unit-tested offline, see
 #      vitulus_navi/tools/test_dockfix_gates.py) -----------------------------
 
@@ -495,6 +504,16 @@ class NavTfNode:
     def __init__(self):
         self.launch_ekf = None
         self.launch_navsat = None
+        # T36 E5 (off by default = navsat is launched inside the 30 Hz loop as
+        # before): roslaunch of navsat_transform takes 1.1-1.9 s and ran in
+        # init_navsat, i.e. in the loop that broadcasts map->odom and
+        # odom->base_link - /tf stood still that long at every (re)launch. On:
+        # the launch runs in its own thread, the loop only starts it. A failed
+        # launch is retried after navsat_async_retry_s.
+        self._navsat_async = bool(rospy.get_param('~navsat_async', False))
+        self._navsat_async_retry_s = float(rospy.get_param('~navsat_async_retry_s', 5.0))
+        self._navsat_starting = False      # a launch thread is running
+        self._navsat_retry_t = 0.0         # no new launch before this time (after a failure)
         self.roslaunch_ekf()
         self.base_odom_msg = Odometry()
         self.base_odom_msg.pose.pose.orientation.w = 1
@@ -1207,7 +1226,58 @@ class NavTfNode:
         self.launch_navsat.start()
         rospy.loginfo("<{}> Navsat launched.".format(rospy.get_caller_id()))
 
+    def _navsat_launch_async(self):
+        """T36 E5 (~navsat_async): start the navsat launch in a thread of its
+        own; returns at once. One launch at a time."""
+        self._navsat_starting = True
+        note = (f"fused_fix={self.fused_fix_time:.3f}s fused_nav={self.fused_nav_time:.3f}s "
+                f"fix_usable={self.fix_usable} heading_usable={self.heading_fix_usable} "
+                f"rtk_err={self.rtk_err:.5f} is_indoor={self.is_indoor}")
+        th = threading.Thread(target=self._navsat_launch_worker, args=(note,),
+                              name='navsat_launch')
+        th.daemon = True
+        th.start()
+
+    def _navsat_launch_worker(self, note):
+        """T36 E5: what roslaunch_navsat does, off the 30 Hz loop. launch_navsat
+        is set BEFORE the start (as in roslaunch_navsat), so everything that
+        asks 'is navsat launched' sees the same as before during the start."""
+        mine = None
+        try:
+            rospy.logwarn("[navi_transform] Launching navsat_transform (async): " + note)
+            uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
+            roslaunch.configure_logging(uuid)
+            mine = roslaunch.parent.ROSLaunchParent(
+                uuid, [os.path.join(NAVI_PKG_DIR, "launch", "vitulus_navsat.launch")])
+            self.launch_navsat = mine
+            mine.start()
+            rospy.loginfo("<{}> Navsat launched.".format(rospy.get_caller_id()))
+            if self.launch_navsat is not mine:
+                # stopped / replaced while it was starting (indoor->outdoor
+                # restart): this one must not stay running beside the next
+                rospy.logwarn("[navi_transform] navsat launch superseded during its start - stopping it")
+                mine.shutdown()
+        except Exception as e:
+            rospy.logerr("[navi_transform] navsat launch failed: %s - retry in %.0f s"
+                         % (e, self._navsat_async_retry_s))
+            try:
+                if mine is not None:
+                    mine.shutdown()
+            except Exception:
+                pass
+            if self.launch_navsat is mine:
+                self.launch_navsat = None
+            self._navsat_retry_t = rospy.get_time() + self._navsat_async_retry_s
+        finally:
+            self._navsat_starting = False
+
     def init_navsat(self):
+        if getattr(self, '_navsat_async', False):      # T36 E5
+            if navsat_async_should_start(self.launch_navsat is not None, self._navsat_starting,
+                                         self.fused_fix_time, self.fused_nav_time,
+                                         rospy.get_time(), self._navsat_retry_t):
+                self._navsat_launch_async()
+            return
         if self.launch_navsat is None:
             if self.fused_fix_time < 1.0 and self.fused_nav_time < 1.0:
                 rospy.logwarn(

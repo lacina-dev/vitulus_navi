@@ -49,6 +49,16 @@ def _navi_pkg_dir():
 NAVI_PKG_DIR = _navi_pkg_dir()
 
 
+def ekf_launch_files(path, nav_ekf_gyro=False):
+    """T36 J2: what roslaunch gets for the two EKFs. Without ~nav_ekf_gyro the
+    bare path (as before); with it the launch file's argument that loads
+    config/ekf/ekf_nav_gyro.yaml over the base config (the nav EKF then also
+    fuses the yaw rate of the gyro)."""
+    if not nav_ekf_gyro:
+        return [path]
+    return [(path, ['nav_ekf_gyro:=true'])]
+
+
 def _dock_point_pose(srv, name):
     """get_point_pose answer for a dock point. A navi_man not restarted yet still
     holds `docked`; this goes when no such navi_man can exist."""
@@ -1920,9 +1930,13 @@ class NavTfNode:
     def roslaunch_ekf(self):
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
         roslaunch.configure_logging(uuid)
-        self.launch_ekf = roslaunch.parent.ROSLaunchParent(uuid, [os.path.join(NAVI_PKG_DIR, "launch", "vitulus_ekf_outdoor.launch")])
+        # T36 J2 (~nav_ekf_gyro, default off = the same launch as before)
+        gyro = bool(rospy.get_param('~nav_ekf_gyro', False))
+        self.launch_ekf = roslaunch.parent.ROSLaunchParent(uuid, ekf_launch_files(
+            os.path.join(NAVI_PKG_DIR, "launch", "vitulus_ekf_outdoor.launch"), gyro))
         self.launch_ekf.start()
-        rospy.loginfo("<{}> EKF launched.".format(rospy.get_caller_id()))
+        rospy.loginfo("<{}> EKF launched{}.".format(
+            rospy.get_caller_id(), " (nav EKF with the gyro yaw rate, ~nav_ekf_gyro)" if gyro else ""))
 
     def roslaunch_navsat(self):
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)

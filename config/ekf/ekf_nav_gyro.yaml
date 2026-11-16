@@ -1,0 +1,17 @@
+# T36 J2 (~nav_ekf_gyro of navi_transform, default off): laid OVER
+# ekf_base_outdoor.yaml by launch/vitulus_ekf_outdoor.launch nav_ekf_gyro:=true.
+# Only what differs from the base config is here.
+#
+# The nav EKF gets the absolute roll / pitch / yaw of /gnss_heading/nav_fused
+# (IMU orientation + the GNSS heading offset) and no yaw RATE from the IMU, so
+# while the robot turns its yaw is 0.04-0.08 s behind the gyro (0.4 s windows:
+# up to 6-8 deg off). nav_fused carries the angular velocity of /bno085/imu
+# unchanged (frame bno_imu_link = chassis axes, relabelled base_link;
+# covariance 0.025 (rad/s)^2 on the diagonal), so the same input can give the
+# yaw rate as well: index 11 (vyaw) true. Roll / pitch rates stay off.
+ekf_wheel_nav_odometry:
+  imu0_config: [ false, false, false,
+                 true,  true,  true,
+                 false, false, false,
+                 false, false, true,
+                 false, false, false ]

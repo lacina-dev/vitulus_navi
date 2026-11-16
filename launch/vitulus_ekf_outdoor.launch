@@ -1,6 +1,12 @@
 <launch>
 
+  <!-- T36 J2: true = the nav EKF also fuses the yaw rate of the gyro
+       (config/ekf/ekf_nav_gyro.yaml laid over the base config). Set by
+       navi_transform from its ~nav_ekf_gyro; default false = the base config only. -->
+  <arg name="nav_ekf_gyro" default="false"/>
+
   <rosparam command="load" file="$(find vitulus_navi)/config/ekf/ekf_base_outdoor.yaml" />
+  <rosparam if="$(arg nav_ekf_gyro)" command="load" file="$(find vitulus_navi)/config/ekf/ekf_nav_gyro.yaml" />
 
   <node pkg="robot_localization" type="ekf_localization_node" name="ekf_wheel_odometry" clear_params="true">
     <!-- "Received set_pose request" INFO off (WARN/ERROR stay), see the config -->

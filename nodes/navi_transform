@@ -243,6 +243,77 @@ def utm_zone_of(lon):
     return int((lon + 180.0) / 6.0) + 1
 
 
+# ---- T36 N1: the heading rides the gyro on the last metres into the dock
+# (pure; tools/test_t36_n1_heading_hold_near_dock.py). In front of the garage
+# the RTK heading is wrong in its last seconds while it still passes every
+# quality gate (48 of 50 arrivals more than 4 deg off). While the robot DOCKS
+# - dock_smach reports `docking` (/dock_smach/dock_status 2: the docking
+# program runs, from its start to the charging contacts) - and is within
+# radius_m of the DOCKED waypoint, no RTK heading sample is taken; the gyro of
+# the IMU carries the heading (0.03 deg/min standing, at most 0.3; a docking
+# spends ~55 s and 4.4 m in the zone). Never in another dock state: 0 docked,
+# 1 undocking (it stays 1 after the way out), 3 undocked (mowing near the
+# dock), 4 failed, 5 unknown, nor with the state stale or the DOCKED waypoint
+# unknown. The fuse: one hold lasts at most max_s and max_m of driving; then
+# the RTK heading is taken again until the robot leaves the zone or the dock
+# state changes.
+HEADING_HOLD_DEFAULTS = {
+    'radius_m': 3.5,       # hold inside this distance from the DOCKED waypoint
+    'leave_m': 0.5,        # ... and until radius_m + leave_m once it runs
+    'max_s': 90.0,         # a hold lasts at most this long ...
+    'max_m': 8.0,          # ... and this much driving
+}
+HEADING_HOLD_DOCKING = 2   # /dock_smach/dock_status while the docking program runs
+
+
+def heading_hold_new_state():
+    return {'hold': False, 'since': None, 'path': 0.0, 'xy': None, 'spent': False,
+            'end': '', 'last_s': 0.0, 'last_m': 0.0, 'count': 0, 'fuse_count': 0}
+
+
+def heading_hold_step(st, now, dock_status, dock_dist_m, xy, cfg=None):
+    """One step (every RTK heading sample and every loc_status). dock_status:
+    the fresh /dock_smach/dock_status, None when unknown or stale;
+    dock_dist_m: distance from the DOCKED waypoint, None when unknown; xy: a
+    pose no correction moves (wheel EKF), only its steps are used.
+    Returns (new_state, hold); st is not modified. state['end'] says why the
+    last hold ended: 'docked', 'dock_state' (the docking stopped), 'left_zone',
+    'dock_unknown', 'fuse_time', 'fuse_dist'."""
+    c = dict(HEADING_HOLD_DEFAULTS)
+    if cfg:
+        c.update(cfg)
+    st = dict(st)
+    step = 0.0
+    if st['xy'] is not None and xy is not None:
+        step = math.hypot(xy[0] - st['xy'][0], xy[1] - st['xy'][1])
+        if not math.isfinite(step) or step > 1.0:      # a reset of the odometry
+            step = 0.0
+    st['xy'] = xy
+    known = dock_dist_m is not None and math.isfinite(dock_dist_m)
+    limit = c['radius_m'] + (c['leave_m'] if (st['hold'] or st['spent']) else 0.0)
+    docking = dock_status == HEADING_HOLD_DOCKING
+    if not (docking and known and dock_dist_m <= limit):
+        if st['hold']:
+            st.update(hold=False, last_s=now - st['since'], last_m=st['path'],
+                      end=('docked' if dock_status == 0 else 'dock_state' if not docking
+                           else 'dock_unknown' if not known else 'left_zone'))
+        st.update(spent=False, since=None, path=0.0)
+        return st, False
+    if st['spent']:
+        return st, False
+    if not st['hold']:
+        st.update(hold=True, since=now, path=0.0, end='', count=st['count'] + 1)
+        return st, True
+    st['path'] = st['path'] + step
+    over = 'fuse_time' if (now - st['since']) > c['max_s'] else \
+        'fuse_dist' if st['path'] > c['max_m'] else ''
+    if over:
+        st.update(hold=False, spent=True, end=over, last_s=now - st['since'],
+                  last_m=st['path'], fuse_count=st['fuse_count'] + 1)
+        return st, False
+    return st, True
+
+
 def utm_band_of(lat):
     """MGRS latitude band letter (C..X, 8 deg each from 80 S; X is 12 deg)."""
     if lat is None or not (-80.0 <= lat <= 84.0):
@@ -1936,6 +2007,7 @@ class NavTfNode:
         # in the grid vs the grid convergence) + the live map-vs-GPS deviation
         # (gps-map-probe dD). JSON, latched, 1 Hz from loop1hz.
         self.georef_status_pub = rospy.Publisher("/nav_tf/georef_status", String, queue_size=1, latch=True)
+        self._hhd_setup()     # T36 N1 (~heading_hold_near_dock, default off)
         # FIX4 (telemfix): edge-triggered loc_status. Baseline stays 1 Hz; on an
         # owner-change edge publish_loc_status is called immediately so an
         # ownership transition is not smeared into the next 1 Hz tick.
@@ -3529,6 +3601,9 @@ class NavTfNode:
                 'heading_ok': bool(self._heading_ok()),
                 'docked': bool(self._docked),
                 'probation_proven': bool(self._gps_proven),
+                # T36 N1 (only with ~heading_hold_near_dock): heading_hold, _s,
+                # _m, _end, _count, _fuse_count
+                **(self._hhd_fields() if getattr(self, '_hhd_enable', False) else {}),
                 'rtabmap_confident': bool(self._rtabmap_confident),
                 'anchor_age_s': anchor_age,
                 'anchor_frozen': anchor_frozen,
@@ -4134,6 +4209,93 @@ class NavTfNode:
             else:
                 break
         return found
+
+    # ---- T36 N1: the heading rides the gyro on the last metres into the dock --
+
+    def _hhd_setup(self):
+        """The one switch (~heading_hold_near_dock): without it nothing runs."""
+        self._hhd_enable = bool(rospy.get_param('~heading_hold_near_dock', False))
+        if not self._hhd_enable:
+            return
+        self._hhd_cfg = dict(HEADING_HOLD_DEFAULTS)
+        for key in self._hhd_cfg:
+            self._hhd_cfg[key] = float(rospy.get_param('~heading_hold_' + key,
+                                                       self._hhd_cfg[key]))
+        self._hhd_lock = threading.Lock()
+        self._hhd_st = heading_hold_new_state()
+        self._hhd_skipped = 0           # RTK heading samples not taken, in all
+        rospy.loginfo('[heading_hold] while docking within %.1f m of the DOCKED waypoint the '
+                      'RTK heading is not taken, the gyro carries the heading (at most %.0f s '
+                      '/ %.1f m a hold) ENABLED' % (self._hhd_cfg['radius_m'],
+                                                    self._hhd_cfg['max_s'], self._hhd_cfg['max_m']))
+
+    def _hhd_dock_dist(self):
+        """Distance of the robot from the DOCKED waypoint in the map, None when
+        the waypoint is not known."""
+        anchor = self._dock_anchor_pose
+        if anchor is None:
+            return None
+        with self._map_odom_lock:
+            mt = self.map_odom_transform.transform.translation
+            mx, my, myaw = mt.x, mt.y, self.map_odom_yaw
+        p = self.ekf_wheel_nav_odom_msg.pose.pose.position
+        c, s = math.cos(myaw), math.sin(myaw)
+        return math.hypot(mx + c * p.x - s * p.y - anchor[0],
+                          my + s * p.x + c * p.y - anchor[1])
+
+    def _hhd_step(self):
+        """One heading_hold_step with the node's inputs; returns hold. A dock
+        state that is missing or older than ~dock_status_stale_s counts as
+        unknown (no hold)."""
+        now = rospy.get_time()
+        status = self._dock_status_val
+        if status is not None and self._dock_status_rx_t \
+                and (now - self._dock_status_rx_t) > self._dock_status_stale_s:
+            status = None
+        dist = self._hhd_dock_dist()
+        p = self.ekf_wheel_odom_msg.pose.pose.position
+        with self._hhd_lock:
+            was = self._hhd_st['hold']
+            self._hhd_st, hold = heading_hold_step(self._hhd_st, now, status, dist,
+                                                   (p.x, p.y), self._hhd_cfg)
+            st = self._hhd_st
+        if hold and not was:
+            rospy.loginfo('[heading_hold] docking, %.1f m from the dock: RTK heading not taken, '
+                          'the gyro carries the heading' % dist)
+        elif was and not hold:
+            log = rospy.logwarn if st['end'].startswith('fuse') else rospy.loginfo
+            log('[heading_hold] over after %.0f s / %.1f m (%s) - RTK heading taken again'
+                % (st['last_s'], st['last_m'], st['end']))
+        return hold
+
+    def _hhd_holds(self, msg):
+        try:
+            if self._hhd_step():
+                self._hhd_skipped += 1
+                self.rtk_err = msg.orientation_covariance[8]     # the UI readout goes on
+                return True
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[heading_hold] %s' % e)
+        return False
+
+    def _hhd_fields(self):
+        try:
+            hold = self._hhd_step()
+            now = rospy.get_time()
+            with self._hhd_lock:
+                st = self._hhd_st
+            return {
+                'heading_hold': bool(hold),
+                'heading_hold_s': round((now - st['since']) if hold else st['last_s'], 1),
+                'heading_hold_m': round(st['path'] if hold else st['last_m'], 2),
+                'heading_hold_end': st['end'],
+                'heading_hold_count': int(st['count']),
+                'heading_hold_fuse_count': int(st['fuse_count']),
+                'heading_hold_skipped': int(self._hhd_skipped),
+            }
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[heading_hold] %s' % e)
+            return {}
 
     def _rewind_verify_anchor(self, t_out):
         """Motion-verified anchor (REWIND v2, defect B): the GPS tail's quality
@@ -5274,6 +5436,8 @@ class NavTfNode:
         :param msg: rtk navheading msg
         :return:
         """
+        if getattr(self, '_hhd_enable', False) and self._hhd_holds(msg):   # T36 N1
+            return      # docking, close to the dock: the gyro carries the heading
         delay = abs(int(str((msg.header.stamp - self.imu_msg.header.stamp) / 1000000)))  # in ms
         self.imu_delay = delay
         rtk_error_z = msg.orientation_covariance[8]

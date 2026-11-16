@@ -470,6 +470,20 @@ def _mag_finite(v):
     return isinstance(v, (int, float)) and math.isfinite(v)
 
 
+def mag_check_in_dock(dock_status, dock_unknown, dock_hold_active, wide=False):
+    """T35 M1: what the watchdog takes for `dock` (no comparison). Always: the
+    dock state is unknown or the dock hold owns map->odom. Then, as before
+    (wide False), the whole manoeuvre: dock_status 0 / 1 / 2 - which on the
+    drives 2026-11-15/16 was 89 % of the time off the dock (the status stays 1
+    after the undock and 2 from the start of the way back). With wide only the
+    robot standing in the dock (dock_status 0, the charging contacts)."""
+    if dock_unknown or dock_hold_active:
+        return True
+    if wide:
+        return dock_status == 0
+    return dock_status in (0, 1, 2)
+
+
 def mag_heading_step_event(hist, now, h, window_s=3.0, step_rad=math.radians(8.0)):
     """True when the heading offset h (diff_yaw + map_odom_yaw: everything in
     the map heading that is NOT the gyro) has moved by >= step_rad NET over
@@ -2729,6 +2743,10 @@ class NavTfNode:
         # heading step = net move of diff_yaw + map_odom_yaw (see mag_heading_step_event)
         self._mag_step_rad = math.radians(float(rospy.get_param('~mag_step_deg', 8.0)))
         self._mag_step_window_s = float(rospy.get_param('~mag_step_window_s', 3.0))
+        # T35 M1: compare during the undock / docking manoeuvre too (only
+        # dock_status 0 = standing in the dock is `dock`); off = as before
+        self._mag_check_wide = bool(rospy.get_param('~mag_check_wide', False))
+        self._mag_was_in_dock = True
         self._mag_lock = threading.Lock()
         self._mag_st = mag_check_new_state()
         self._mag_yaw = None
@@ -2807,8 +2825,9 @@ class NavTfNode:
             dock_unknown = self._dock_status_val is None \
                 or not self._dock_status_rx_t \
                 or (now - self._dock_status_rx_t) > self._dock_status_stale_s
-            in_dock = dock_unknown or self._dock_status_val in (0, 1, 2) \
-                or self._dock_hold_active
+            wide = getattr(self, '_mag_check_wide', False)       # T35 M1
+            in_dock = mag_check_in_dock(self._dock_status_val, dock_unknown,
+                                        self._dock_hold_active, wide)
             # heading steps: first anchor, set_heading, hand-over slew, map-pose yaw
             stepped = mag_heading_step_event(
                 self._mag_h_hist, now, self.diff_yaw + map_odom_yaw,
@@ -2816,7 +2835,15 @@ class NavTfNode:
             if stepped or (anchored and not self._mag_was_anchored):
                 self._mag_evt_t = now
             self._mag_was_anchored = anchored
-            evt = max(self._mag_evt_t or 0.0, self._dock_free_since or 0.0)
+            if wide:
+                # T35 M1: the settle time runs from leaving the dock itself
+                # (not from the end of the manoeuvre, _dock_free_since)
+                if self._mag_was_in_dock and not in_dock:
+                    self._mag_evt_t = now
+                self._mag_was_in_dock = in_dock
+                evt = self._mag_evt_t or 0.0
+            else:
+                evt = max(self._mag_evt_t or 0.0, self._dock_free_since or 0.0)
             since_event = (now - evt) if evt else None
             mag_age = (now - self._mag_rx_t) if self._mag_rx_t is not None else None
             mag_state = self._mag_state_now(now)

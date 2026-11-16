@@ -125,6 +125,14 @@ def main():
     check('yaw-only step 0.1 s after diff_yaw moved: heading_anchor; with an xy step: unknown',
           cz(False, None, '', 0.1, 0.3, 0.3) == ('heading_anchor', '')
           and cz(True, None, '', 0.1, 0.3, 0.3) == ('unknown', ''))
+    check('under GPS (set_pose 0.05 s ago): yaw-only step after diff_yaw moved is heading_anchor',
+          cz(False, 0.05, 'position_anchor', 0.1, 0.3, 0.3) == ('heading_anchor', ''))
+    check('... yaw-only step, diff_yaw still: set_pose_yaw:<path>; xy step: set_pose:<path>',
+          cz(False, 0.05, 'position_anchor', None, 0.3, 0.3) == ('set_pose_yaw:position_anchor', '')
+          and cz(False, 0.05, 'position_anchor', 2.0, 0.3, 0.3) == ('set_pose_yaw:position_anchor', '')
+          and cz(True, 0.05, 'position_anchor', 0.1, 0.3, 0.3) == ('set_pose:position_anchor', ''))
+    check('... yaw-only step 1 s after the last write, diff_yaw still: unknown',
+          cz(False, 1.0, 'position_anchor', None, 0.3, 0.3) == ('unknown', ''))
     ev = [(100.0, 0.02, 0.1, 'set_pose:position_anchor', ''), (130.0, 0.05, -4.0, 'unknown', ''),
           (150.0, 0.17, 0.3, 'ekf_twist_spike', 'ekf')]
     f = nt.odom_step_fields(ev, 165.0, {'cause': 'ekf_twist_spike'})
@@ -259,6 +267,23 @@ def main():
         stale.x += 0.05 if k >= 10 else 0.0          # 5 cm steps once they are 0.3 s old
         stale.n._osr_on_ekf(R.odom_msg(stale.t, stale.x, 0, 0, 0, 0.3, 0))
     check('wheel odometry / IMU older than 0.2 s: no verdict', stale.events() == [])
+    lk = Drive(nt, ON)
+    check('the events are guarded by a lock (EKF thread writes, loc_status reads)',
+          hasattr(lk.n._osr_lock, 'acquire') and not lk.n._osr_lock.locked())
+    lk.tick(30)
+    lk.n.ekf_wheel_nav_odom_msg.pose.pose.position.x = lk.x
+    lk.n._set_anchor_pose_slewed(lk.x + 0.03, lk.y, 0.0)     # the anchor writes ...
+    lk.n.init = False
+    lk.n.diff_yaw += math.radians(4.0)                        # ... and the heading moves
+    lk.tick(1)
+    lk.tick(1, dyaw=math.radians(4.0))
+    check('built drive: yaw step right after an anchor write and a diff_yaw move: heading_anchor',
+          lk.events()[-1]['cause'] == 'heading_anchor', str(lk.events()[-1:]))
+    lk.tick(20)
+    lk.n._set_anchor_pose_slewed(lk.x + 0.03, lk.y, 0.0)
+    lk.tick(1, dyaw=math.radians(4.0))
+    check('... yaw step right after an anchor write alone: set_pose_yaw:position_anchor',
+          lk.events()[-1]['cause'] == 'set_pose_yaw:position_anchor', str(lk.events()[-1:]))
     bad = Drive(nt, ON)
     bad.n._osr_events = None
     bad.tick(3, dx=0.05)

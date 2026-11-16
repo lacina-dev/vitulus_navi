@@ -248,13 +248,19 @@ def odom_step_residual(t0, x0, y0, yaw0, t1, x1, y1, yaw1, v, w):
 def odom_step_cause(xy_step, since_set_pose_s, set_pose_path, since_heading_s,
                     ekf_vx, wheel_vx, vo_vx=None, licp_vx=None, cfg=None):
     """(cause, spike source or '') of an unexplained step.
-      set_pose:<path>   the node wrote the EKF pose at most set_pose_s ago
-                        (position_anchor / emergency / rewind / manual /
-                        bridge); set_pose also zeroes the EKF velocity, so the
-                        next poses lag the wheels - the same cause
+      set_pose:<path>   an xy step, the node wrote the EKF pose at most
+                        set_pose_s ago (position_anchor / emergency / rewind /
+                        manual / bridge); set_pose also zeroes the EKF
+                        velocity, so the next poses lag the wheels - the same
+                        cause
       ekf_twist_spike   the EKF's own linear.x is spike_mps off the wheels
       heading_anchor    a yaw-only step at most heading_s after diff_yaw moved
+      set_pose_yaw:<path>  a yaw-only step after an own set_pose with diff_yaw
+                        still (set_pose zeroes the yaw rate as well)
       unknown           none of it
+    The position anchor writes up to 10 times a second, so a yaw-only step is
+    judged by the heading first: under GPS nearly every step falls into the
+    set_pose window.
     The spike source is given with any cause when the EKF twist is off: the
     input whose linear.x is off as well (vo / licp / wheels), else 'ekf'."""
     c = dict(ODOM_STEP_CFG, **(cfg or {}))
@@ -267,12 +273,15 @@ def odom_step_cause(xy_step, since_set_pose_s, set_pose_path, since_heading_s,
                 break
         if spike == 'ekf' and abs(wheel_vx) > 2.0 * c['spike_mps']:
             spike = 'wheels'
-    if since_set_pose_s is not None and 0.0 <= since_set_pose_s <= c['set_pose_s']:
+    wrote = since_set_pose_s is not None and 0.0 <= since_set_pose_s <= c['set_pose_s']
+    if xy_step and wrote:
         return 'set_pose:%s' % (set_pose_path or 'unknown'), spike
     if spike:
         return 'ekf_twist_spike', spike
     if not xy_step and since_heading_s is not None and 0.0 <= since_heading_s <= c['heading_s']:
         return 'heading_anchor', spike
+    if wrote:
+        return 'set_pose_yaw:%s' % (set_pose_path or 'unknown'), spike
     return 'unknown', spike
 
 
@@ -4988,6 +4997,7 @@ class NavTfNode:
         self._osr_vo = None               # last /vo/odom, /licp/odom_cov (twist inputs
         self._osr_licp = None             # of the EKF) - to find the source of a spike
         self._osr_events = deque(maxlen=512)
+        self._osr_lock = threading.Lock()  # events: EKF thread writes, loc_status reads
         self._osr_last = None
         self._osr_pub = rospy.Publisher('/nav_tf/odom_step', String, queue_size=20)
         self._osr_subs = [
@@ -5054,13 +5064,15 @@ class NavTfNode:
         cause, spike = odom_step_cause(xy_step, since_sp, self._osr_sp_path, since_hd,
                                        ekf_vx, wheel_vx, vo_vx, licp_vx, self._osr_cfg)
         yaw_deg = round(math.degrees(ryaw), 2)
-        self._osr_events.append((now, res, yaw_deg, cause, spike))
+        with self._osr_lock:
+            self._osr_events.append((now, res, yaw_deg, cause, spike))
         rnd = lambda x: None if x is None else round(x, 3)
         ev = {'stamp': round(stamp, 3), 'xy_m': round(res, 3), 'yaw_deg': yaw_deg,
               'cause': cause, 'spike': spike, 'since_set_pose_s': rnd(since_sp),
               'ekf_vx': rnd(ekf_vx), 'wheel_vx': rnd(wheel_vx), 'vo_vx': rnd(vo_vx),
               'licp_vx': rnd(licp_vx)}
-        self._osr_last = ev
+        with self._osr_lock:
+            self._osr_last = ev
         self._osr_pub.publish(String(data=json.dumps(ev)))
         if spike:
             rospy.logwarn_throttle(
@@ -5071,10 +5083,12 @@ class NavTfNode:
 
     def _osr_fields(self, now_s):
         try:
-            last = self._osr_last
-            if last is not None:
-                last = dict(last, age_s=round(now_s - self._osr_events[-1][0], 2))
-            return odom_step_fields(self._osr_events, now_s, last, self._osr_cfg)
+            with self._osr_lock:
+                events = tuple(self._osr_events)
+                last = self._osr_last
+            if last is not None and events:
+                last = dict(last, age_s=round(now_s - events[-1][0], 2))
+            return odom_step_fields(events, now_s, last, self._osr_cfg)
         except Exception as e:
             rospy.logwarn_throttle(10.0, '[odom_step] %s' % e)
             return {}

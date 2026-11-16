@@ -1080,6 +1080,13 @@ class NavTfNode:
         self._hi_hist = deque(maxlen=32)   # (imu stamp, imu yaw), filled only when enabled
         self._hi_pending = None            # (heading stamp, rtk yaw) waiting for the next IMU
         self._hi_used = 0                  # samples paired / dropped (no IMU around)
+        # T36 G1 (0 = off, pairing as before; works only with heading_imu_interp):
+        # the GNSS heading sample is stamped when it ARRIVES, the receiver
+        # measured it earlier, so against the IMU it lags - in the recorded
+        # drives by ~45 ms, which at 0.9 rad/s biases the heading target by
+        # ~2.3 deg for as long as the robot turns. With the parameter the
+        # sample is paired with the IMU yaw that many seconds BEFORE its stamp.
+        self._hi_latency_s = min(max(float(rospy.get_param('~heading_latency_s', 0.0)), 0.0), 0.2)
         self._hi_dropped = 0
         # HEADING ANCHOR V2 (2026-08-01, courtyard entry-error fix): in-band
         # offsets are no longer applied live — multipath onset near buildings
@@ -4564,7 +4571,8 @@ class NavTfNode:
         with self._hi_lock:
             if self._hi_pending is not None:
                 self._hi_dropped += 1      # the IMU never got past the previous one
-            self._hi_pending = (msg.header.stamp.to_sec(), rtk_yaw)
+            # T36 G1: the IMU yaw of the moment the receiver measured the heading
+            self._hi_pending = (msg.header.stamp.to_sec() - self._hi_latency_s, rtk_yaw)
             pair = self._hi_take_pair()
         if pair is not None:
             self._hi_apply(*pair)

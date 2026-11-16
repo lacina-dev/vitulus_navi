@@ -50,6 +50,17 @@ map_source_on_start: "octomap"
 #   false = as before (every re-armed publish goes out), true = only on change
 map_publish_on_change: false
 
+# T39 C4: the served map must not depend on /web_plan/map_edited being repeated.
+# navi_man changes the map source by itself in two places (start of the navi
+# launch -> "planner", new map -> "rtabmap") without asking for a publish; so far
+# the next map_edited (every 2 s) did. With node_planner ~map_edited_on_change
+# that message does not come, and /navi_manager/map would keep the grid of the
+# previous source. true = such a change sends the grid of the new source, and a
+# publish for which the grid is not here yet stays pending until it arrives.
+# Turn on BEFORE node_planner ~map_edited_on_change.
+#   false = as before
+map_source_republish: false
+
 # ============================================================================
 # SITE-NATIVE MODE  (mapping-v3 site bundles as the runtime map authority)
 # ============================================================================

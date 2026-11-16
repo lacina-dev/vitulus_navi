@@ -447,7 +447,9 @@ class Node:
         self.map_show = 'planner'
         self.is_map_to_publish = True
         self.rtabmap_grid_map_msg = None
-        self.planner_map_msg = None
+        # T39 C4: the subscriber above is already live - a latched map_edited
+        # that got here first is kept (without one this is None, as before).
+        self.planner_map_msg = getattr(self, 'planner_map_msg', None)
         self.site_map_msg = None
         # Octomap-source boot robustness (bootfix2, 2026-07-12). In "octomap" mode
         # /navi_manager/map must NEVER go silent, or the global costmap static layer
@@ -474,6 +476,9 @@ class Node:
         # from the latch). Default false = every re-armed publish goes out as before.
         self._nm_map_dedup = map_dedup.MapDedup()
         self._nm_map_on_change = None           # read from self.params on first use
+        # T39 C4: navi_manager.yaml map_source_republish=true - the served map no
+        # longer relies on /web_plan/map_edited coming again every 2 s.
+        self._nm_map_source_republish = None    # read from self.params on first use
         self.point_pose_srvs = rospy.Service("navi_manager/get_point_pose", Point_pose, self.srv_cb_map_point_pose)
 
 
@@ -690,6 +695,26 @@ class Node:
 
 
 
+    def _nm_map_source_fix(self):
+        # T39 C4 switch map_source_republish (navi_manager.yaml, default false).
+        if self._nm_map_source_republish is None and self.params is not None:
+            self._nm_map_source_republish = bool(self.params.get('map_source_republish', False))
+            if self._nm_map_source_republish:
+                rospy.loginfo("navi_man: map_source_republish=true - every change of the "
+                              "map source sends /navi_manager/map, a publish without a "
+                              "grid stays pending.")
+        return bool(self._nm_map_source_republish)
+
+    def _nm_map_source_set(self, source):
+        # The map source changed inside navi_man (not by /navi_manager/show_map).
+        # Until T39 C4 nothing asked for a publish here: the next map_edited of
+        # node_planner (every 2 s) did. With map_source_republish the grid of
+        # the new source goes out on the next slow tick whatever was sent last.
+        self.map_show = source
+        if self._nm_map_source_fix():
+            self._nm_map_dedup.forget()
+            self.is_map_to_publish = True
+
     def _nm_map_publish(self, msg):
         # T39 C2: /navi_manager/map only when the grid changed (switch
         # map_publish_on_change in navi_manager.yaml; off = always, as before).
@@ -711,10 +736,14 @@ class Node:
                 if self.planner_map_msg is not None:
                     self._nm_map_publish(self.planner_map_msg)
                     self.pub_map_source.publish(String("planner"))
+                elif self._nm_map_source_fix():
+                    return      # T39 C4: nothing sent - the publish stays pending
             if self.map_show == "rtabmap":
                 if self.rtabmap_grid_map_msg is not None:
                     self._nm_map_publish(self.rtabmap_grid_map_msg)
                     self.pub_map_source.publish(String("rtabmap"))
+                elif self._nm_map_source_fix():
+                    return      # T39 C4: nothing sent - the publish stays pending
             if self.map_show == "octomap":
                 # mapping_v3 site raster. /navi_manager/map is a latched publisher,
                 # so this one republish keeps the costmap static layer + planner + UI
@@ -2199,7 +2228,7 @@ class Node:
             args[rtabmap_change_id] = "localization:=true"
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
         roslaunch.configure_logging(uuid)
-        self.map_show = "planner"
+        self._nm_map_source_set("planner")
         if self.indoor:
             # if rtabmap_run:
             #     cli_args = ['/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/launch/vitulus_navi_indoor.launch',
@@ -2637,7 +2666,7 @@ class Node:
             self.status_msg_pub.publish("New map created.")
             self.nex_log_info_pub.publish("New map created")
             rospy.loginfo("New map created.")
-            self.map_show = 'rtabmap'
+            self._nm_map_source_set('rtabmap')
             self.set_map_utm_transform()
             # self.map_status = "Ready"
         else:

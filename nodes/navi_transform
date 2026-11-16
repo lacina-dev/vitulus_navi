@@ -312,6 +312,75 @@ def georef_status(datum, georef, fix, ant_xy, loc, now_s, fix_max_age_s=3.0):
     return out
 
 
+# ---- T35 M2: RTK heading against the magnetometer (pure; REPORT ONLY; -------
+# tools/test_t35_m2_rtk_mag_report.py). Both headings are reduced to their
+# offset against the IMU yaw (heading - imu_yaw at the heading's own time), so
+# a turn between the two messages does not count. The magnetometer side is the
+# offset of its last `ok` message, carried by the gyro for at most hold_s: on
+# the drives 2026-11-15/16 the field in front of the garage is disturbed just
+# where the RTK heading goes wrong (5 of the 231 wrong samples had an `ok`
+# magnetometer at that moment, 218 had one within the last 10 s).
+
+RTK_MAG_REPORT_DEFAULTS = {
+    'disagree_deg': 6.0,    # |rtk - mag| above this ...
+    'disagree_s': 0.3,      # ... for this much comparison time (two samples) ...
+    'window_s': 5.0,        # ... within the last window_s -> disagree
+    'hold_s': 30.0,         # the last `ok` magnetometer offset is used this long
+    'max_dt_s': 0.5,        # one comparison counts for at most this long
+    'sample_dt_s': 0.2,     # the first comparison of a stretch counts for this
+                            # (RTK heading period)
+}
+
+
+def rtk_mag_offset_diff(rtk_off, mag_off):
+    """rtk - mag [deg, -180..180] from the two offsets against the IMU yaw [rad]."""
+    d = rtk_off - mag_off
+    return math.degrees(math.atan2(math.sin(d), math.cos(d)))
+
+
+def rtk_mag_report_new_state():
+    return {'win': (),              # valid comparisons: (t, counted time, over)
+            'last': None,           # time of the last valid comparison
+            'disagree': False,
+            'count': 0,             # times disagree was raised
+            'last_true': None}      # last time disagree was true
+
+
+def rtk_mag_report_step(st, now, diff_deg, cfg=None):
+    """One step. diff_deg: rtk - mag of an RTK heading sample that passed the
+    node's quality gates and has a magnetometer reference, None otherwise (the
+    window then only ages). Returns (new_state, out); out = {'over_s',
+    'disagree', 'edge'}: over_s = comparison time above disagree_deg within
+    the last window_s; disagree = over_s >= disagree_s; edge 'raised' /
+    'cleared' on a change. st is not modified."""
+    c = dict(RTK_MAG_REPORT_DEFAULTS)
+    if cfg:
+        c.update(cfg)
+    st = dict(st)
+    win, last = st['win'], st['last']
+    if last is not None and now < last:             # clock went backwards
+        win, last = (), None
+    if diff_deg is not None and math.isfinite(diff_deg):
+        gap = (now - last) if last is not None else None
+        dt = c['sample_dt_s'] if gap is None or gap > c['max_dt_s'] else gap
+        win = win + ((now, dt, abs(diff_deg) > c['disagree_deg']),)
+        last = now
+    win = tuple(w for w in win if w[0] >= now - c['window_s'])
+    over_s = sum(w[1] for w in win if w[2])
+    was = st['disagree']
+    disagree = bool(win) and over_s >= c['disagree_s']
+    st.update(win=win, last=last, disagree=disagree)
+    edge = None
+    if disagree and not was:
+        st['count'] = st['count'] + 1
+        edge = 'raised'
+    elif was and not disagree:
+        edge = 'cleared'
+    if disagree:
+        st['last_true'] = now
+    return st, {'over_s': over_s, 'disagree': disagree, 'edge': edge}
+
+
 # ---- T35 magnetometer heading watchdog (pure; tools/test_t35_mag_check.py) --
 # REPORT ONLY: compares the navigation heading with the independent
 # magnetometer heading (/bno085/mag_heading) and flags a gross disagreement in
@@ -1277,6 +1346,9 @@ class NavTfNode:
         self.tf2_TransformBroadcaster = tf2_ros.TransformBroadcaster()
 
         self.set_pose_srv = rospy.Service("nav_tf/set_pose", SetPose, self.srv_cb_set_pose)
+        # T35 M2: RTK heading against the magnetometer in loc_status. REPORT
+        # ONLY, off by default: then no subscriber, no state, no field.
+        self._rmr_setup()
 
         rospy.loginfo("<{}> GNSSNode initiated.".format(rospy.get_caller_id()))
         rospy.logwarn(
@@ -2711,6 +2783,8 @@ class NavTfNode:
             }
             if getattr(self, '_mag_check_enable', False):
                 status.update(self._mag_check_fields())   # T35, report only
+            if getattr(self, '_rmr_enable', False):
+                status.update(self._rmr_fields())         # T35 M2, report only
             self._last_published_owner = owner    # FIX4: keep edge detector in sync
             self.loc_status_pub.publish(String(data=json.dumps(status)))
         except Exception as e:
@@ -2882,6 +2956,132 @@ class NavTfNode:
             rospy.logwarn_throttle(10.0, "[mag_check] %s" % e)
             return {'mag_state': 'stale', 'mag_diff_deg': None,
                     'mag_disagree': False, 'mag_check': 'error'}
+
+    # ---- T35 M2: RTK heading against the magnetometer (report only) ---------
+
+    def _rmr_setup(self):
+        """The one switch (~rtk_mag_report): without it nothing of M2 runs."""
+        self._rmr_enable = bool(rospy.get_param('~rtk_mag_report', False))
+        if not self._rmr_enable:
+            return
+        self._rmr_cfg = {
+            'disagree_deg': float(rospy.get_param('~rtk_mag_disagree_deg', 6.0)),
+            'disagree_s': float(rospy.get_param('~rtk_mag_disagree_s', 0.3)),
+            'window_s': float(rospy.get_param('~rtk_mag_disagree_window_s', 5.0)),
+            'hold_s': float(rospy.get_param('~rtk_mag_report_hold_s', 30.0)),
+        }
+        self._rmr_lock = threading.Lock()
+        self._rmr_st = rtk_mag_report_new_state()
+        self._rmr_ref = None        # (rx time, mag yaw - imu yaw) of the last `ok` message
+        self._rmr_last = None       # (time, rtk - mag deg) of the last comparison
+        topic = rospy.get_param('~rtk_mag_report_topic', '/bno085/mag_heading')
+        self._rmr_sub = rospy.Subscriber(topic, Imu, self._rmr_cb_mag, queue_size=5)
+        rospy.loginfo(
+            '[rtk_mag] RTK heading against the magnetometer ENABLED (report only): %s, '
+            'disagree = > %.1f deg for %.1fs of comparisons within %.0fs, magnetometer '
+            'offset held %.0fs', topic, self._rmr_cfg['disagree_deg'],
+            self._rmr_cfg['disagree_s'], self._rmr_cfg['window_s'], self._rmr_cfg['hold_s'])
+
+    def _rmr_imu_yaw_at(self, stamp):
+        """IMU yaw of the last IMU message carried to `stamp` by its own gyro
+        rate (at most 0.2 s); None before the first IMU message."""
+        m = self.imu_msg
+        t = m.header.stamp.to_sec()
+        if t <= 0.0:
+            return None
+        dt = max(-0.2, min(0.2, stamp - t)) if stamp > 0.0 else 0.0
+        return self.imu_yaw + m.angular_velocity.z * dt
+
+    def _rmr_cb_mag(self, msg):
+        """Magnetometer heading: keep the offset of an `ok` message (the node
+        marks every other one by the 1e3 covariance)."""
+        try:
+            q = msg.orientation
+            if not all(math.isfinite(v) for v in (q.x, q.y, q.z, q.w)) \
+                    or (q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) < 0.5 \
+                    or not msg.orientation_covariance[8] < 100.0:
+                return
+            imu_yaw = self._rmr_imu_yaw_at(msg.header.stamp.to_sec())
+            if imu_yaw is None or not math.isfinite(imu_yaw):
+                return
+            yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+            self._rmr_ref = (rospy.get_time(), yaw - imu_yaw)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[rtk_mag] %s" % e)
+
+    def _rmr_rtk_passes(self, msg):
+        """The quality gates of offset_navheading_imu, read only and silent
+        (fix, heading fix, NAV-RELPOSNED fixed + valid + fresh, variance band)."""
+        if not (self.fix_usable and self.heading_fix_usable):
+            return False
+        var = msg.orientation_covariance[8]
+        if not (self._heading_var_min <= var <= self._heading_var_max):
+            return False
+        f = self._relpos_flags
+        if not self._heading_require_relpos or f is None:
+            return True
+        return ((f >> 3) & 3) == 2 and bool(f & 0x100) \
+            and (rospy.get_time() - self._relpos_rx_t) <= self._relpos_max_age_s
+
+    def _rmr_sample(self, msg):
+        """Every RTK heading message, before the node takes it. Never raises,
+        writes nothing but its own state."""
+        try:
+            now = rospy.get_time()
+            diff = None
+            ref = self._rmr_ref
+            if ref is not None and 0.0 <= (now - ref[0]) <= self._rmr_cfg['hold_s'] \
+                    and self._rmr_rtk_passes(msg):
+                q = msg.orientation
+                imu_yaw = self._rmr_imu_yaw_at(msg.header.stamp.to_sec())
+                if imu_yaw is not None and all(math.isfinite(v) for v in (q.x, q.y, q.z, q.w)):
+                    diff = rtk_mag_offset_diff(
+                        euler_from_quaternion([q.x, q.y, q.z, q.w])[2] - imu_yaw, ref[1])
+                    if not math.isfinite(diff):
+                        diff = None
+            with self._rmr_lock:
+                self._rmr_st, out = rtk_mag_report_step(self._rmr_st, now, diff, self._rmr_cfg)
+                if diff is not None:
+                    self._rmr_last = (now, diff)
+                count = self._rmr_st['count']
+            if out['edge'] == 'raised':
+                rospy.logwarn(
+                    '[rtk_mag] RTK heading DISAGREES with the magnetometer: rtk - mag = '
+                    '%+.1f deg (> %.1f deg for %.1fs within %.0fs), %d times so far — '
+                    'report only', diff if diff is not None else float('nan'),
+                    self._rmr_cfg['disagree_deg'], out['over_s'],
+                    self._rmr_cfg['window_s'], count)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[rtk_mag] %s" % e)
+
+    def _rmr_fields(self):
+        """rtk_mag_* fields of /nav_tf/loc_status (only with ~rtk_mag_report)."""
+        try:
+            now = rospy.get_time()
+            with self._rmr_lock:
+                self._rmr_st, out = rtk_mag_report_step(self._rmr_st, now, None, self._rmr_cfg)
+                st, last, ref = self._rmr_st, self._rmr_last, self._rmr_ref
+            age = (now - last[0]) if last is not None else None
+            ref_age = (now - ref[0]) if ref is not None else None
+            return {
+                # rtk - mag of the last RTK heading sample that passed the gates
+                'rtk_mag_diff_deg': round(last[1], 1) if last is not None else None,
+                'rtk_mag_age_s': round(age, 2) if age is not None else None,
+                'rtk_mag_valid': bool(age is not None and 0.0 <= age <= 1.0),
+                # age of the `ok` magnetometer message the comparison rests on
+                'rtk_mag_ref_age_s': round(ref_age, 2) if ref_age is not None else None,
+                'rtk_mag_over_s': round(out['over_s'], 2),
+                'rtk_mag_disagree': bool(out['disagree']),
+                'rtk_mag_disagree_count': int(st['count']),
+                'rtk_mag_disagree_age_s': (round(now - st['last_true'], 1)
+                                           if st['last_true'] is not None else None),
+            }
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, "[rtk_mag] %s" % e)
+            return {'rtk_mag_diff_deg': None, 'rtk_mag_age_s': None, 'rtk_mag_valid': False,
+                    'rtk_mag_ref_age_s': None, 'rtk_mag_over_s': None,
+                    'rtk_mag_disagree': False, 'rtk_mag_disagree_count': None,
+                    'rtk_mag_disagree_age_s': None}
 
     def publish_georef_status(self):
         """/nav_tf/georef_status (vitulus-field#32): which UTM frame the map
@@ -3434,6 +3634,8 @@ class NavTfNode:
         return self.heading_fix_usable or (time.time() - self._heading_last_good) < self._heading_grace_s
 
     def callback_navheading(self, msg):
+        if getattr(self, '_rmr_enable', False):    # T35 M2, report only
+            self._rmr_sample(msg)
         self.offset_navheading_imu(msg)
         self.navheading_msg = msg
         (roll, pitch, yaw) = euler_from_quaternion(

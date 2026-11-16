@@ -42,6 +42,7 @@ from vitulus_navi.srv import Point_pose, Point_poseResponse
 from navi_man import mapdata
 from navi_man import path_rules
 from navi_man import map_dedup
+from navi_man import map_nogo
 sys.modules['mapdata'] = mapdata
 from mapdata import MapPoint, MapData, MapPath
 
@@ -385,7 +386,7 @@ class Node:
         self.refuse_lethal_edits = bool(rospy.get_param('~refuse_lethal_edits', True))
         rospy.Subscriber("/map_objects/rules", String, self.callback_map_rules, queue_size=1)
         rospy.Subscriber("/mapping_manager/status", String,
-                         lambda m: self.rule_set.on_status(m.data), queue_size=1)
+                         self.callback_rules_status, queue_size=1)
         rospy.Subscriber("/map_objects/objects", String, self.callback_map_edits, queue_size=1)
         rospy.Subscriber("/navi_manager/save_map", String, self.callback_save_map)
         rospy.Subscriber("/navi_manager/remove_map", String, self.callback_remove_map)
@@ -715,6 +716,60 @@ class Node:
             self._nm_map_dedup.forget()
             self.is_map_to_publish = True
 
+    def _nm_nogo_on(self):
+        # T36 Z1 switch map_nogo_always (navi_manager.yaml, default TRUE).
+        if getattr(self, '_nm_nogo_always', None) is None:
+            params = getattr(self, 'params', None)
+            if params is None:
+                return True
+            self._nm_nogo_always = bool(params.get('map_nogo_always', True))
+            if not self._nm_nogo_always:
+                rospy.logwarn("navi_man: map_nogo_always=false - the nogo areas are in "
+                              "/navi_manager/map only with the site raster (source octomap).")
+        return self._nm_nogo_always
+
+    def _nm_nogo_changed(self):
+        # The nogo areas that apply changed (rules edited / another site served).
+        # The site raster gets them from mapping_manager; any other grid on
+        # /navi_manager/map is stamped here, so it has to go out again.
+        rule_set = getattr(self, 'rule_set', None)
+        if rule_set is None:
+            return
+        sig = map_nogo.signature(rule_set.nogos)
+        if sig == getattr(self, '_nm_nogo_sig', ()):
+            return
+        self._nm_nogo_sig = sig
+        if not self._nm_nogo_on():
+            return
+        if (getattr(self, "map_show", None) == "octomap"
+                and getattr(self, "site_map_msg", None) is not None):
+            return
+        self.is_map_to_publish = True
+
+    def _nm_nogo(self, msg):
+        # T36 Z1: the active nogo areas into a grid that is not the site raster
+        # (planner, rtabmap, bootstrap); see map_nogo. A grid that has them
+        # already comes back as the same object.
+        rule_set = getattr(self, 'rule_set', None)
+        if rule_set is None or not self._nm_nogo_on():
+            return msg
+        if getattr(self, '_nm_nogo_stamper', None) is None:
+            self._nm_nogo_stamper = map_nogo.Nogo()
+            self._nm_nogo_said = None
+        nogos = rule_set.nogos
+        out = self._nm_nogo_stamper.apply(msg, nogos)
+        if self._nm_nogo_stamper.error:
+            rospy.logerr_throttle(60.0, "navi_man: nogo areas NOT stamped into the %s map "
+                                  "(%s) - only map_rules_guard holds them." %
+                                  (self.map_show, self._nm_nogo_stamper.error))
+        said = (self.map_show, len(nogos), self._nm_nogo_stamper.added)
+        if said != self._nm_nogo_said:
+            self._nm_nogo_said = said
+            if nogos:
+                rospy.loginfo("navi_man: %d nogo area(s) in the %s map, %d cell(s) "
+                              "turned into obstacles here." % (said[1], said[0], said[2]))
+        return out
+
     def _nm_map_publish(self, msg):
         # T39 C2: /navi_manager/map only when the grid changed (switch
         # map_publish_on_change in navi_manager.yaml; off = always, as before).
@@ -734,13 +789,13 @@ class Node:
         if self.is_map_to_publish:
             if self.map_show == "planner":
                 if self.planner_map_msg is not None:
-                    self._nm_map_publish(self.planner_map_msg)
+                    self._nm_map_publish(self._nm_nogo(self.planner_map_msg))
                     self.pub_map_source.publish(String("planner"))
                 elif self._nm_map_source_fix():
                     return      # T39 C4: nothing sent - the publish stays pending
             if self.map_show == "rtabmap":
                 if self.rtabmap_grid_map_msg is not None:
-                    self._nm_map_publish(self.rtabmap_grid_map_msg)
+                    self._nm_map_publish(self._nm_nogo(self.rtabmap_grid_map_msg))
                     self.pub_map_source.publish(String("rtabmap"))
                 elif self._nm_map_source_fix():
                     return      # T39 C4: nothing sent - the publish stays pending
@@ -762,7 +817,7 @@ class Node:
                         self._bootstrap_map_msg = self._build_bootstrap_map()
                     if self._bootstrap_map_msg is not None:
                         self._bootstrap_map_msg.header.stamp = rospy.Time.now()
-                        self._nm_map_publish(self._bootstrap_map_msg)
+                        self._nm_map_publish(self._nm_nogo(self._bootstrap_map_msg))
                         self.pub_map_source.publish(String("bootstrap"))
                         if not self._octomap_fallback_active:
                             self._octomap_fallback_active = True
@@ -778,7 +833,7 @@ class Node:
                     # map as a fallback so the global costmap/MBF/footprint still come
                     # up. octomap_serve_tick keeps retrying serve_site;
                     # callback_site_map switches back to the raster on first arrival.
-                    self._nm_map_publish(self.planner_map_msg)
+                    self._nm_map_publish(self._nm_nogo(self.planner_map_msg))
                     self.pub_map_source.publish(String("planner"))
                     if not self._octomap_fallback_active:
                         self._octomap_fallback_active = True
@@ -1063,6 +1118,11 @@ class Node:
     def callback_map_rules(self, msg):
         if not self.rule_set.on_rules(msg.data):
             rospy.logwarn("navi_man: bad /map_objects/rules ignored")
+        self._nm_nogo_changed()
+
+    def callback_rules_status(self, msg):
+        self.rule_set.on_status(msg.data)       # which site's rules apply
+        self._nm_nogo_changed()
 
     def callback_map_edits(self, msg):
         try:

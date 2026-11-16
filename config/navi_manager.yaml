@@ -61,6 +61,21 @@ map_publish_on_change: false
 #   false = as before
 map_source_republish: false
 
+# T36 Z1: the owner's nogo areas are in /navi_manager/map (static layer of the
+# global and the local costmap) whatever the map source. mapping_manager stamps
+# them only into the site raster, which is served with the source "octomap".
+# Every start of the navi launch at run time (save / edit of a map) and
+# /navi_manager/show_map switch the source to "planner" or "rtabmap", and
+# nothing switches it back before the next boot: the costmap then has the nogo
+# areas only as far as node_planner's shown grid happens to carry them (not in a
+# layer view, late after an edit, never during a mission). true = navi_man
+# stamps the active nogo areas of /map_objects/rules into every grid it sends
+# that is not the site raster, and sends it again when they change.
+# ON by default (a fix of a safety hole): with the source "octomap" and a site
+# raster the map is the very same message as before, the code is not on its way.
+#   false = as before (nogo areas only in the site raster)
+map_nogo_always: true
+
 # ============================================================================
 # SITE-NATIVE MODE  (mapping-v3 site bundles as the runtime map authority)
 # ============================================================================

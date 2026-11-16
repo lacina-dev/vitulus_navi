@@ -60,6 +60,10 @@
                  suppression ON instead of opening the gates.
                  ROLLBACK: dock_status_fail_closed:=false -->
             <param name="dock_status_fail_closed" value="true"/>
+            <!-- T36 F2 2026-11-16 hlaseni rezimu kotvy polohy a posunu hodin proti GPS do
+                 loc_status (anchor_mode, anchor_starving, gps_clock_offset_s). Jen hlasi.
+                 ROLLBACK: anchor_mode_report:=false -->
+            <param name="anchor_mode_report" value="true"/>
             <param name="dock_status_stale_s" value="5.0"/>
             <!-- T36 D1 2026-11-15 rychlost v /odometry/odom z kol misto z EKF, kdyz EKF
                  vynecha: jizda 15. 11. vypadky nulove rychlosti 2.0 % -> 0.03 %.

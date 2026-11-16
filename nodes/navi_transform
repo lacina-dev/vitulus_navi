@@ -264,6 +264,107 @@ def utm_convergence(lat, lon, zone):
     return math.atan(math.tan(dl) * math.sin(math.radians(lat)))
 
 
+# ---- T36 H2: "localization runs blind" in loc_status (pure, report only;
+# tools/test_t36_h2_anchor_freeze_report.py) ----------------------------------
+
+ANCHOR_FREEZE_CFG = {'after_s': 10.0, 'min_dist_m': 0.5, 'move_mps': 0.05,
+                     'dock_radius_m': 6.0, 'stop_s': 3.0}
+_ANCHOR_FREEZE_ABS = ('dock', 'relock', 'tracker', 'rtabmap', 'legacy')
+
+
+def anchor_freeze_new_state():
+    return {'t': None, 'xy': None, 'abs_t': None, 'h_none_t': None, 'still_s': 0.0,
+            'age': {'h': None, 'p': None}, 'dist': {'h': 0.0, 'p': 0.0},
+            'cond': False, 'blind': False, 'count': 0}
+
+
+def anchor_freeze_step(st, now, xy, owner, heading_age, anchor_age, in_dock,
+                       dock_dist_m=None, gps_direct=False, cfg=None):
+    """One step (each loc_status, ~1 Hz) of the summary "localization runs
+    blind": the robot has DRIVEN at least min_dist_m since an anchor last
+    advanced and that anchor is older than after_s.
+      heading_anchor      heading_age (s since a verified GNSS heading was
+                          last applied) - the heading rides the gyro
+      heading_unverified  heading_age None: no GNSS heading verified since the
+                          start; the age runs from the first such step
+      position_anchor     owner 'gps' and anchor_age (s since the verified GPS
+                          position anchor last advanced) - pose on the wheels.
+                          Not with gps_direct (the anchor has nothing verified
+                          to stand on and the GPS position is written to the
+                          EKF directly - bootstrap / emergency set_pose) nor
+                          with anchor_age None: the position follows GPS
+      dead_reckoning      owner 'dr': s since the position last had any
+                          absolute source (GPS, dock, lidar)
+    An owner with its own absolute pose (dock, tracker, relock...) resets both
+    ages, standing in the dock (in_dock) resets everything. xy = a pose that
+    no correction moves (wheel EKF), only its steps are used; a step slower
+    than move_mps or implausibly long does not count.
+    Near the dock the condition is normal (GPS is not taken under the roof):
+    closer than dock_radius_m (dock_dist_m), or with the dock position unknown
+    (None), it is reported as loc_blind_near_dock, not as loc_blind. A robot
+    that has stood for stop_s does not drive blind: both flags go off (and
+    return with the first step; reason, age and distance stay). Fields:
+      loc_blind, loc_blind_near_dock, loc_blind_reason ('a+b'), loc_blind_s
+      (age of the oldest anchor in the reason), loc_blind_m (driven since it
+      advanced), loc_blind_dock_m (distance from the dock, None = unknown),
+      loc_blind_count (episodes away from the dock since the start)."""
+    c = dict(ANCHOR_FREEZE_CFG, **(cfg or {}))
+    dt = 0.0 if st['t'] is None else min(max(now - st['t'], 0.0), 5.0)
+    step = 0.0
+    if st['xy'] is not None and xy is not None and dt > 0.0:
+        step = math.hypot(xy[0] - st['xy'][0], xy[1] - st['xy'][1])
+        if step < c['move_mps'] * dt or step > 2.0 * dt + 0.5:
+            step = 0.0
+    st['t'], st['xy'] = now, xy
+    st['still_s'] = 0.0 if step > 0.0 else st['still_s'] + dt
+    if st['abs_t'] is None:
+        st['abs_t'] = now
+    absolute = owner in _ANCHOR_FREEZE_ABS
+    p_name = 'dead_reckoning'
+    if owner == 'gps':
+        p_name = 'position_anchor'
+        p_age = 0.0 if (gps_direct or anchor_age is None) else max(float(anchor_age), 0.0)
+        st['abs_t'] = now - p_age
+    elif absolute:
+        p_age = 0.0
+        st['abs_t'] = now
+    else:
+        p_age = max(now - st['abs_t'], 0.0)
+    h_name = 'heading_anchor'
+    if absolute or in_dock:
+        h_age, st['h_none_t'] = 0.0, None
+    elif heading_age is None:
+        h_name = 'heading_unverified'
+        if st['h_none_t'] is None:
+            st['h_none_t'] = now
+        h_age = now - st['h_none_t']
+    else:
+        h_age, st['h_none_t'] = max(float(heading_age), 0.0), None
+    why, worst_s, worst_m = [], 0.0, 0.0
+    for k, age, name in (('h', h_age, h_name), ('p', p_age, p_name)):
+        prev = st['age'][k]
+        st['age'][k] = age
+        if in_dock or prev is None or age < prev + 0.5 * dt:
+            st['dist'][k] = 0.0
+        else:
+            st['dist'][k] += step
+        if not in_dock and age > c['after_s'] and st['dist'][k] >= c['min_dist_m']:
+            why.append(name)
+            worst_s, worst_m = max(worst_s, age), max(worst_m, st['dist'][k])
+    near = bool(why) and (dock_dist_m is None or dock_dist_m < c['dock_radius_m'])
+    cond = bool(why) and not near
+    if cond and not st['cond']:
+        st['count'] += 1
+    st['cond'] = cond
+    moving = st['still_s'] < c['stop_s']
+    st['blind'] = cond and moving
+    return {'loc_blind': st['blind'], 'loc_blind_near_dock': near and moving,
+            'loc_blind_reason': '+'.join(why),
+            'loc_blind_s': round(worst_s, 1), 'loc_blind_m': round(worst_m, 2),
+            'loc_blind_dock_m': (round(dock_dist_m, 1) if dock_dist_m is not None else None),
+            'loc_blind_count': st['count']}
+
+
 def utm_to_map_xy(e, n, utm_e, utm_n, yaw):
     """vitulus_mapping.geo.utm_to_map: UTM -> map through the datum."""
     dx, dy = e - utm_e, n - utm_n
@@ -1271,6 +1372,19 @@ class NavTfNode:
         # pose is running open-loop on the wheel EKF and the operator must see it.
         self._anchor_last_advance_t = None
         self._anchor_frozen_warn_s = float(rospy.get_param('~anchor_frozen_warn_s', 5.0))
+        # T36 H2 (~anchor_freeze_report, default off): loc_status says when the
+        # robot drives on a frozen heading / position anchor or on dead
+        # reckoning away from the dock (loc_blind*). Report only.
+        self._afr_enable = bool(rospy.get_param('~anchor_freeze_report', False))
+        self._afr_cfg = dict(ANCHOR_FREEZE_CFG)
+        for _k in self._afr_cfg:
+            self._afr_cfg[_k] = float(rospy.get_param('~anchor_freeze_report_' + _k,
+                                                      self._afr_cfg[_k]))
+        self._afr_st = anchor_freeze_new_state()
+        self._afr_lock = threading.Lock()    # loc_status goes out from two loops
+        if self._afr_enable:
+            rospy.loginfo('[anchor_freeze] report "localization runs blind" ENABLED %s '
+                          '(report only)' % self._afr_cfg)
         # FIX1 (telemfix 2026-07-11): capture the live nav pose AND time-paired
         # RTK pose at the resume tick BEFORE the first new correction is applied,
         # so the drift report is measured against INDEPENDENT RTK truth (not the
@@ -3288,6 +3402,10 @@ class NavTfNode:
                 'heading_anchor_frozen': bool(
                     self._ha_frozen_since is not None
                     and (time.time() - self._ha_frozen_since) > 3.0),
+                # T36 H2 (only with ~anchor_freeze_report): loc_blind,
+                # loc_blind_near_dock, _reason, _s, _m, _dock_m, _count
+                **(self._afr_fields(now_s, owner, anchor_age)
+                   if getattr(self, '_afr_enable', False) else {}),
                 'map_pose_sources': sources,
                 'drift_report': self._drift_report,
                 # DOCKFIX-2026-08-29 observability
@@ -3660,6 +3778,59 @@ class NavTfNode:
                 self.publish_loc_status()
         except Exception as e:
             rospy.logwarn_throttle(10.0, "[loc_status_edge] %s" % e)
+
+    # ---- T36 H2: "localization runs blind" in loc_status (report only) ------
+
+    def _afr_dock_dist(self):
+        """Distance of the robot from the DOCKED waypoint in the map, None when
+        the waypoint is not known."""
+        anchor = self._dock_anchor_pose
+        if anchor is None:
+            return None
+        with self._map_odom_lock:
+            mt = self.map_odom_transform.transform.translation
+            mx, my, myaw = mt.x, mt.y, self.map_odom_yaw
+        p = self.ekf_wheel_nav_odom_msg.pose.pose.position
+        c, s = math.cos(myaw), math.sin(myaw)
+        return math.hypot(mx + c * p.x - s * p.y - anchor[0],
+                          my + s * p.x + c * p.y - anchor[1])
+
+    def _afr_gps_direct(self, now_s):
+        """True while loop3sec writes the GPS position to the EKF directly
+        (set_wheel_base_nav_pose: bootstrap, or the emergency mode when the
+        GPS samples do not reach the anchor's buffer) - the conditions under
+        which _apply_continuous_anchor returns False. anchor_age_s grows then
+        although the position follows GPS."""
+        if not self._pose_buffer:
+            return True
+        if self._buffer_newest_before(now_s - self._anchor_lag_s) is None:
+            return True
+        return self._anchor_verified is None
+
+    def _afr_fields(self, now_s, owner, anchor_age):
+        try:
+            p = self.ekf_wheel_odom_msg.pose.pose.position
+            h_age = (time.time() - self._ha_last_applied_t
+                     if self._ha_last_applied_t is not None else None)
+            direct = owner == 'gps' and self._afr_gps_direct(now_s)
+            dock_m = self._afr_dock_dist()
+            with self._afr_lock:
+                was = self._afr_st['blind']
+                out = anchor_freeze_step(self._afr_st, now_s, (p.x, p.y), owner, h_age,
+                                         anchor_age, bool(self._docked), dock_m, direct,
+                                         self._afr_cfg)
+            if out['loc_blind'] and not was:
+                rospy.logwarn('[anchor_freeze] localization runs BLIND: %s, %.0f s, '
+                              '%.1f m driven (report only)' % (
+                                  out['loc_blind_reason'], out['loc_blind_s'],
+                                  out['loc_blind_m']))
+            elif was and not out['loc_blind']:
+                rospy.loginfo('[anchor_freeze] not driving blind any more (%s)'
+                              % (out['loc_blind_reason'] or 'anchored'))
+            return out
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[anchor_freeze] %s' % e)
+            return {}
 
     def callback_bridge_live_enable(self, msg):
         self._bridge_live_enable = bool(msg.data)

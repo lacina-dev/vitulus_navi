@@ -29,9 +29,50 @@ try:
     from ublox_msgs.msg import NavRELPOSNED9
 except ImportError:          # driver msgs missing: RELPOSNED gate stays off (logged)
     NavRELPOSNED9 = None
-from tf.transformations import euler_from_quaternion, quaternion_from_euler
+from tf.transformations import quaternion_from_euler
+from tf.transformations import euler_from_quaternion as _tf_euler_from_quaternion
 import numpy as np
 import math
+
+# T39: tf.transformations.euler_from_quaternion builds two numpy matrices per call
+# (~42 us); this node calls it on every IMU sample (100 Hz) and several times in
+# every 30 Hz tick. The function below is the same arithmetic in the same order for
+# the default axes 'sxyz' (quaternion_matrix + euler_from_matrix written out for
+# i, j, k = 0, 1, 2), ~3.5 us, and returns bit for bit the same three floats - also
+# for a not normalized or zero quaternion, at the gimbal lock and for NaN / inf
+# (tools/test_t39_euler_fast.py: 100 000 random + edge quaternions against tf).
+# Any other axes go to tf.transformations as before.
+_EULER_EPS = np.finfo(float).eps * 4.0
+
+
+def euler_from_quaternion(quaternion, axes='sxyz'):
+    if axes != 'sxyz':
+        return _tf_euler_from_quaternion(quaternion, axes)
+    x = float(quaternion[0])
+    y = float(quaternion[1])
+    z = float(quaternion[2])
+    w = float(quaternion[3])
+    nq = x * x + y * y + z * z + w * w
+    if nq < _EULER_EPS:
+        return 0.0, -0.0, 0.0            # the identity matrix through euler_from_matrix
+    s = math.sqrt(2.0 / nq)
+    x *= s
+    y *= s
+    z *= s
+    w *= s
+    q00 = x * x
+    q11 = y * y
+    q22 = z * z
+    q12 = y * z
+    q03 = x * w
+    m00 = 1.0 - q11 - q22
+    m10 = x * y + z * w
+    m20 = x * z - y * w
+    cy = math.sqrt(m00 * m00 + m10 * m10)
+    if cy > _EULER_EPS:
+        return (math.atan2(q12 + q03, 1.0 - q00 - q11), math.atan2(-m20, cy),
+                math.atan2(m10, m00))
+    return math.atan2(-(q12 - q03), 1.0 - q00 - q22), math.atan2(-m20, cy), 0.0
 from visualization_msgs.msg import Marker, MarkerArray
 from collections import deque
 

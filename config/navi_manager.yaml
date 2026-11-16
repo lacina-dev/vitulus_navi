@@ -41,6 +41,15 @@ obstacles_engine: depth_obstacles
 #   "rtabmap" = rtabmap grid_map (starts RTABMAP_MAPPING on demand)
 map_source_on_start: "octomap"
 
+# T39 C2: send /navi_manager/map only when the grid really changed. The topic is
+# latched, so a restarted move_base_flex, a static layer after clear_costmaps and
+# a new UI client get the last grid from the latch. Until now every arrival of
+# /web_plan/map_edited (node_planner, every 2 s) re-armed the publish and the same
+# 2 mil. cells went out on every slow tick, each copy making the global costmap
+# take over and inflate the whole grid again.
+#   false = as before (every re-armed publish goes out), true = only on change
+map_publish_on_change: false
+
 # ============================================================================
 # SITE-NATIVE MODE  (mapping-v3 site bundles as the runtime map authority)
 # ============================================================================

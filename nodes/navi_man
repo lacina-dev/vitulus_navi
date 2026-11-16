@@ -41,6 +41,7 @@ from vitulus_navi.srv import Point_pose, Point_poseResponse
 
 from navi_man import mapdata
 from navi_man import path_rules
+from navi_man import map_dedup
 sys.modules['mapdata'] = mapdata
 from mapdata import MapPoint, MapData, MapPath
 
@@ -468,6 +469,11 @@ class Node:
         self._octomap_fallback_mode = rospy.get_param('~octomap_fallback', 'bootstrap')
         self._bootstrap_map_msg = None         # cached OccupancyGrid once built
         self._bootstrap_build_attempts = 0     # so we retry a few times for TF
+        # T39 C2: with navi_manager.yaml map_publish_on_change=true an identical
+        # grid is not sent again (the topic is latched, late subscribers get it
+        # from the latch). Default false = every re-armed publish goes out as before.
+        self._nm_map_dedup = map_dedup.MapDedup()
+        self._nm_map_on_change = None           # read from self.params on first use
         self.point_pose_srvs = rospy.Service("navi_manager/get_point_pose", Point_pose, self.srv_cb_map_point_pose)
 
 
@@ -678,26 +684,43 @@ class Node:
                               self._octomap_serve_window)
             self.is_rtabmap_pub.publish(Bool(False))
         self.map_show = msg.data
+        # An explicit source selection always sends the grid (T39 C2).
+        self._nm_map_dedup.forget()
         self.is_map_to_publish = True
 
 
+
+    def _nm_map_publish(self, msg):
+        # T39 C2: /navi_manager/map only when the grid changed (switch
+        # map_publish_on_change in navi_manager.yaml; off = always, as before).
+        if self._nm_map_on_change is None and self.params is not None:
+            self._nm_map_on_change = bool(self.params.get('map_publish_on_change', False))
+            if self._nm_map_on_change:
+                rospy.loginfo("navi_man: map_publish_on_change=true - /navi_manager/map "
+                              "is sent only when the grid changes (latched).")
+        if self._nm_map_on_change:
+            if self._nm_map_dedup.is_same(msg):
+                self._nm_map_dedup.note_skipped()
+                return
+            self._nm_map_dedup.note_published(msg)
+        self.nm_map_pub.publish(msg)
 
     def publish_map(self):
         if self.is_map_to_publish:
             if self.map_show == "planner":
                 if self.planner_map_msg is not None:
-                    self.nm_map_pub.publish(self.planner_map_msg)
+                    self._nm_map_publish(self.planner_map_msg)
                     self.pub_map_source.publish(String("planner"))
             if self.map_show == "rtabmap":
                 if self.rtabmap_grid_map_msg is not None:
-                    self.nm_map_pub.publish(self.rtabmap_grid_map_msg)
+                    self._nm_map_publish(self.rtabmap_grid_map_msg)
                     self.pub_map_source.publish(String("rtabmap"))
             if self.map_show == "octomap":
                 # mapping_v3 site raster. /navi_manager/map is a latched publisher,
                 # so this one republish keeps the costmap static layer + planner + UI
                 # fed exactly like the rtabmap/planner sources do.
                 if self.site_map_msg is not None:
-                    self.nm_map_pub.publish(self.site_map_msg)
+                    self._nm_map_publish(self.site_map_msg)
                     self.pub_map_source.publish(String("octomap"))
                 elif self._octomap_fallback_mode != "planner":
                     # No raster yet, and bootstrap mode (default): publish a TRUTHFUL
@@ -710,7 +733,7 @@ class Node:
                         self._bootstrap_map_msg = self._build_bootstrap_map()
                     if self._bootstrap_map_msg is not None:
                         self._bootstrap_map_msg.header.stamp = rospy.Time.now()
-                        self.nm_map_pub.publish(self._bootstrap_map_msg)
+                        self._nm_map_publish(self._bootstrap_map_msg)
                         self.pub_map_source.publish(String("bootstrap"))
                         if not self._octomap_fallback_active:
                             self._octomap_fallback_active = True
@@ -726,7 +749,7 @@ class Node:
                     # map as a fallback so the global costmap/MBF/footprint still come
                     # up. octomap_serve_tick keeps retrying serve_site;
                     # callback_site_map switches back to the raster on first arrival.
-                    self.nm_map_pub.publish(self.planner_map_msg)
+                    self._nm_map_publish(self.planner_map_msg)
                     self.pub_map_source.publish(String("planner"))
                     if not self._octomap_fallback_active:
                         self._octomap_fallback_active = True

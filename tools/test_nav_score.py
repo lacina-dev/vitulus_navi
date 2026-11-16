@@ -389,6 +389,159 @@ class Compare(unittest.TestCase):
         self.assertIn('nelze porovnat', txt)
 
 
+class ClockShift(unittest.TestCase):
+    """Oddil C2: mezera EKF - GPS s razitky opravenymi o posun hodin, v ramu odom."""
+    OFF = -0.68          # systemove hodiny za UTC
+
+    def _run(self, off=OFF, lag_m=0.0, side_m=0.0, mo_drift=0.0, with_pvt=True, back=True):
+        # jizda tam (kurz 0) a zpet (kurz pi), 0,3 m/s; GPS 10 Hz s razitkem UTC
+        n, v = 1800, 0.3
+        t = T0 + np.arange(n) / 30.0
+        h = n // 2 if back else n
+        yaw = np.where(np.arange(n) < h, 0.0, math.pi)
+        s_ = v / 30.0
+        x = np.concatenate([[0.0], np.cumsum(np.cos(yaw[:-1]) * s_)])
+        y = np.zeros(n)
+        D = {'wheel': odo(t, x, y, yaw, v=v), 'ekf': odo(t, x, y, yaw, v=v),
+             'odom': odo(t, x, y, yaw, v=v), 'imu': imu(t, yaw),
+             'mo': tfrows(t, np.linspace(0.0, mo_drift, n), 0.0), 'ob': tfrows(t, x, y, yaw),
+             'counts': {}}
+        tg = t[::3]
+        # GPS = EKF posunute o lag_m dozadu podel drahy a side_m vpravo
+        gx = x[::3] - lag_m * np.cos(yaw[::3]) + side_m * np.sin(yaw[::3])
+        gy = y[::3] - lag_m * np.sin(yaw[::3]) - side_m * np.cos(yaw[::3])
+        utc = tg - off
+        D['gps'] = np.column_stack([tg + 0.02, utc, gx, gy, np.zeros(len(tg))])
+        if with_pvt:
+            D['pvt'] = np.column_stack([tg + 0.01, np.full(len(tg), 3.0), np.full(len(tg), 2.0),
+                                        np.full(len(tg), 0.01), utc])   # dodani 0,01 s
+        lt = T0 + np.arange(0, n / 30.0, 0.1)
+        D['loc_t'], D['loc_owner'] = lt, np.array(['gps'] * len(lt))
+        D['loc_anchor_age'] = np.full(len(lt), 0.2)
+        D['loc_heading_age'] = np.full(len(lt), 0.2)
+        return ns.score(D)
+
+    def test_old_metric_is_biased_new_is_not(self):
+        m = self._run()['metrics']
+        # stara metrika: posun x rychlost = 0,68 * 0,3 = 20 cm
+        self.assertGreater(m['gps_gap_med_cm'], 15.0)
+        self.assertAlmostEqual(m['gps_stamp_offset_s'], self.OFF + 0.01, places=2)
+        self.assertLess(m['gps_gap_odom_med_cm'], 0.5)
+        self.assertLess(abs(m['gps_along_med_cm']), 0.5)
+        self.assertIsNone(m['gps_gap_fit_dt_s'])        # stala rychlost: primku nelze urcit
+
+    def test_fit_recovers_residual_time_shift(self):
+        # promenna rychlost, GPS razitka o 0,1 s jinde, nez rika oprava
+        t = np.arange(0.0, 60.0, 1 / 30.0)
+        v = 0.3 + 0.2 * np.sin(0.5 * t)
+        x = np.concatenate([[0.0], np.cumsum(v[:-1] / 30.0)])
+        ekf = odo(t, x, 0.0, 0.0, v=v)
+        tg = t[30:-30:3]
+        gps = np.column_stack([tg, tg, np.interp(tg - 0.1, t, x), 0 * tg, 0 * tg])
+        G = ns.gps_gap_odom(ekf, gps, 0.0, [(0.0, 60.0)])
+        self.assertAlmostEqual(ns.gap_odom_stats(G)['gps_gap_fit_dt_s'], 0.1, delta=0.01)
+        G = ns.gps_gap_odom(ekf, gps, -0.1, [(0.0, 60.0)])
+        self.assertLess(ns.gap_odom_stats(G)['gps_gap_odom_p95_cm'], 0.2)
+
+    def test_old_metric_note_and_clean_clock(self):
+        R = self._run()
+        self.assertIn('zkreslene posunem hodin', R['notes']['gps_gap_med_cm'])
+        R = self._run(off=0.0)
+        self.assertNotIn('gps_gap_med_cm', R['notes'])
+        self.assertLess(R['metrics']['gps_gap_odom_med_cm'], 0.5)
+
+    def test_along_sign_same_both_directions(self):
+        # EKF 4 cm pred GPS v obou smerech (chyba spojena s robotem)
+        m = self._run(lag_m=0.04)['metrics']
+        self.assertAlmostEqual(m['gps_along_out_med_cm'], 4.0, delta=0.5)
+        self.assertAlmostEqual(m['gps_along_back_med_cm'], 4.0, delta=0.5)
+        self.assertAlmostEqual(m['gps_along_med_cm'], 4.0, delta=0.5)
+        self.assertLess(abs(m['gps_cross_med_cm']), 0.3)
+
+    def test_cross_component_and_sign(self):
+        m = self._run(side_m=0.03)['metrics']      # GPS vpravo => EKF vlevo => +
+        self.assertAlmostEqual(m['gps_cross_med_cm'], 3.0, delta=0.3)
+        self.assertLess(abs(m['gps_along_med_cm']), 0.5)
+        self.assertAlmostEqual(m['gps_gap_odom_med_cm'], 3.0, delta=0.3)
+
+    def test_map_odom_drift_does_not_enter(self):
+        m = self._run(mo_drift=1.0)['metrics']
+        self.assertGreater(m['gps_gap_p95_cm'], 50.0)       # stara: artefakt map->odom
+        self.assertLess(m['gps_gap_odom_p95_cm'], 0.5)
+
+    def test_fixed_world_offset_flips_sign(self):
+        # posun pevny ve svete (GPS o 5 cm v +x): tam EKF vzadu, zpet vpredu
+        G = ns.gps_gap_odom(odo(np.arange(10.0), np.arange(10.0), 0.0, 0.0),
+                            np.column_stack([np.arange(1.0, 9.0), np.arange(1.0, 9.0),
+                                             np.arange(1.0, 9.0) + 0.05, np.zeros(8), np.zeros(8)]),
+                            0.0, [(0.0, 20.0)])
+        self.assertTrue(np.allclose(G['along'], -0.05))
+        self.assertTrue(np.allclose(G['cross'], 0.0))
+
+    def test_only_rtk_fixed_samples_count(self):
+        t = np.arange(0.0, 60.0, 0.1)
+        ekf = odo(t, 0.3 * t, 0.0, 0.0)
+        gps = np.column_stack([t, t, 0.3 * t, np.where(t >= 40, 0.4, 0.0), 0 * t])   # float: 40 cm bokem
+        pvt = np.column_stack([t, 3 + 0 * t, np.where(t >= 40, 1.0, 2.0), 0 * t, t])
+        M = ns.gap_odom_stats(ns.gps_gap_odom(ekf, gps, 0.0, [(0.0, 60.0)], pvt))
+        self.assertLess(M['gps_gap_odom_p95_cm'], 0.1)
+        self.assertAlmostEqual(M['gps_gap_rtk_fixed_pct'], 100 * 400 / 600.0, delta=1.0)
+        M = ns.gap_odom_stats(ns.gps_gap_odom(ekf, gps, 0.0, [(0.0, 60.0)]))
+        self.assertGreater(M['gps_gap_odom_p95_cm'], 30.0)
+
+    def test_fallback_without_navpvt_is_noted(self):
+        R = self._run(with_pvt=False)
+        self.assertEqual(R['meta']['gps_stamp_offset_src'], 'gps')
+        self.assertIn('navsatu', R['notes']['gps_stamp_offset_s'])
+        self.assertLess(R['metrics']['gps_gap_odom_med_cm'], 1.0)   # 0,02 s * 0,3 m/s
+
+    def test_rolling_offset_follows_step_and_drift(self):
+        t = np.arange(0.0, 600.0, 0.1)
+        utc = t + 0.5 + 0.001 * t                       # drift 1 ms/s
+        utc[t >= 300] -= 0.3                            # skok hodin
+        pvt = np.column_stack([t, t * 0, t * 0, t * 0, utc])
+        off, src = ns.stamp_offset(np.array([100.0, 250.0, 400.0, 550.0]), pvt)
+        self.assertEqual(src, 'navpvt')
+        want = -(0.5 + 0.001 * np.array([100.0, 250.0, 400.0, 550.0])) + np.array([0, 0, 0.3, 0.3])
+        self.assertTrue(np.allclose(off, want, atol=0.02), (off, want))
+
+    def test_invalid_utc_is_skipped(self):
+        self.assertTrue(math.isnan(ns.pvt_utc(2026, 11, 16, 7, 0, 0, 0, valid=0)))
+        self.assertAlmostEqual(ns.pvt_utc(2026, 11, 16, 7, 0, 1, -500000000, valid=7),
+                               ns.pvt_utc(2026, 11, 16, 7, 0, 0, 500000000, valid=3))
+        pvt = np.column_stack([np.arange(5.0), np.zeros(5), np.zeros(5), np.zeros(5),
+                               np.full(5, np.nan)])
+        self.assertEqual(ns.stamp_offset(np.array([1.0]), pvt), (None, None))
+
+    def test_buffered_share_from_loc_status(self):
+        D, t, x, y = base_extract()
+        lt = t[::3]
+        D['loc_t'], D['loc_owner'] = lt, np.array(['dr'] * 50 + ['gps'] * (len(lt) - 50))
+        D['loc_anchor_age'] = np.full(len(lt), 0.2)
+        D['loc_heading_age'] = np.full(len(lt), 0.2)
+        bs = np.full(len(lt), 0.98)
+        bs[:50] = 0.1                       # mimo owner=gps se nepocita
+        bs[60:64] = np.nan
+        D['loc_buffered_share'] = bs
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['anchor_buffered_share_med_pct'], 98.0)
+        R = ns.score(base_extract()[0])
+        self.assertIsNone(R['metrics']['anchor_buffered_share_med_pct'])
+
+    def test_compare_with_older_json_works(self):
+        A = ns._jsonable(self._run())
+        old = json.loads(json.dumps(A))
+        old['version'] = 2
+        for k in list(old['metrics']):
+            if '_odom_' in k or k.startswith(('gps_along', 'gps_cross', 'gps_stamp', 'gps_gap_fit',
+                                              'gps_gap_standing', 'anchor_buffered')):
+                del old['metrics'][k]
+        buf = io.StringIO()
+        ns.compare(old, A, out=buf)
+        self.assertIn('nelze porovnat', buf.getvalue())
+        self.assertIn('(stare*)', buf.getvalue())
+
+
 class RawParsers(unittest.TestCase):
     @staticmethod
     def _hdr(stamp, frame):

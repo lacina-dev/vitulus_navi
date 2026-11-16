@@ -66,6 +66,40 @@ C. Vlastnik pozy (/nav_tf/loc_status, pole owner)
          doba od prevzeti, nez mezera klesne pod 5 cm a vydrzi tam 1 s.
    gps_gap_med_cm, gps_gap_p95_cm
          tataz mezera pres vsechny vzorky GPS pri owner=gps.
+   POZOR: tyto stare metriky (takeover_gap_*, takeover_settle_*, gps_gap_*)
+   jsou ZKRESLENE PRI POSUNU HODIN: hledaji pozu EKF (systemovy cas) na
+   razitku GPS (UTC prijimace) -> chyba = posun hodin x rychlost, a GPS
+   prevadeji pres map->odom z konce epizody, ktery se behem epizody hybe.
+   Zustavaji jen kvuli --compare se starsimi JSON. Platne jsou tyto:
+C2. Mezera EKF - GPS s opravou razitek, v ramu odom
+   Razitko vzorku /odometry/gps (UTC prijimace) se prevede na systemovy cas
+   prictenim posunu hodin = klouzavy median (okno 60 s) rozdilu (cas bagu -
+   UTC) zprav /gnss/navpvt; kdyz navpvt chybi, median (cas bagu - razitko)
+   /odometry/gps (poznamka u metriky). Mezera = EKF(cas mereni) - GPS, obe
+   v ramu odom (map->odom do ni nevstupuje; stejnou velikost ma mezera v
+   mape s map->odom v case vzorku). Rozklad podle kurzu EKF: PODEL drahy
+   (+ = EKF pred GPS) a PRICNE (+ = EKF vlevo od GPS).
+   gps_stamp_offset_s       pouzity posun hodin (median); jen udaj
+   Do gps_gap_* / gps_along_* / gps_cross_* jdou jen vzorky pri owner=gps,
+   kdy prijimac hlasi RTK fix (NAV-PVT carrSoln == 2): bez fixu (float u
+   garaze) je desitky cm mimo GPS, ne EKF. gps_gap_rtk_fixed_pct = podil
+   takovych vzorku. Prevzeti (takeover_*_odom_*) bere vsechny vzorky.
+   gps_gap_odom_med_cm, gps_gap_odom_p95_cm   |mezera| pri owner=gps
+   gps_gap_standing_med_cm  |mezera| ve stoje (|v| < 0,02 m/s)
+   gps_along_med_cm         slozka podel, median se znamenkem, jizda vpred
+                            (v > 0,1 m/s)
+   gps_along_out_med_cm, gps_along_back_med_cm
+         totez zvlast pro smer TAM (kurz do 45 st. od smeru prvnich 20 s
+         jizdy vpred pri owner=gps) a ZPET (opacny smer). Stejne znamenko
+         v obou smerech = chyba spojena s robotem (cas, zpozdeni); opacne
+         = posun pevny v mape (datum, georeference).
+   gps_along_abs_p95_cm     |podel| p95 za jizdy (|v| > 0,1 m/s)
+   gps_cross_med_cm, gps_cross_abs_p95_cm   slozka pricne za jizdy
+   gps_gap_fit_dt_s         zbytkovy casovy posun: smernice primky
+         podel = dt * v + c pres vzorky za jizdy. Kontrola opravy razitek
+         (0 = razitka sedi; obsahuje i zpozdeni dodani navpvt a kotvy).
+   takeover_gap_odom_med_cm / _max_cm, takeover_settle_odom_med_s / _max_s
+         jako takeover_gap_* / takeover_settle_*, ale z teto mezery.
 D. Predani kurzu po vyjezdu (dok -> GNSS)
    Okno predani = souvisly usek po opusteni doku, kdy se yaw map->odom meni
    (mezery mezi zmenami <= 5 s) a konci presnou nulou.
@@ -114,6 +148,12 @@ G. Kotvy (loc_status pri owner=gps)
          /odometry/gps, uz prisla zprava /odometry/ekf_wheel_odom s razitkem
          >= razitko vzorku. Median pres 10 fazi tiku. Jen udaj; do priznaku
          vstupuje jen u nahravek bez pole anchor_mode.
+   anchor_buffered_share_med_pct, anchor_buffered_share_p05_pct
+         skutecny podil vzorku GPS ulozenych do bufferu kotvy: pole
+         anchor_buffered_share z loc_status pri owner=gps (median a 5.
+         percentil). Jen s polem v nahravce (anchor_mode_report). Nahrazuje
+         odhad gps_buffered_est_pct, ktery se zapnutym gps_stamp_offset_track
+         nic nerika (pocita s neopravenymi razitky).
    Priznak pos_metrics_invalid (vedle metrics; True/False/None = nelze urcit):
    jizda bezela z vetsi casti v nouzovem rezimu kotvy nebo kotva hladovela,
    takze kroky EKF, mezera fuze - GPS a kolisani polohy meri ten rezim, ne
@@ -131,6 +171,7 @@ H. Ostatni
    mbf_fail_n        pocet vysledku exe_path s outcome != 0
 """
 import argparse
+import calendar
 import json
 import math
 import os
@@ -139,7 +180,7 @@ import sys
 
 import numpy as np
 
-VERSION = 2
+VERSION = 3
 
 TOPICS = {
     'tf': '/tf',
@@ -442,6 +483,102 @@ def gps_gap(T, ekf, gps, episodes):
     if not tb:
         return np.array([]), np.array([]), np.array([], dtype=bool)
     return np.concatenate(tb), np.concatenate(gap), np.concatenate(ing)
+
+
+def rolling_median(t, v, tq, win_s=60.0):
+    """Klouzavy median v(t) v okne +-win_s/2 kolem casu tq (t rostouci).
+    Okno bez vzorku -> nejblizsi vzorek."""
+    t, v, tq = np.asarray(t, dtype=float), np.asarray(v, dtype=float), np.atleast_1d(tq)
+    a = np.searchsorted(t, tq - 0.5 * win_s, side='left')
+    b = np.searchsorted(t, tq + 0.5 * win_s, side='right')
+    out = np.empty(len(tq))
+    for k in range(len(tq)):
+        if b[k] > a[k]:
+            out[k] = np.median(v[a[k]:b[k]])
+        else:
+            out[k] = v[int(np.clip(a[k], 0, len(v) - 1))]
+    return out
+
+
+def stamp_offset(tq, pvt=None, gps=None, win_s=60.0):
+    """Posun hodin (systemovy cas - UTC prijimace) v casech bagu tq.
+    pvt: N x >=5 (bag_t, ..., utc ve sloupci 4; NaN = neplatny cas); gps:
+    /odometry/gps (bag_t, stamp, ...) jako nahrada. Vraci (pole, zdroj) nebo
+    (None, None). Pocita se na mrizce po 5 s a linearne interpoluje."""
+    src = None
+    if pvt is not None and len(pvt) >= 3 and pvt.shape[1] >= 5:
+        ok = np.isfinite(pvt[:, 4])
+        if ok.sum() >= 3:
+            t, d, src = pvt[ok, 0], pvt[ok, 0] - pvt[ok, 4], 'navpvt'
+    if src is None and gps is not None and len(gps) >= 3:
+        t, d, src = gps[:, 0], gps[:, 0] - gps[:, 1], 'gps'
+    if src is None:
+        return None, None
+    grid = np.arange(t[0], t[-1] + 5.0, 5.0)
+    return np.interp(tq, grid, rolling_median(t, d, grid, win_s)), src
+
+
+def gps_gap_odom(ekf, gps, off, episodes, pvt=None):
+    """Mezera EKF - GPS v ramu odom s opravenymi razitky (oddil C2).
+    off = posun hodin pro kazdy vzorek gps (pole) nebo skalar. Vraci dict
+    poli pres vzorky do 20 s pred epizodou gps a v ni: t (cas bagu), gap,
+    along, cross [m], v [m/s], yaw [rad, kurz EKF], in_gps, fixed (prijimac
+    mel v case prijeti vzorku RTK fix, carrSoln == 2; bez pvt vse True)."""
+    off = np.broadcast_to(np.asarray(off, dtype=float), (len(gps),))
+    sel = np.zeros(len(gps), dtype=bool)
+    ing = np.zeros(len(gps), dtype=bool)
+    for (a, b) in episodes:
+        sel |= (gps[:, 0] >= a - 20.0) & (gps[:, 0] <= b)
+        ing |= (gps[:, 0] >= a) & (gps[:, 0] <= b)
+    g, ts = gps[sel], gps[sel, 1] + off[sel]
+    inside = (ts >= ekf[0, 1]) & (ts <= ekf[-1, 1])
+    g, ts, ing = g[inside], ts[inside], ing[sel][inside]
+    dx = np.interp(ts, ekf[:, 1], ekf[:, 2]) - g[:, 2]
+    dy = np.interp(ts, ekf[:, 1], ekf[:, 3]) - g[:, 3]
+    yaw = np.interp(ts, ekf[:, 1], np.unwrap(ekf[:, 5]))
+    c, s = np.cos(yaw), np.sin(yaw)
+    fixed = np.ones(len(g), dtype=bool)
+    if pvt is not None and len(pvt):
+        fixed = hold(g[:, 0], pvt[:, 0], pvt[:, 2]) == 2
+    return dict(t=g[:, 0], gap=np.hypot(dx, dy), along=dx * c + dy * s, cross=-dx * s + dy * c,
+                v=np.interp(ts, ekf[:, 1], ekf[:, 6]), yaw=yaw, in_gps=ing, fixed=fixed)
+
+
+def gap_odom_stats(G):
+    """Souhrn oddilu C2 z vystupu gps_gap_odom (jen vzorky in_gps a fixed)."""
+    keys = ['gps_gap_odom_med_cm', 'gps_gap_odom_p95_cm', 'gps_gap_standing_med_cm',
+            'gps_along_med_cm', 'gps_along_out_med_cm', 'gps_along_back_med_cm',
+            'gps_along_abs_p95_cm', 'gps_cross_med_cm', 'gps_cross_abs_p95_cm', 'gps_gap_fit_dt_s',
+            'gps_gap_rtk_fixed_pct']
+    M = {k: None for k in keys}
+    m = G['in_gps']
+    if not m.any():
+        return M
+    M['gps_gap_rtk_fixed_pct'] = 100.0 * float(G['fixed'][m].mean())
+    m = m & G['fixed']
+    if not m.any():
+        return M
+    gap, al, cr, v, yaw = G['gap'][m], G['along'][m], G['cross'][m], G['v'][m], G['yaw'][m]
+    med = lambda a, k=1: 100 * float(np.median(a)) if len(a) >= k else None
+    M['gps_gap_odom_med_cm'] = med(gap)
+    M['gps_gap_odom_p95_cm'] = 100 * pct(gap, 95)
+    M['gps_gap_standing_med_cm'] = med(gap[np.abs(v) < 0.02], 10)
+    mv, fwd = np.abs(v) > 0.1, v > 0.1
+    if mv.sum() >= 10:
+        M['gps_along_abs_p95_cm'] = 100 * pct(np.abs(al[mv]), 95)
+        M['gps_cross_med_cm'] = med(cr[mv])
+        M['gps_cross_abs_p95_cm'] = 100 * pct(np.abs(cr[mv]), 95)
+        if np.ptp(v[mv]) > 0.05:
+            A = np.c_[v[mv], np.ones(int(mv.sum()))]
+            M['gps_gap_fit_dt_s'] = float(np.linalg.lstsq(A, al[mv], rcond=None)[0][0])
+    if fwd.sum() >= 10:
+        M['gps_along_med_cm'] = med(al[fwd])
+        first = np.flatnonzero(fwd)[:200]
+        ref = math.atan2(float(np.mean(np.sin(yaw[first]))), float(np.mean(np.cos(yaw[first]))))
+        d = np.cos(yaw - ref)
+        M['gps_along_out_med_cm'] = med(al[fwd & (d > 0.7)], 20)
+        M['gps_along_back_med_cm'] = med(al[fwd & (d < -0.7)], 20)
+    return M
 
 
 def takeover_stats(gt, gap, episodes):
@@ -779,6 +916,50 @@ def score(D):
                 notes[k] = 'v nahravce neni zadna epizoda owner=gps'
     else:
         missing(keysC2, TOPICS['loc'], TOPICS['tf'], TOPICS['ekf'], TOPICS['gps'])
+    # C2. mezera s opravou razitek, v ramu odom
+    keysC3 = ['gps_stamp_offset_s', 'gps_gap_odom_med_cm', 'gps_gap_odom_p95_cm',
+              'gps_gap_standing_med_cm', 'gps_along_med_cm', 'gps_along_out_med_cm',
+              'gps_along_back_med_cm', 'gps_along_abs_p95_cm', 'gps_cross_med_cm',
+              'gps_cross_abs_p95_cm', 'gps_gap_fit_dt_s', 'gps_gap_rtk_fixed_pct',
+              'takeover_gap_odom_med_cm',
+              'takeover_gap_odom_max_cm', 'takeover_settle_odom_med_s', 'takeover_settle_odom_max_s']
+    if has_loc and ekf is not None and _have(D, 'gps', 3):
+        off, off_src = stamp_offset(D['gps'][:, 0], D.get('pvt') if _have(D, 'pvt', 3) else None,
+                                    D['gps'])
+        for k in keysC3:
+            M[k] = None
+        M['gps_stamp_offset_s'] = float(np.median(off))
+        meta['gps_stamp_offset_src'] = off_src
+        meta['gps_stamp_offset_range_s'] = [round(float(off.min()), 3), round(float(off.max()), 3)]
+        if off_src != 'navpvt':
+            notes['gps_stamp_offset_s'] = ('z (prijeti - razitko) %s, chybi %s s casem UTC: '
+                                           'obsahuje i zpozdeni navsatu' % (TOPICS['gps'], TOPICS['pvt']))
+        if abs(M['gps_stamp_offset_s']) > 0.1:
+            for k in keysC2:
+                if M.get(k) is not None:
+                    notes[k] = 'zkreslene posunem hodin %+.2f s' % M['gps_stamp_offset_s']
+        if episodes:
+            G = gps_gap_odom(ekf, D['gps'], off, episodes, D.get('pvt') if _have(D, 'pvt', 3) else None)
+            M.update(gap_odom_stats(G))
+            tk = takeover_stats(G['t'], G['gap'], episodes)
+            gaps = [x['gap_cm'] for x in tk if x['gap_cm'] is not None]
+            sett = [x['settle_s'] for x in tk if x['settle_s'] is not None]
+            M['takeover_gap_odom_med_cm'] = float(np.median(gaps)) if gaps else None
+            M['takeover_gap_odom_max_cm'] = max(gaps) if gaps else None
+            M['takeover_settle_odom_med_s'] = float(np.median(sett)) if sett else None
+            M['takeover_settle_odom_max_s'] = max(sett) if sett else None
+            if len(sett) < len(tk):
+                notes['takeover_settle_odom_max_s'] = (
+                    '%d z %d prevzeti se v epizode nedorovnalo pod %g cm'
+                    % (len(tk) - len(sett), len(tk), 100 * SETTLE_M))
+            for x in tk:
+                x['t'] = round(x['t'] - t_beg, 2)
+            detail['takeovers_odom'] = tk
+        else:
+            for k in keysC3[1:]:
+                notes[k] = 'v nahravce neni zadna epizoda owner=gps'
+    else:
+        missing(keysC3, TOPICS['loc'], TOPICS['ekf'], TOPICS['gps'])
 
     # D, E, F. dok
     keysD = ['yaw_handover_s', 'yaw_handover_turn_deg', 'yaw_handover_excess_deg',
@@ -892,6 +1073,18 @@ def score(D):
     if mG['anchor_fallback_pct'] is None:
         notes['anchor_fallback_pct'] = ('%s (chybi %s)' % (NA, TOPICS['loc']) if not has_loc
                                         else 'v nahravce neni zadny vzorek owner=gps')
+    bs = D.get('loc_buffered_share') if has_loc else None
+    M['anchor_buffered_share_med_pct'] = M['anchor_buffered_share_p05_pct'] = None
+    if bs is not None:
+        b_ok = bs[(np.asarray(owner) == 'gps') & np.isfinite(bs)]
+        if len(b_ok):
+            M['anchor_buffered_share_med_pct'] = 100 * float(np.median(b_ok))
+            M['anchor_buffered_share_p05_pct'] = 100 * pct(b_ok, 5)
+    if M['anchor_buffered_share_med_pct'] is None:
+        for k in ('anchor_buffered_share_med_pct', 'anchor_buffered_share_p05_pct'):
+            notes[k] = 'v nahravce neni pole anchor_buffered_share (anchor_mode_report vypnuty)'
+    elif mG['gps_buffered_est_pct'] is not None:
+        notes['gps_buffered_est_pct'] = 'jen odhad bez opravy razitek; plati anchor_buffered_share'
     if mG['gps_rx_minus_stamp_s'] is None:
         notes['gps_rx_minus_stamp_s'] = '%s (chybi %s)' % (NA, TOPICS['gps'])
     if mG['gps_buffered_est_pct'] is None:
@@ -982,11 +1175,19 @@ def parse_tf(buf):
     return out
 
 
+def pvt_utc(year, month, day, hour, minute, sec, nano, valid=3):
+    """Cas UTC zpravy NAV-PVT [s od 1970]; NaN, kdyz prijimac nema platne
+    datum a cas (valid bity 0 a 1)."""
+    if (valid & 3) != 3 or year < 2020:
+        return float('nan')
+    return calendar.timegm((year, month, day, hour, minute, sec)) + nano * 1e-9
+
+
 def extract(bag_path):
     """Jedno cteni bagu -> dict poli (vytah). Vsechna 2D pole maji v prvnim
     sloupci cas bagu; odometrie: (bag_t, stamp, x, y, z, yaw, vx, vy, wz);
     mo/ob: (bag_t, stamp, x, y, z, yaw); imu: (bag_t, stamp, yaw, wz);
-    gps: (bag_t, stamp, x, y, z); pvt: (bag_t, fixType, carrSoln, hAcc_m);
+    gps: (bag_t, stamp, x, y, z); pvt: (bag_t, fixType, carrSoln, hAcc_m, utc);
     hrel: (bag_t, carrSoln, headValid, heading_deg, accHeading_deg);
     dock: (bag_t, hodnota). Chybejici tema = klic chybi."""
     import rosbag
@@ -1028,7 +1229,9 @@ def extract(bag_path):
                 elif k == 'dock':
                     rows[k].append((ts, m.data))
                 elif k == 'pvt':
-                    rows[k].append((ts, m.fixType, (m.flags >> 6) & 3, m.hAcc * 1e-3))
+                    rows[k].append((ts, m.fixType, (m.flags >> 6) & 3, m.hAcc * 1e-3,
+                                    pvt_utc(m.year, m.month, m.day, m.hour, m.min, m.sec,
+                                            m.nano, m.valid)))
                 elif k == 'hrel':
                     rows[k].append((ts, (m.flags >> 3) & 3, (m.flags >> 8) & 1,
                                     m.relPosHeading * 1e-5, m.accHeading * 1e-5))
@@ -1048,6 +1251,7 @@ def extract(bag_path):
         D['loc_heading_age'] = np.array([fl(j.get('heading_anchor_age_s')) for j in js])
         D['loc_anchor_mode'] = np.array([str(j.get('anchor_mode') or '') for j in js])
         D['loc_anchor_starving'] = np.array([bool(j.get('anchor_starving')) for j in js])
+        D['loc_buffered_share'] = np.array([fl(j.get('anchor_buffered_share')) for j in js])
     if TOPICS['res'] in counts:
         D['res_outcome'] = np.array([r[1] for r in res], dtype=int)
     if TOPICS['rosout'] in counts or TOPICS['rosout_agg'] in counts:
@@ -1109,12 +1313,30 @@ SPEC = [
     ('C. Vlastnik pozy', None, None, None),
     ('owner_changes', 'zmen vlastnika', '', 'low'),
     ('owner_dr_gps_per_hour', 'prepnuti dr<->gps za hodinu', '/h', 'low'),
-    ('takeover_gap_med_cm', 'mezera pred prevzetim GPS, median', 'cm', 'low'),
-    ('takeover_gap_max_cm', 'mezera pred prevzetim GPS, max', 'cm', 'low'),
-    ('takeover_settle_med_s', 'doba dorovnani po prevzeti, median', 's', 'low'),
-    ('takeover_settle_max_s', 'doba dorovnani po prevzeti, max', 's', 'low'),
-    ('gps_gap_med_cm', '|fuze - GPS| pri owner=gps, median', 'cm', 'low'),
-    ('gps_gap_p95_cm', '|fuze - GPS| pri owner=gps, p95', 'cm', 'low'),
+    ('takeover_gap_med_cm', '(stare*) mezera pred prevzetim GPS, median', 'cm', 'low'),
+    ('takeover_gap_max_cm', '(stare*) mezera pred prevzetim GPS, max', 'cm', 'low'),
+    ('takeover_settle_med_s', '(stare*) doba dorovnani po prevzeti, median', 's', 'low'),
+    ('takeover_settle_max_s', '(stare*) doba dorovnani po prevzeti, max', 's', 'low'),
+    ('gps_gap_med_cm', '(stare*) |fuze - GPS| pri owner=gps, median', 'cm', 'low'),
+    ('gps_gap_p95_cm', '(stare*) |fuze - GPS| pri owner=gps, p95', 'cm', 'low'),
+    ('C2. Mezera EKF - GPS, razitka opravena o posun hodin, ram odom  (*stare = zkreslene pri posunu hodin)',
+     None, None, None),
+    ('gps_stamp_offset_s', 'posun hodin (system - UTC prijimace), median', 's', 'info'),
+    ('gps_gap_odom_med_cm', '|EKF - GPS| pri owner=gps, median', 'cm', 'low'),
+    ('gps_gap_odom_p95_cm', '|EKF - GPS| pri owner=gps, p95', 'cm', 'low'),
+    ('gps_gap_standing_med_cm', '|EKF - GPS| ve stoje, median', 'cm', 'low'),
+    ('gps_along_med_cm', 'podel drahy (+ EKF vpredu), median, jizda vpred', 'cm', 'abs'),
+    ('gps_along_out_med_cm', 'podel drahy, smer TAM, median', 'cm', 'abs'),
+    ('gps_along_back_med_cm', 'podel drahy, smer ZPET, median', 'cm', 'abs'),
+    ('gps_along_abs_p95_cm', '|podel drahy| za jizdy, p95', 'cm', 'low'),
+    ('gps_cross_med_cm', 'pricne (+ EKF vlevo), median za jizdy', 'cm', 'abs'),
+    ('gps_cross_abs_p95_cm', '|pricne| za jizdy, p95', 'cm', 'low'),
+    ('gps_gap_fit_dt_s', 'zbytkovy casovy posun z primky podel ~ v', 's', 'info'),
+    ('gps_gap_rtk_fixed_pct', 'podil vzorku owner=gps s RTK fixem (jen ty vyse)', '%', 'info'),
+    ('takeover_gap_odom_med_cm', 'mezera pred prevzetim GPS, median', 'cm', 'low'),
+    ('takeover_gap_odom_max_cm', 'mezera pred prevzetim GPS, max', 'cm', 'low'),
+    ('takeover_settle_odom_med_s', 'doba dorovnani po prevzeti, median', 's', 'low'),
+    ('takeover_settle_odom_max_s', 'doba dorovnani po prevzeti, max', 's', 'low'),
     ('D. Kurz: predani po vyjezdu a klid ve stoje', None, None, None),
     ('yaw_handover_s', 'doba predani kurzu', 's', 'low'),
     ('yaw_handover_turn_deg', 'otoceni map->odom pri predani', 'st', 'info'),
@@ -1144,6 +1366,8 @@ SPEC = [
     ('anchor_starving_pct', 'kotva polohy hladovi (malo vzorku GPS)', '%', 'low'),
     ('gps_rx_minus_stamp_s', '/odometry/gps: prijeti - razitko, median', 's', 'info'),
     ('gps_buffered_est_pct', 'odhad: vzorky GPS do bufferu bez opravy razitek', '%', 'info'),
+    ('anchor_buffered_share_med_pct', 'vzorky GPS v bufferu kotvy (loc_status), median', '%', 'info'),
+    ('anchor_buffered_share_p05_pct', 'vzorky GPS v bufferu kotvy (loc_status), p05', '%', 'info'),
     ('H. Ostatni', None, None, None),
     ('z_drift_m', 'drift vysky EKF (konec - zacatek)', 'm', 'abs'),
     ('z_range_m', 'rozsah vysky EKF', 'm', 'low'),

@@ -10,7 +10,7 @@ Zdroje čísel: **[B]** = `~/bags/nav_test/nav_baseline_2026-11-15_a.bag` (2× d
 
 ---
 
-## Stav vypínačů úprav (16. 11. 2026 02:30)
+## Stav vypínačů úprav (16. 11. 2026 04:20)
 
 | Úprava | Parametr | Stav | Důkaz | Vrácení |
 |---|---|---|---|---|
@@ -21,12 +21,16 @@ Zdroje čísel: **[B]** = `~/bags/nav_test/nav_baseline_2026-11-15_a.bag` (2× d
 | E5 navsat ve vlastním vlákně | `navsat_async` | **zapnuto** | série 4 (2 proti 8): největší mezera `/tf` 0,95–1,36 s → 0,13–0,14 s | `git revert c998e8d` |
 | E6 vyhlazení cíle kurzu | `heading_target_smooth` | vypnuto | série 4 a 5 (4 platné jízdy proti 5): skoky kurzu mapy 9–29 proti 15–40, rozkmit ve stoje 2,4–4,1° proti 2,8–5,7°; jednou ustálení po převzetí 65 s (jinde do 9 s) – příčina neznámá, doměřit a prověřit | – |
 | Hlídač kurzu magnetometrem (T35) | `mag_check_enable`, `mag_disagree_deg` 15 | **zapnuto**, jen hlásí | zpětný přepočet jízd: 0 planých poplachů i při 10° | `git revert d1f73c9` |
+| M1 hlídač kurzu i při výjezdu a příjezdu (T35) | `mag_check_wide` | **zapnuto**, jen hlásí | přepočet 18 jízd: pokrytí 6,9 → 70,7 % času mimo dok, 0 poplachů i při 6°; práh nesnižovat pod ~12° (rezerva mimo nahraná místa neověřená) | vrátit commit „M1 zapnuto“ v `navi_man.launch` (kód `3129059`) |
+| M2 hlášení RTK kurz × magnetometr (T35) | `rtk_mag_report`, 6° / 0,3 s | **zapnuto**, jen hlásí (pole `rtk_mag_*`) | přepočet: příznak u 9 z 36 příjezdů, medián 0,8 s před koncem RTK | `git revert fe70f0e` (kód `0b205dd`) |
 
 Past měření (15. 11.): běh `nav_s3_d3_1` jel ve skutečnosti s D2, měřicí skript restartoval cizí proces (hledání PID bez ukotvení). Skóre toho běhu se počítá k D2.
 
 Série 4 (15.–16. 11., 10 jízd, výchozí = D1+D2): zátěž stroje 14–43 (první kolo souběžně s testy agentů), závěry jen z rozdílů shodných v obou kolech. Skóre `nav_s4_*`.
 
 Série 5 (16. 11. 01:12–02:22, 9 jízd, výchozí = D1+D2+D4+E5, zátěž 15–39): běh `nav_s5_e6_2` neplatí (agent misi uzavřel bez jízdy jako už hotovou). Ve třetím kole u D3 i E6 výrazně víc kroků EKF nad 1 cm (93 a 55 /min proti 14–36) – výchozí jízda téhož kola je v normě, příčina neurčena. Skóre `nav_s5_*`.
+
+Nález T35 (rozbor 18 jízd): „platný“ RTK kurz je v posledních 4–9 s před ztrátou u garáže (1,3–3,3 m od doku) mimo u 35 z 36 příjezdů (medián 6,3°, max 27°). Brána magnetometrem (M3, `rtk_mag_gate`) kontrolou NEPROŠLA a není v `main` (práh v šumu, plané zamítání při otáčení, cyklus při vadném magnetometru; patch odložen). Lepší kandidát k měření jízdou: delší `heading_anchor_lag_s` (dnes 2,5 s) – přepočet: 8 s → chyba kurzu při zadokování RMS 1,13°, 12 s → 0,90° proti dnešním 1,64°, bez zamítání; cena = každá korekce kurzu přijde později.
 
 ## 1. Rámce a kdo je píše
 

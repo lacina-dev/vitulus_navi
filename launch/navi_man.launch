@@ -37,6 +37,12 @@
                  (was tracker-only); micro refinements still pass.
                  ROLLBACK: dock_gate_non_dock:=false -->
             <param name="dock_gate_non_dock" value="true"/>
+            <!-- T36 D3 2026-11-16 pri prevzeti kurzu z GPS dotacet map->odom podle
+                 skutecneho natoceni EKF: 5 jizd proti 5 (serie 4 a 5), skoky kurzu mapy nad
+                 0.3 deg 15-40 -> 10-18, nejvetsi krok pri predani 0.71-0.85 deg -> 0.43-0.52 deg,
+                 nadbytecne otaceni 9-34 deg -> 6-10 deg; rozkmit kurzu ve stoje beze zmeny.
+                 ROLLBACK: handover_follow_ekf:=false -->
+            <param name="handover_follow_ekf" value="true"/>
             <param name="dock_micro_m" value="0.05"/>
             <param name="dock_micro_deg" value="1.0"/>
             <!-- T36 E5 2026-11-16 navsat_transform se spousti ve vlastnim vlakne: 2 jizdy

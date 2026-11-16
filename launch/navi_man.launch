@@ -10,6 +10,10 @@
 <!--            <remap from="/topic" to="/another_topic" />-->
         <!-- </node> -->
         <node name="navi_transform" pkg="vitulus_navi" type="navi_transform" respawn="true" respawn_delay="1" output="log">
+            <!-- T35 M1 2026-11-16 hlidac kurzu magnetometrem hlida i pri vyjezdu a prijezdu
+                 (dok = jen skutecne stani v doku): prepocet 18 jizd, pokryti 6.9 -> 70.7 %
+                 casu mimo dok, 0 poplachu. Jen hlasi. ROLLBACK: mag_check_wide:=false -->
+            <param name="mag_check_wide" value="true"/>
             <!-- 2026-08-02 field fix: spread cap musi pojmout realny sum vzorku
                  (sigma 1.2-1.6 deg) — 1.5 deg okno NIKDY neproslo (vecny freeze).
                  6 deg = ~2.5 sigma; multipath rampu (>1 deg/s) chyti i tak. -->

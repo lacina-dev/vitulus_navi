@@ -3331,8 +3331,9 @@ class NavTfNode:
 
     def _rmr_setup(self):
         """The one switch (~rtk_mag_report): without it nothing of M2 runs."""
-        self._rmr_enable = bool(rospy.get_param('~rtk_mag_report', False))
-        if not self._rmr_enable:
+        enable = bool(rospy.get_param('~rtk_mag_report', False))
+        self._rmr_enable = False
+        if not enable:
             return
         self._rmr_cfg = {
             'disagree_deg': float(rospy.get_param('~rtk_mag_disagree_deg', 6.0)),
@@ -3345,6 +3346,7 @@ class NavTfNode:
         self._rmr_ref = None        # (rx time, mag yaw - imu yaw) of the last `ok` message
         self._rmr_last = None       # (time, rtk - mag deg) of the last comparison
         topic = rospy.get_param('~rtk_mag_report_topic', '/bno085/mag_heading')
+        self._rmr_enable = True
         self._rmr_sub = rospy.Subscriber(topic, Imu, self._rmr_cb_mag, queue_size=5)
         rospy.loginfo(
             '[rtk_mag] RTK heading against the magnetometer ENABLED (report only): %s, '

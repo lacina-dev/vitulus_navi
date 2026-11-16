@@ -30,6 +30,9 @@
                  cannot drift between the old 5 s re-anchor pulses.
                  ROLLBACK: dock_anchor_enable:=false (back to pulse re-anchor). -->
             <param name="dock_anchor_enable" value="true"/>
+            <!-- T35 M2 2026-11-16 hlaseni nesouhlasu RTK kurzu s magnetometrem do loc_status
+                 (pole rtk_mag_*), do rizeni nezasahuje. ROLLBACK: rtk_mag_report:=false -->
+            <param name="rtk_mag_report" value="true"/>
             <param name="dock_anchor_debounce_s" value="2.0"/>
             <param name="dock_anchor_max_hold_m" value="3.0"/>
             <!-- T36 D4 2026-11-16 prvni zapis dokove pozy po zadokovani plynule (0.10 m/s)

@@ -136,6 +136,53 @@ def georef_map_odom_xy(utm_odom_xy, utm_map_xy, map_yaw):
     return (c * dx + s * dy, -s * dx + c * dy)
 
 
+# ---- T36 H1: odom->base_link and map->odom stamped with the nav-EKF message
+# (pure; tools/test_t36_h1_tf_ekf_stamp.py) -----------------------------------
+
+def tf_ekf_stamp_decide(msg_stamp, last_stamp, now, max_age_s):
+    """What a nav-EKF message does to /tf with ~tf_ekf_stamp on (times in s):
+      'ekf'      broadcast now, both transforms stamped msg_stamp
+      'repeat'   msg_stamp is not newer than the last broadcast stamp (the same
+                 message again, out of order, or the loop already stamped past
+                 it) - tf2 drops such a transform (TF_REPEATED_DATA /
+                 TF_OLD_DATA), so it is not sent
+      'old'      msg_stamp is more than max_age_s behind the clock
+      'future'   msg_stamp is ahead of the clock
+      'invalid'  no / non-finite stamp
+    Anything but 'ekf' broadcasts nothing; the 30 Hz loop takes over (loop
+    time, last pose - as without the parameter) once no 'ekf' happened for
+    ~tf_ekf_stamp_hold_s, see tf_ekf_stamp_loop_due and tf_ekf_stamp_handback."""
+    if not (math.isfinite(msg_stamp) and math.isfinite(now)) or msg_stamp <= 0.0:
+        return 'invalid'
+    if msg_stamp > now:
+        return 'future'
+    if now - msg_stamp > max_age_s:
+        return 'old'
+    if msg_stamp <= last_stamp:
+        return 'repeat'
+    return 'ekf'
+
+
+def tf_ekf_stamp_loop_due(now, last_ekf_tick, hold_s):
+    """True when the 30 Hz loop has to broadcast itself (as without the
+    parameter): no EKF-stamped broadcast yet, none for hold_s, or the clock
+    went back."""
+    return last_ekf_tick is None or not (0.0 <= now - last_ekf_tick <= hold_s)
+
+
+def tf_ekf_stamp_handback(why, loop_mode, msg_stamp, last_msg_stamp):
+    """True when a message the loop has already stamped past ('repeat' while
+    the loop broadcasts) is nevertheless a NEW EKF message: the loop then has
+    to go quiet for hold_s so that the NEXT message is newer than the last
+    broadcast and takes /tf over. Without it a message that keeps arriving
+    just after the loop tick (both run at 30 Hz, the phase holds) is 'repeat'
+    for ever and the loop never hands back. The message itself is not sent
+    (its stamp is behind the last broadcast). A repeated or stuck stamp does
+    not silence the loop."""
+    return bool(loop_mode and why == 'repeat' and last_msg_stamp is not None
+                and msg_stamp > last_msg_stamp)
+
+
 # ---- UTM frame observability (/nav_tf/georef_status, vitulus-field#32) -----
 # WGS84 <-> UTM with the USGS series robot_localization's navsat_conversions
 # uses (the same as ~/vitulus-field/tools/gps-map-probe), so the "map vs GPS"
@@ -960,6 +1007,27 @@ class NavTfNode:
         self.ekf_wheel_odom_msg.pose.pose.orientation.w = 1
         self.ekf_wheel_nav_odom_msg = Odometry()
         self.ekf_wheel_nav_odom_msg.pose.pose.orientation.w = 1
+        # T36 H1 (~tf_ekf_stamp, default off = as before: the 30 Hz loop stamps
+        # the last EKF pose with its own time, so a pose up to ~45 ms old goes
+        # out as "now" and 0.05-16 % of the ticks repeat the previous pose). On:
+        # every nav-EKF message is broadcast once, when it arrives, both
+        # transforms stamped with the message; see _tes_on_ekf.
+        self._tes_enable = bool(rospy.get_param('~tf_ekf_stamp', False))
+        self._tes_max_age_s = float(rospy.get_param('~tf_ekf_stamp_max_age_s', 0.1))
+        self._tes_hold_s = float(rospy.get_param('~tf_ekf_stamp_hold_s', 0.05))
+        self._tes_lock = threading.Lock()
+        self._tes_tick = object()        # marks loop30hz runs started by H1
+        self._tes_pending = None         # stamp of the EKF message being broadcast
+        self._tes_last_stamp = 0.0       # stamp of the last broadcast (s)
+        self._tes_last_ekf_t = None      # clock of the last EKF-stamped broadcast
+        self._tes_last_msg = 0.0         # stamp of the last EKF message received
+        self._tes_loop_mode = True       # the loop broadcasts (start / EKF silent)
+        self._tes_n = {'ekf': 0, 'loop': 0, 'repeat': 0, 'old': 0, 'future': 0,
+                       'invalid': 0, 'handback': 0}
+        if self._tes_enable:
+            rospy.loginfo('[tf_ekf_stamp] odom->base_link and map->odom stamped with the '
+                          'nav-EKF message ENABLED (max age %.2f s, loop takes over after '
+                          '%.3f s without one)' % (self._tes_max_age_s, self._tes_hold_s))
         self.map_coords_msg = PoseStamped()
         self.map_odom_transform = TransformStamped()
         self.map_odom_transform.transform.rotation.w = 1
@@ -2653,6 +2721,88 @@ class NavTfNode:
         q = msg.pose.pose.orientation
         self._nav_yaw_hist.append((msg.header.stamp.to_sec(),
                                    euler_from_quaternion([q.x, q.y, q.z, q.w])[2]))
+        if getattr(self, '_tes_enable', False):     # T36 H1
+            self._tes_on_ekf(msg)
+
+    # ---- T36 H1: /tf stamped with the nav-EKF message (~tf_ekf_stamp) -------
+
+    def _tes_on_ekf(self, msg):
+        """Runs the body of loop30hz for THIS EKF message (in the subscriber
+        thread): odom->base_link is the pose of the message, both transforms
+        and nothing else carry its stamp, /odometry/odom goes out once per EKF
+        message. A message that cannot be used (tf_ekf_stamp_decide) sends
+        nothing; the timer then takes over, see _tes_gate."""
+        with self._tes_lock:
+            now = rospy.get_time()
+            stamp_s = msg.header.stamp.to_sec()
+            why = tf_ekf_stamp_decide(stamp_s, self._tes_last_stamp, now, self._tes_max_age_s)
+            self._tes_n[why] += 1
+            last_msg, self._tes_last_msg = self._tes_last_msg, stamp_s
+            if tf_ekf_stamp_handback(why, self._tes_loop_mode, stamp_s, last_msg):
+                self._tes_n['handback'] += 1
+                self._tes_last_ekf_t = now      # the loop waits for the next message
+            if why != 'ekf':
+                return
+            if self._tes_loop_mode:
+                self._tes_loop_mode = False
+                rospy.loginfo_throttle(10.0, '[tf_ekf_stamp] /tf follows the nav-EKF '
+                                       'messages %s' % self._tes_n)
+            self._tes_pending = msg.header.stamp
+            walk_t = getattr(self, '_dock_engage_last_t', None)
+            try:
+                self.loop30hz(self._tes_tick)
+            finally:
+                self._tes_pending = None
+            self._tes_walk_carry(walk_t)
+
+    def _tes_walk_carry(self, before):
+        """The dock engage walk (D4, when present) caps the time step of a
+        tick at 1/30 s, which the loop timer keeps to; the EKF messages come
+        unevenly, so every late one would lose the excess and the walk would
+        take longer. The excess (at most one period) is carried to the next
+        tick instead - a step still never exceeds 1/30 s of the slew."""
+        after = getattr(self, '_dock_engage_last_t', None)
+        if before is None or after is None or after <= before:
+            return
+        excess = (after - before) - 1.0 / 30.0
+        if excess > 0.0:
+            self._dock_engage_last_t = after - min(excess, 1.0 / 30.0)
+
+    def _tes_gate(self, event):
+        """First line of loop30hz with ~tf_ekf_stamp: True = run the body. A
+        run started by H1 passes. A timer tick does nothing while the EKF
+        messages drive /tf; after ~tf_ekf_stamp_hold_s without one it runs the
+        body itself with the loop time and the last pose - as without the
+        parameter."""
+        if event is self._tes_tick:
+            return True
+        if not tf_ekf_stamp_loop_due(rospy.get_time(), self._tes_last_ekf_t,
+                                     self._tes_hold_s):
+            return False
+        if not self._tes_lock.acquire(False):
+            return False            # an EKF message is being broadcast right now
+        try:
+            if not self._tes_loop_mode:
+                self._tes_loop_mode = True
+                rospy.logwarn_throttle(
+                    10.0, '[tf_ekf_stamp] no usable nav-EKF message for %.2f s - /tf '
+                    'from the 30 Hz loop (loop time, last pose) %s'
+                    % (self._tes_hold_s, self._tes_n))
+            self._tes_n['loop'] += 1
+            self.loop30hz(self._tes_tick)
+        finally:
+            self._tes_lock.release()
+        return False
+
+    def _tes_stamp(self):
+        """Stamp of this broadcast: the EKF message's, else the loop time."""
+        stamp = self._tes_pending
+        if stamp is not None:
+            self._tes_last_ekf_t = rospy.get_time()
+        else:
+            stamp = rospy.Time.now()
+        self._tes_last_stamp = stamp.to_sec()
+        return stamp
 
     # ---- anchor pairing fix helpers (2026-08-07) ---------------------------
     @staticmethod
@@ -5226,6 +5376,8 @@ class NavTfNode:
 
 
     def loop30hz(self, event=None):
+        if getattr(self, '_tes_enable', False) and not self._tes_gate(event):   # T36 H1
+            return
         self.publish_odom_for_gps()
         # TF-ATOMIC (2026-10-18, N1): odom->base and map->odom used to go out as
         # TWO /tf messages, each stamped with its own rospy.Time.now(), with the
@@ -5238,7 +5390,7 @@ class NavTfNode:
         # load the gap widens. Now both transforms carry ONE stamp and go out
         # in ONE message, map->odom first, so whenever odom->base(t) is in a
         # listener's buffer, map->odom(t) already is. Values are unchanged.
-        stamp = rospy.Time.now()
+        stamp = self._tes_stamp() if getattr(self, '_tes_enable', False) else rospy.Time.now()
         tf_out = []
         odom_base_tf = self.transform_odom_to_base_link(stamp)
         try:

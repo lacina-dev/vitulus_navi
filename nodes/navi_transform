@@ -608,6 +608,162 @@ def heading_smooth_step(diff_yaw, window, dt, tau_s, max_err_rad):
     return diff_yaw + share * err
 
 
+# ---- T36 F1: clock offset of the GPS stamps (pure, see
+# tools/test_t36_f1_gps_stamp_offset.py) -------------------------------------
+# /gnss/fix (and /odometry/gps, which navsat_transform stamps with the stamp
+# of the fix) carries the UTC of the receiver; every other input of the node
+# is stamped with the system clock, which is not disciplined (measured
+# -0.093 s/h against GPS, ntpdate steps it at boot). The position anchor
+# pairs a GPS sample with the wheel-EKF history AT ITS STAMP: a stamp 0.2 s
+# "in the future" is never found there, the buffer of the anchor stays empty
+# and the node falls back to set_pose on the newest GPS message 10 times a
+# second (series 6, 2026-11-16: 100 % of the time); a stamp "in the past" is
+# found, at the wrong place (v * offset along the track).
+# The offset is measured on /gnss/fix - the driver publishes it right away;
+# /odometry/gps leaves navsat_transform on its 10 Hz timer, 0.02-0.12 s later
+# and hopping by 0.1 s - as the median of (receive time - stamp) over a short
+# window minus transport_s; stamp + offset = the time of the sample on the
+# system clock.
+#   - a step of the SYSTEM clock (ntpdate) shows against the monotonic clock
+#     and is taken out of the window exactly, nothing is learnt anew;
+#   - a sample that came EARLY by more than step_s cannot be a delay: the
+#     samples are held back and after step_n of them in a row the window
+#     starts anew (the stamps of the receiver stepped, or a delay that had
+#     been taken for the offset is gone);
+#   - a sample that came LATE by more than step_s is a delay of the message
+#     (driver, USB, load): it is left out and the offset stays. Only when
+#     nothing but late samples came for late_adopt_s the window starts anew
+#     with them - by then it cannot be told from the stamps having stepped
+#     back; state['shifts'] counts it and the node reports it;
+#   - the window never ages below min_samples: with only a few messages on
+#     time the last ones on time keep the offset (late ones do not slip in);
+#   - outside those steps the offset in use moves by at most rate_max (the
+#     real drift is 0.03 ms/s): a delay that creeps up slowly is not followed
+#     as if the clock drifted; more than step_s behind = 'rate_hold', counted
+#     in state['rate_holds'] and reported.
+GPS_STAMP_OFFSET_CFG = {
+    'window_s': 20.0,       # window of the median
+    'min_samples': 5,       # fewer: no estimate
+    'transport_s': 0.0,     # see tools/test_t36_f1_gps_stamp_offset.py (26 drives: -0.01 +- 0.01)
+    'max_s': 120.0,         # |offset| above: no correction (reported)
+    'step_s': 0.05,         # a sample this far off the median is out of line
+    'step_n': 5,            # this many early ones in a row: the window starts anew
+    'late_adopt_s': 10.0,   # only late ones for this long: the window starts anew
+    'hold_s': 1.0,          # no pairing for this long after a step of the system clock
+    'rate_max': 0.0002,     # s/s: the offset in use moves at most this fast between steps
+}
+
+
+def gps_stamp_offset_new_state():
+    return {'win': [], 'early': [], 'late': [], 'prev': None, 'offset': None,
+            'raw': None, 'why': 'no_data', 'hold': False, 'hold_until': None,
+            'sys_steps': 0, 'sys_step_s': 0.0, 'shifts': 0, 'shift_s': 0.0,
+            'used': None, 'used_mono': None, 'rate_hold': False, 'rate_holds': 0}
+
+
+def _gso_median(rows):
+    ds = sorted(v for _, v in rows)
+    k = len(ds)
+    return ds[k // 2] if k % 2 else 0.5 * (ds[k // 2 - 1] + ds[k // 2])
+
+
+def gps_stamp_offset_step(st, rx_t, stamp_t, mono_t, cfg=None):
+    """One /gnss/fix message received at rx_t (system clock; mono_t = the
+    monotonic clock at that moment) with the stamp stamp_t. Updates and
+    returns the state:
+      why     'ok' | 'no_data' (fewer than min_samples: start, GPS back after
+              a gap) | 'over_max' (|offset| above max_s)
+      offset  system clock - GPS stamps [s] when 'ok', else None
+      hold    True while the last samples came early or the system clock has
+              just stepped: no GPS sample is paired
+      sys_steps / sys_step_s   steps of the system clock seen / the last one
+      shifts / shift_s         times the window started anew without a step
+                               of the system clock / by how much
+      rate_hold / rate_holds   the offset in use is more than step_s behind
+                               the measured one (st['raw']), held by rate_max
+                               / how many times that began"""
+    c = cfg or GPS_STAMP_OFFSET_CFG
+    d = rx_t - stamp_t
+    if not (math.isfinite(d) and stamp_t > 0.0):
+        return st
+    win, early, late = st['win'], st['early'], st['late']
+    prev = st['prev']
+    st['prev'] = (rx_t, mono_t)
+    if prev is not None:
+        jump = (rx_t - prev[0]) - (mono_t - prev[1])
+        if abs(jump) > c['step_s']:          # the system clock stepped by `jump`
+            for rows in (win, early, late):
+                rows[:] = [(t + jump, v + jump) for t, v in rows]
+            st['sys_steps'] += 1
+            st['sys_step_s'] = jump
+            st['hold_until'] = rx_t + c['hold_s']
+            if st['used'] is not None:
+                st['used'] += jump
+    while len(win) > int(c['min_samples']) and win[0][0] < rx_t - c['window_s']:
+        win.pop(0)
+    n_shift = st['shifts']
+    if len(win) < int(c['min_samples']):
+        del early[:], late[:]
+        win.append((rx_t, d))
+    else:
+        med = _gso_median(win)
+        if d < med - c['step_s']:
+            del late[:]
+            early.append((rx_t, d))
+            if len(early) >= int(c['step_n']) and \
+                    max(v for _, v in early) - min(v for _, v in early) <= c['step_s']:
+                st['shifts'] += 1
+                st['shift_s'] = _gso_median(early) - med
+                win[:] = early
+                del early[:]
+        elif d > med + c['step_s']:
+            del early[:]
+            late.append((rx_t, d))
+            if rx_t - late[0][0] >= c['late_adopt_s']:
+                st['shifts'] += 1
+                st['shift_s'] = _gso_median(late) - med
+                win[:] = late[-max(int(c['min_samples']), int(c['step_n'])):]
+                del late[:]
+        else:
+            del early[:], late[:]
+            win.append((rx_t, d))
+    st['hold'] = bool(early) or (st['hold_until'] is not None and rx_t < st['hold_until'])
+    if len(win) < int(c['min_samples']):
+        st['offset'], st['raw'], st['why'] = None, None, 'no_data'
+        return st
+    st['raw'] = _gso_median(win) - c['transport_s']
+    used, dt = st['used'], 0.0
+    if st['used_mono'] is not None:
+        dt = min(max(mono_t - st['used_mono'], 0.0), c['window_s'])
+    st['used_mono'] = mono_t
+    if used is None or st['shifts'] != n_shift:
+        used = st['raw']                      # first estimate, or a reported shift
+    else:
+        room = c['rate_max'] * dt
+        used += min(max(st['raw'] - used, -room), room)
+    st['used'] = used
+    behind = abs(st['raw'] - used) > c['step_s']
+    if behind and not st['rate_hold']:
+        st['rate_holds'] += 1
+    st['rate_hold'] = behind
+    if abs(used) > c['max_s']:
+        st['offset'], st['why'] = None, 'over_max'
+    else:
+        st['offset'], st['why'] = used, 'ok'
+    return st
+
+
+def gps_stamp_offset_time(why, offset, hold, stamp_t):
+    """The time of a GPS sample on the system clock: stamp_t + offset; None =
+    the sample is not paired (no offset yet, or held back); with the offset
+    above max_s the stamp as it is (the behaviour without the correction)."""
+    if why == 'over_max':
+        return stamp_t
+    if why != 'ok' or hold:
+        return None
+    return stamp_t + offset
+
+
 class NavTfNode:
 
     def __init__(self):
@@ -993,6 +1149,24 @@ class NavTfNode:
         self._wheel_hist = deque(maxlen=150)    # (t, x, y, yaw) @ 30 Hz = 5 s
         self._nav_yaw_hist = deque(maxlen=150)  # (t, yaw)       @ 30 Hz = 5 s
         self._last_buffered_gps_t = 0.0
+        # T36 F1: the stamp of /odometry/gps (UTC of the receiver) is moved
+        # onto the system clock before it is looked up in the histories above;
+        # the offset is measured on /gnss/fix (gps_stamp_offset_step). Off by
+        # default: the stamp is used as it is.
+        self._gso_enable = bool(rospy.get_param('~gps_stamp_offset_track', False))
+        if self._gso_enable:
+            self._gso_cfg = dict(GPS_STAMP_OFFSET_CFG)
+            for key in ('window_s', 'transport_s', 'max_s', 'step_s', 'late_adopt_s',
+                        'rate_max'):
+                self._gso_cfg[key] = float(rospy.get_param(
+                    '~gps_stamp_offset_' + key, self._gso_cfg[key]))
+            self._gso_st = gps_stamp_offset_new_state()
+            self._gso_now = ('no_data', None, False, 0.0)   # why, offset, hold, receive time
+            self._gso_seen = ('no_data', 0, 0, 0)   # why, sys_steps, shifts, rate_holds (logged)
+            self._gso_torn = 0                      # fixes dropped: the two clocks read apart
+            rospy.loginfo('[gps_stamp] offset tracking ENABLED (/gnss/fix, window %.0f s, '
+                          'transport %.2f s, max %.0f s)', self._gso_cfg['window_s'],
+                          self._gso_cfg['transport_s'], self._gso_cfg['max_s'])
         # Georef (map->odom) slew: rate-limit corrections from the utm georef
         # path; only a kidnap-size mismatch snaps.
         self._georef_slew_mps = float(rospy.get_param('~georef_slew_mps', 0.10))
@@ -2384,6 +2558,70 @@ class NavTfNode:
     def callback_wheel_odom(self, msg):
         self.wheel_odom_msg = msg
 
+    def _gso_sample(self, msg):
+        """T36 F1 (only with ~gps_stamp_offset_track): every /gnss/fix message
+        feeds the offset of the GPS stamps against the system clock; loop3sec
+        reads the result from _gso_now."""
+        try:
+            # the two clocks are read back to back (monotonic - system -
+            # monotonic); a thread switch in between would look like a step
+            # of the system clock, such a reading is dropped
+            mono = getattr(time, 'monotonic', time.time)
+            m0 = mono()
+            now = rospy.get_time()
+            m1 = mono()
+            if not 0.0 <= m1 - m0 <= 0.005:
+                self._gso_torn += 1
+                return
+            st = gps_stamp_offset_step(
+                self._gso_st, now, msg.header.stamp.to_sec(), 0.5 * (m0 + m1), self._gso_cfg)
+            self._gso_now = (st['why'], st['offset'], st['hold'], now)
+            why, n_sys, n_shift, n_rate = self._gso_seen
+            self._gso_seen = (st['why'], st['sys_steps'], st['shifts'], st['rate_holds'])
+            if st['rate_holds'] != n_rate:
+                rospy.logwarn('[gps_stamp] receive time - stamp of /gnss/fix creeps faster than a '
+                              'clock drifts (measured %+.3f s, in use %+.3f s) - offset held to '
+                              '%.2f ms/s', st['raw'], st['used'], 1e3 * self._gso_cfg['rate_max'])
+            if st['sys_steps'] != n_sys:
+                # the buffer and the age of the anchor are on the old clock
+                self._pose_buffer.clear()
+                if self._anchor_last_advance_t is not None:
+                    self._anchor_last_advance_t += st['sys_step_s']
+                rospy.logwarn('[gps_stamp] the SYSTEM clock stepped by %+.3f s - offset '
+                              'moved with it, anchor buffer emptied', st['sys_step_s'])
+            if st['shifts'] != n_shift:
+                rospy.logwarn('[gps_stamp] receive time - stamp of /gnss/fix moved by %+.3f s '
+                              'with NO step of the system clock (GPS stamps stepped, or the '
+                              'message is delayed for good) - offset follows, now %s s',
+                              st['shift_s'],
+                              'none' if st['offset'] is None else '%+.3f' % st['offset'])
+            if st['why'] != why:
+                if st['why'] == 'ok':
+                    rospy.loginfo('[gps_stamp] system clock - GPS stamps = %+.3f s '
+                                  '(stamps corrected by it)', st['offset'])
+                elif st['why'] == 'over_max':
+                    rospy.logwarn('[gps_stamp] offset %+.1f s above the limit - GPS stamps '
+                                  'used as they are', st['raw'])
+        except Exception as e:
+            self._gso_now = ('no_data', None, False, 0.0)
+            rospy.logwarn_throttle(10.0, '[gps_stamp] %s' % e)
+
+    def _gso_fields(self):
+        """gps_stamp_* fields of /nav_tf/loc_status (only with ~gps_stamp_offset_track)."""
+        try:
+            why, offset, hold, rx = self._gso_now
+            st = self._gso_st
+            return {'gps_stamp_state': ('hold' if hold else 'rate_hold' if st['rate_hold'] else why)
+                    if why == 'ok' else why,
+                    'gps_stamp_rate_holds': int(st['rate_holds']),
+                    'gps_stamp_measured_s': None if st['raw'] is None else round(st['raw'], 3),
+                    'gps_stamp_offset_s': None if offset is None else round(offset, 3),
+                    'gps_stamp_sys_steps': int(st['sys_steps']),
+                    'gps_stamp_shifts': int(st['shifts']),
+                    'gps_stamp_shift_s': round(st['shift_s'], 3)}
+        except Exception:
+            return {}
+
     def callback_rtk_odom(self, msg):
         self.rtk_odom_msg = msg
         self._rtk_odom_rx_t = rospy.get_time()
@@ -2756,6 +2994,9 @@ class NavTfNode:
                 'owner': owner,
                 'gps_good': bool(gps_stable),
                 'fix_usable': bool(self.position_fix_usable),
+                # T36 F1 (only with ~gps_stamp_offset_track): gps_stamp_state,
+                # gps_stamp_offset_s, steps of the clock and unexplained shifts
+                **(self._gso_fields() if getattr(self, '_gso_enable', False) else {}),
                 'heading_ok': bool(self._heading_ok()),
                 'docked': bool(self._docked),
                 'probation_proven': bool(self._gps_proven),
@@ -3170,6 +3411,8 @@ class NavTfNode:
 
 
     def callback_gnss_fix(self, msg):
+        if getattr(self, '_gso_enable', False):     # T36 F1
+            self._gso_sample(msg)
         usable = False
         position_usable = False
         # Fix-acceptance covariance gates (2026-07-19 field fix): the old
@@ -4701,7 +4944,20 @@ class NavTfNode:
                     # v*age (96-196 ms) error into every entry — the anchor
                     # target jittered +-40 mm and the pose sawtoothed under TEB.
                     gps_t = self.rtk_odom_msg.header.stamp.to_sec()
-                    if gps_t > self._last_buffered_gps_t:
+                    gps_key = gps_t
+                    gso_on = getattr(self, '_gso_enable', False)
+                    if gso_on:
+                        # T36 F1: the sample's time on the SYSTEM clock (the
+                        # clock of the histories and of the anchor lag); None
+                        # = the sample is not paired (no offset yet, held
+                        # back, /gnss/fix silent)
+                        _gso = self._gso_now
+                        gps_t = gps_stamp_offset_time(_gso[0], _gso[1], _gso[2], gps_key) \
+                            if 0.0 <= rospy.get_time() - _gso[3] < self._rtk_fresh_s else None
+                    if gps_t is not None and gps_key > self._last_buffered_gps_t:
+                        if gso_on and self._pose_buffer \
+                                and gps_t <= self._pose_buffer[-1][0]:
+                            self._pose_buffer.clear()   # F1: a clock stepped back
                         wh = self._hist_at(self._wheel_hist, gps_t)
                         nv = self._hist_at(self._nav_yaw_hist, gps_t)
                         if wh is not None and nv is not None:
@@ -4715,7 +4971,7 @@ class NavTfNode:
                                  self._interp_scalar(wa[2], wb[2], wf)),
                                 self._interp_angle(wa[3], wb[3], wf),
                                 self._interp_angle(na[1], nb[1], nf)))
-                            self._last_buffered_gps_t = gps_t
+                            self._last_buffered_gps_t = gps_key
                     # CONTINUOUS SAME-TIME ANCHOR: write GPS_pose(now-lag) o
                     # wheel-delta(now-lag -> now). On the FIRST owning tick after
                     # an outage, emit the accumulated-error drift report. Falls

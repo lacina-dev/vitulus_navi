@@ -3714,6 +3714,14 @@ class NavTfNode:
             'window_s': float(rospy.get_param('~rtk_mag_disagree_window_s', 5.0)),
             'hold_s': float(rospy.get_param('~rtk_mag_report_hold_s', 30.0)),
         }
+        # T35 K1 (~rtk_mag_report_wide, default off): compare every RTK heading
+        # sample whose NAV-RELPOSNED is fixed, valid and fresh - also those the
+        # node itself would not take (variance out of band, heading / position
+        # fix not usable). In front of the garage the heading goes wrong
+        # together with its quality: of the samples > 6 deg off, 44 % fail the
+        # variance band and 31 % the heading fix, so the accepted ones rarely
+        # add up to the 0.3 s the alarm needs (16 of 48 arrivals; 36 with this).
+        self._rmr_wide = bool(rospy.get_param('~rtk_mag_report_wide', False))
         self._rmr_lock = threading.Lock()
         self._rmr_st = rtk_mag_report_new_state()
         self._rmr_ref = None        # (rx time, mag yaw - imu yaw) of the last `ok` message
@@ -3759,6 +3767,10 @@ class NavTfNode:
     def _rmr_rtk_passes(self, msg):
         """The quality gates of offset_navheading_imu, read only and silent
         (fix, heading fix, NAV-RELPOSNED fixed + valid + fresh, variance band)."""
+        if self._rmr_wide:                          # T35 K1: RELPOSNED alone
+            f = self._relpos_flags
+            return f is not None and ((f >> 3) & 3) == 2 and bool(f & 0x100) \
+                and (rospy.get_time() - self._relpos_rx_t) <= self._relpos_max_age_s
         if not (self.fix_usable and self.heading_fix_usable):
             return False
         var = msg.orientation_covariance[8]

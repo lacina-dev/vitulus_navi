@@ -51,6 +51,12 @@
                  ROLLBACK: handover_follow_ekf:=false -->
             <param name="handover_follow_ekf" value="true"/>
             <param name="dock_micro_m" value="0.05"/>
+            <!-- T36 F1 2026-11-16 razitko GPS (UTC prijimace) se pred parovanim s historii
+                 wheel-EKF prevede na systemovy cas podle mereneho posunu hodin: jizda s hodinami
+                 -0.68 s, nouzovy rezim kotvy 78-87 % -> 2.3 % casu, kroky EKF nad 3 cm
+                 30-45 -> 5-11 /min, odchylka podel drahy -3 az -4 cm -> 0 cm.
+                 ROLLBACK: gps_stamp_offset_track:=false -->
+            <param name="gps_stamp_offset_track" value="true"/>
             <param name="dock_micro_deg" value="1.0"/>
             <!-- T36 E5 2026-11-16 navsat_transform se spousti ve vlastnim vlakne: 2 jizdy
                  proti 8 ostatnim, nejvetsi mezera /tf 0.95-1.36 s -> 0.13-0.14 s.

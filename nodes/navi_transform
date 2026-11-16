@@ -475,6 +475,23 @@ def anchor_mode_fields(st, now, cfg=None):
     }
 
 
+# ---- T35 U3: heading hand-over left to do, in loc_status (pure; REPORT ONLY;
+# tools/test_t35_u3_handover_report.py). After the undock the dock heading
+# sits in map_odom_yaw; the GNSS heading hand-over walks it to 0 about the
+# robot (offset_navheading_imu, slew_yaw_level) and the georef waits for
+# exactly 0. The antenna hardly moves while that goes on (1-2 cm), so
+# /nav_tf/georef_status dev_m cannot tell when it is over; this can.
+
+def handover_report_fields(map_odom_yaw):
+    """map_odom_yaw_deg: what is left of the hand-over, deg (None when not a
+    finite number); heading_handover_done: map_odom_yaw is exactly 0 (the
+    condition the georef itself goes by)."""
+    ok = isinstance(map_odom_yaw, (int, float)) and not isinstance(map_odom_yaw, bool) \
+        and math.isfinite(map_odom_yaw)
+    return {'map_odom_yaw_deg': round(math.degrees(map_odom_yaw), 2) if ok else None,
+            'heading_handover_done': bool(ok and map_odom_yaw == 0.0)}
+
+
 # ---- T35 magnetometer heading watchdog (pure; tools/test_t35_mag_check.py) --
 # REPORT ONLY: compares the navigation heading with the independent
 # magnetometer heading (/bno085/mag_heading) and flags a gross disagreement in
@@ -1624,6 +1641,9 @@ class NavTfNode:
         # T35 M2: RTK heading against the magnetometer in loc_status. REPORT
         # ONLY, off by default: then no subscriber, no state, no field.
         self._rmr_setup()
+        # T35 U3: heading hand-over left to do (map_odom_yaw_deg) in
+        # loc_status. REPORT ONLY, off by default: then no field.
+        self._hor_enable = bool(rospy.get_param('~handover_report', False))
 
         rospy.loginfo("<{}> GNSSNode initiated.".format(rospy.get_caller_id()))
         rospy.logwarn(
@@ -3133,6 +3153,8 @@ class NavTfNode:
                 status.update(self._mag_check_fields())   # T35, report only
             if getattr(self, '_rmr_enable', False):
                 status.update(self._rmr_fields())         # T35 M2, report only
+            if getattr(self, '_hor_enable', False):       # T35 U3, report only
+                status.update(handover_report_fields(self.map_odom_yaw))
             self._last_published_owner = owner    # FIX4: keep edge detector in sync
             self.loc_status_pub.publish(String(data=json.dumps(status)))
         except Exception as e:

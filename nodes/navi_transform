@@ -206,6 +206,85 @@ def utm_central_meridian(zone):
     return (zone - 1) * 6 - 180 + 3
 
 
+# ---- T36 J1: steps of the nav-EKF pose the measured rates do not explain
+# (pure, report only; tools/test_t36_j1_odom_step_report.py) -------------------
+ODOM_STEP_CFG = {
+    'xy_m': 0.01,          # a step: pose moved this much more than wheels x dt
+    'yaw_deg': 3.0,        # ... or turned this much more than gyro x dt
+    'window_s': 60.0,      # the counters cover this long
+    'set_pose_s': 0.25,    # a step this soon after an own set_pose is its doing
+    'heading_s': 0.3,      # a yaw step this soon after diff_yaw moved, likewise
+    'spike_mps': 1.0,      # EKF linear.x this far from the wheels = twist spike
+    'max_dt_s': 0.2,       # a longer gap between EKF messages is not judged
+}
+# who called set_wheel_base_nav_pose -> the path named in the report
+ODOM_STEP_PATHS = {'_set_anchor_pose_slewed': 'position_anchor', 'loop3sec': 'emergency',
+                   '_do_rewind_handoff': 'rewind', 'callback_set_pose': 'manual',
+                   'srv_cb_set_pose': 'manual', 'set_bridge_live_pose': 'bridge'}
+
+
+def odom_step_residual(t0, x0, y0, yaw0, t1, x1, y1, yaw1, v, w):
+    """What two consecutive nav-EKF poses moved beyond the measured rates:
+    v = wheel odometry linear.x, w = gyro z, both taken as constant over the
+    step. Returns (xy residual m, yaw residual rad signed, dt)."""
+    dt = t1 - t0
+    ym = yaw0 + 0.5 * w * dt
+    rx = x1 - x0 - v * dt * math.cos(ym)
+    ry = y1 - y0 - v * dt * math.sin(ym)
+    dy = yaw1 - yaw0 - w * dt
+    return math.hypot(rx, ry), math.atan2(math.sin(dy), math.cos(dy)), dt
+
+
+def odom_step_cause(xy_step, since_set_pose_s, set_pose_path, since_heading_s,
+                    ekf_vx, wheel_vx, vo_vx=None, licp_vx=None, cfg=None):
+    """(cause, spike source or '') of an unexplained step.
+      set_pose:<path>   the node wrote the EKF pose at most set_pose_s ago
+                        (position_anchor / emergency / rewind / manual /
+                        bridge); set_pose also zeroes the EKF velocity, so the
+                        next poses lag the wheels - the same cause
+      ekf_twist_spike   the EKF's own linear.x is spike_mps off the wheels
+      heading_anchor    a yaw-only step at most heading_s after diff_yaw moved
+      unknown           none of it
+    The spike source is given with any cause when the EKF twist is off: the
+    input whose linear.x is off as well (vo / licp / wheels), else 'ekf'."""
+    c = dict(ODOM_STEP_CFG, **(cfg or {}))
+    spike = ''
+    if abs(ekf_vx - wheel_vx) > c['spike_mps']:
+        spike = 'ekf'
+        for name, vx in (('vo', vo_vx), ('licp', licp_vx)):
+            if vx is not None and math.isfinite(vx) and abs(vx - wheel_vx) > c['spike_mps']:
+                spike = name
+                break
+        if spike == 'ekf' and abs(wheel_vx) > 2.0 * c['spike_mps']:
+            spike = 'wheels'
+    if since_set_pose_s is not None and 0.0 <= since_set_pose_s <= c['set_pose_s']:
+        return 'set_pose:%s' % (set_pose_path or 'unknown'), spike
+    if spike:
+        return 'ekf_twist_spike', spike
+    if not xy_step and since_heading_s is not None and 0.0 <= since_heading_s <= c['heading_s']:
+        return 'heading_anchor', spike
+    return 'unknown', spike
+
+
+def odom_step_fields(events, now, last=None, cfg=None):
+    """loc_status fields from the kept events (t, xy m, yaw deg, cause, spike):
+    counts and maxima over window_s, the causes, the last step."""
+    c = dict(ODOM_STEP_CFG, **(cfg or {}))
+    n = n_spike = 0
+    mx = my = 0.0
+    causes = {}
+    for (t, xy, yaw, cause, spike) in list(events):
+        if not (0.0 <= now - t <= c['window_s']):
+            continue
+        n += 1
+        n_spike += 1 if spike else 0
+        mx, my = max(mx, xy), max(my, abs(yaw))
+        causes[cause] = causes.get(cause, 0) + 1
+    return {'odom_step_n': n, 'odom_step_max_xy_m': round(mx, 3),
+            'odom_step_max_yaw_deg': round(my, 2), 'odom_step_spikes': n_spike,
+            'odom_step_causes': causes, 'odom_step_last': last}
+
+
 def ll_to_utm(lat, lon, zone=None):
     """lat/lon [deg] -> (easting, northing, zone); a given zone forces it."""
     a, ecc2, k0 = _UTM_A, _UTM_E2, _UTM_K0
@@ -1791,6 +1870,7 @@ class NavTfNode:
         self.licp_odom_sub = rospy.Subscriber("/licp/odom", Odometry, self.callback_licp_odom, queue_size=50)
         self.bridge_preview_pub = rospy.Publisher("/nav_tf/odom_bridge_preview", Odometry, queue_size=20)
         self.bridge_status_pub = rospy.Publisher("/nav_tf/bridge_status", String, queue_size=5)
+        self._osr_setup()     # T36 J1 (~odom_step_report, default off: nothing runs)
         # WP2 (localization v2): typed status topic (JSON, latched) — owner +
         # health, so downstream stops string-parsing bridge_status. Published at
         # 1 Hz from loop1hz (see publish_loc_status).
@@ -3412,6 +3492,9 @@ class NavTfNode:
                 'dock_status': self._dock_status_val,
                 'dock_hold_active': bool(self._dock_hold_active),
                 'dock_hold_refusals': self._dock_hold_refusals,
+                # T36 J1 (only with ~odom_step_report): odom_step_n, _max_xy_m,
+                # _max_yaw_deg, _spikes, _causes, _last
+                **(self._osr_fields(now_s) if getattr(self, '_osr_enable', False) else {}),
                 'dock_anchor_ok': self._dock_anchor_pose is not None,
                 'dock_suppressing': bool(self._tracker_pose_suppressed()),
                 'budget_used_m': round(self._budget_used_m, 3),
@@ -3853,6 +3936,8 @@ class NavTfNode:
             pose_srv.pose.pose.pose.orientation.w = self.fused_msg.orientation.w
             pose_srv.pose.header.frame_id = 'odom'
             pose_srv.pose.header.stamp = rospy.Time.now()
+            if getattr(self, '_osr_enable', False):     # T36 J1, report only
+                self._osr_note_set_pose('set_bridge_live_pose')
             srv = rospy.ServiceProxy('/ekf_wheel_nav_odometry/set_pose', SetPose)
             srv(pose_srv)
         except rospy.ServiceException as e:
@@ -4859,12 +4944,126 @@ class NavTfNode:
 
             pose_srv.pose.header.stamp = rospy.Time.now()
 
+            if getattr(self, '_osr_enable', False):     # T36 J1, report only
+                self._osr_note_set_pose(sys._getframe(1).f_code.co_name)
             srv = rospy.ServiceProxy('/ekf_wheel_nav_odometry/set_pose', SetPose)  # Connect to the service
             response = srv(pose_srv)
             # print("Response: ", response)
 
         except rospy.ServiceException as e:
             rospy.logerr("Service /ekf_wheel_nav_odometry/set_pose call failed: %s" % e)
+
+    # ---- T36 J1: unexplained steps of the nav-EKF pose (report only) --------
+
+    def _osr_setup(self):
+        """The one switch (~odom_step_report): without it no subscriber, no
+        publisher and no work per message."""
+        self._osr_enable = bool(rospy.get_param('~odom_step_report', False))
+        if not self._osr_enable:
+            return
+        self._osr_cfg = dict(ODOM_STEP_CFG)
+        for key in self._osr_cfg:
+            self._osr_cfg[key] = float(rospy.get_param('~odom_step_report_' + key,
+                                                       self._osr_cfg[key]))
+        self._osr_yaw_lim = math.radians(self._osr_cfg['yaw_deg'])
+        self._osr_prev = None             # (stamp, x, y, yaw) of the last EKF message
+        self._osr_sp_t = None             # clock of the last own set_pose
+        self._osr_sp_path = ''
+        self._osr_diff_yaw = None         # diff_yaw / set_pose_yaw seen last
+        self._osr_hd_t = None             # clock it moved
+        self._osr_vo = None               # last /vo/odom, /licp/odom_cov (twist inputs
+        self._osr_licp = None             # of the EKF) - to find the source of a spike
+        self._osr_events = deque(maxlen=512)
+        self._osr_last = None
+        self._osr_pub = rospy.Publisher('/nav_tf/odom_step', String, queue_size=20)
+        self._osr_subs = [
+            rospy.Subscriber('/odometry/ekf_wheel_nav_odom', Odometry, self._osr_on_ekf,
+                             queue_size=200),
+            rospy.Subscriber('/vo/odom', Odometry, self._osr_on_vo, queue_size=5),
+            rospy.Subscriber('/licp/odom_cov', Odometry, self._osr_on_licp, queue_size=5)]
+        rospy.loginfo('[odom_step] report of unexplained nav-EKF pose steps ENABLED %s '
+                      '(report only; events on /nav_tf/odom_step)' % self._osr_cfg)
+
+    def _osr_on_vo(self, msg):
+        self._osr_vo = msg
+
+    def _osr_on_licp(self, msg):
+        self._osr_licp = msg
+
+    def _osr_note_set_pose(self, caller):
+        self._osr_sp_t = rospy.get_time()
+        self._osr_sp_path = ODOM_STEP_PATHS.get(caller, caller)
+
+    @staticmethod
+    def _osr_fresh_vx(msg, now, max_age=0.3):
+        if msg is None or abs(now - msg.header.stamp.to_sec()) > max_age:
+            return None
+        return msg.twist.twist.linear.x
+
+    def _osr_on_ekf(self, msg):
+        """Every nav-EKF message: the step from the previous one against wheels
+        x dt and gyro x dt. Scalars only; an event (rare) is what allocates."""
+        try:
+            p, q = msg.pose.pose.position, msg.pose.pose.orientation
+            t = msg.header.stamp.to_sec()
+            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            prev, self._osr_prev = self._osr_prev, (t, p.x, p.y, yaw)
+            now = rospy.get_time()
+            dy = self.set_pose_yaw if self.init else self.diff_yaw
+            if dy != self._osr_diff_yaw:
+                if self._osr_diff_yaw is not None:
+                    self._osr_hd_t = now
+                self._osr_diff_yaw = dy
+            if prev is None:
+                return
+            wheel, imu = self.wheel_odom_msg, self.imu_msg
+            if abs(t - wheel.header.stamp.to_sec()) > self._osr_cfg['max_dt_s'] \
+                    or abs(t - imu.header.stamp.to_sec()) > self._osr_cfg['max_dt_s']:
+                return                    # no measured rate to compare with
+            v, w = wheel.twist.twist.linear.x, imu.angular_velocity.z
+            res, ryaw, dt = odom_step_residual(prev[0], prev[1], prev[2], prev[3],
+                                               t, p.x, p.y, yaw, v, w)
+            if not (0.0 < dt <= self._osr_cfg['max_dt_s']):
+                return
+            xy_step = res > self._osr_cfg['xy_m']
+            if not (xy_step or abs(ryaw) > self._osr_yaw_lim):
+                return
+            self._osr_event(now, t, res, ryaw, xy_step, msg.twist.twist.linear.x, v)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[odom_step] %s' % e)
+
+    def _osr_event(self, now, stamp, res, ryaw, xy_step, ekf_vx, wheel_vx):
+        since_sp = (now - self._osr_sp_t) if self._osr_sp_t is not None else None
+        since_hd = (now - self._osr_hd_t) if self._osr_hd_t is not None else None
+        vo_vx = self._osr_fresh_vx(self._osr_vo, stamp)
+        licp_vx = self._osr_fresh_vx(self._osr_licp, stamp)
+        cause, spike = odom_step_cause(xy_step, since_sp, self._osr_sp_path, since_hd,
+                                       ekf_vx, wheel_vx, vo_vx, licp_vx, self._osr_cfg)
+        yaw_deg = round(math.degrees(ryaw), 2)
+        self._osr_events.append((now, res, yaw_deg, cause, spike))
+        rnd = lambda x: None if x is None else round(x, 3)
+        ev = {'stamp': round(stamp, 3), 'xy_m': round(res, 3), 'yaw_deg': yaw_deg,
+              'cause': cause, 'spike': spike, 'since_set_pose_s': rnd(since_sp),
+              'ekf_vx': rnd(ekf_vx), 'wheel_vx': rnd(wheel_vx), 'vo_vx': rnd(vo_vx),
+              'licp_vx': rnd(licp_vx)}
+        self._osr_last = ev
+        self._osr_pub.publish(String(data=json.dumps(ev)))
+        if spike:
+            rospy.logwarn_throttle(
+                5.0, '[odom_step] nav-EKF twist spike: linear.x %.2f m/s, wheels %.2f, vo %s, '
+                'licp %s, source %s, %.3f s after set_pose (%s)' % (
+                    ekf_vx, wheel_vx, vo_vx, licp_vx, spike,
+                    since_sp if since_sp is not None else float('nan'), self._osr_sp_path))
+
+    def _osr_fields(self, now_s):
+        try:
+            last = self._osr_last
+            if last is not None:
+                last = dict(last, age_s=round(now_s - self._osr_events[-1][0], 2))
+            return odom_step_fields(self._osr_events, now_s, last, self._osr_cfg)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[odom_step] %s' % e)
+            return {}
 
 
     def callback_relposned(self, msg):

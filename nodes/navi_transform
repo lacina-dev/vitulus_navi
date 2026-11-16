@@ -381,6 +381,100 @@ def rtk_mag_report_step(st, now, diff_deg, cfg=None):
     return st, {'over_s': over_s, 'disagree': disagree, 'edge': edge}
 
 
+# ---- T36 F2: mode of the position anchor (pure; REPORT ONLY; ---------------
+# tools/test_t36_f2_anchor_mode_report.py) ------------------------------------
+# While GPS owns the position, every 10 Hz tick of loop3sec writes either the
+# CONTINUOUS anchor (a buffered, motion-verified GPS sample + the wheel delta
+# since) or, while the buffer has no sample old enough, the FALLBACK set_pose
+# on the newest GPS message. The fallback is meant for the first seconds after
+# GPS takes over; when the samples never reach the buffer (their stamp is not
+# in the wheel-EKF history - clocks apart) it runs all the time: the pose
+# shivers and the anchor guard and the rewind have nothing to work with. This
+# only counts what happened, it steers nothing.
+ANCHOR_MODE_CFG = {
+    'window_s': 10.0,          # window of the shares
+    'tick_max_age_s': 0.5,     # last tick older: GPS does not own the position
+    'starve_share': 0.5,       # buffered share below it ...
+    'starve_min_samples': 10,  # ... of at least this many GPS samples = starving
+    'clock_window_s': 30.0,    # window of the clock offset (1 Hz samples of /gnss/fix)
+    'transport_s': 0.0,        # see tools/test_t36_f2_anchor_mode_report.py
+}
+
+
+def anchor_mode_new_state():
+    return {'ticks': [], 'gps': [], 'clock': []}
+
+
+def _anchor_mode_prune(rows, now, window_s):
+    if rows and now < rows[-1][0]:           # the clock went back
+        del rows[:]
+    while rows and rows[0][0] < now - window_s:
+        rows.pop(0)
+
+
+def anchor_mode_tick(st, now, continuous, gps_stamp, buffered_stamp, cfg=None):
+    """One tick of loop3sec in which GPS owns the position. continuous: the
+    continuous anchor wrote (False = the fallback set_pose ran); gps_stamp:
+    stamp of the newest /odometry/gps; buffered_stamp: stamp of the last
+    sample that reached the buffer of the anchor."""
+    c = cfg or ANCHOR_MODE_CFG
+    _anchor_mode_prune(st['ticks'], now, c['window_s'])
+    _anchor_mode_prune(st['gps'], now, c['window_s'])
+    st['ticks'].append((now, bool(continuous)))
+    gps = st['gps']
+    if not gps or gps[-1][1] != gps_stamp:
+        gps.append([now, gps_stamp, False])
+    if buffered_stamp == gps_stamp:
+        gps[-1][2] = True
+    return st
+
+
+def anchor_mode_clock(st, now, rx_minus_stamp, cfg=None):
+    """One sample (1 Hz) of receive time - stamp of /gnss/fix (the driver
+    publishes it right away; /odometry/gps leaves navsat_transform on a 10 Hz
+    timer, 0.02-0.12 s later and hopping by 0.1 s)."""
+    c = cfg or ANCHOR_MODE_CFG
+    _anchor_mode_prune(st['clock'], now, c['clock_window_s'])
+    if math.isfinite(rx_minus_stamp):
+        st['clock'].append((now, rx_minus_stamp))
+    return st
+
+
+def anchor_mode_fields(st, now, cfg=None):
+    """The fields of /nav_tf/loc_status:
+      anchor_mode            'continuous' | 'fallback_set_pose' (the last
+                             tick) | 'none' (GPS does not own the position)
+      anchor_fallback_share  share of the ticks of the window on the fallback
+      anchor_buffered_share  share of the GPS samples of the window that
+                             reached the buffer (the newest one may still be
+                             on its way)
+      anchor_starving        GPS owns the position and under starve_share of
+                             its samples reach the buffer
+      gps_clock_offset_s     system clock - GPS stamps: median of receive
+                             time - stamp minus the transport delay"""
+    c = cfg or ANCHOR_MODE_CFG
+    for key, win in (('ticks', 'window_s'), ('gps', 'window_s'), ('clock', 'clock_window_s')):
+        _anchor_mode_prune(st[key], now, c[win])
+    ticks, gps, clock = st['ticks'], st['gps'], st['clock']
+    mode = 'none'
+    if ticks and now - ticks[-1][0] <= c['tick_max_age_s']:
+        mode = 'continuous' if ticks[-1][1] else 'fallback_set_pose'
+    fb = (sum(1 for t in ticks if not t[1]) / float(len(ticks))) if ticks else None
+    buffered = (sum(1 for g in gps if g[2]) / float(len(gps))) if gps else None
+    off = None
+    if len(clock) >= 3:
+        ds = sorted(v for _, v in clock)
+        off = ds[len(ds) // 2] - c['transport_s']
+    return {
+        'anchor_mode': mode,
+        'anchor_fallback_share': None if fb is None else round(fb, 2),
+        'anchor_buffered_share': None if buffered is None else round(buffered, 2),
+        'anchor_starving': bool(mode != 'none' and len(gps) >= c['starve_min_samples']
+                                and buffered < c['starve_share']),
+        'gps_clock_offset_s': None if off is None else round(off, 3),
+    }
+
+
 # ---- T35 magnetometer heading watchdog (pure; tools/test_t35_mag_check.py) --
 # REPORT ONLY: compares the navigation heading with the independent
 # magnetometer heading (/bno085/mag_heading) and flags a gross disagreement in
@@ -1530,6 +1624,9 @@ class NavTfNode:
             "(anchor_lag_s=%.1f, motion-verified) | rewind splice %s",
             self._anchor_lag_s,
             "ENABLED (legacy)" if self._rewind_enable else "DISABLED (obsolete)")
+        # T36 F2: mode of the position anchor in loc_status. REPORT ONLY, off
+        # by default: then no state and no field.
+        self._amr_setup()
 
     def roslaunch_ekf(self):
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
@@ -3003,6 +3100,9 @@ class NavTfNode:
                 'rtabmap_confident': bool(self._rtabmap_confident),
                 'anchor_age_s': anchor_age,
                 'anchor_frozen': anchor_frozen,
+                # T36 F2 (only with ~anchor_mode_report): anchor_mode, shares,
+                # anchor_starving, gps_clock_offset_s
+                **(self._amr_fields() if getattr(self, '_amr_enable', False) else {}),
                 # heading anchor v2 observability: age since a verified heading
                 # anchor last applied; frozen = window failing >3 s (heading on
                 # gyro + last verified offset)
@@ -3443,6 +3543,8 @@ class NavTfNode:
         self.position_fix_usable = position_usable
         self._last_fix = (msg.latitude, msg.longitude, msg.status.status,
                           rospy.get_time(), position_usable)
+        if getattr(self, '_amr_enable', False):     # T36 F2, report only
+            self._amr_fix = (rospy.get_time(), msg.header.stamp.to_sec())
         self.position_fix_usable_history.pop(0)
         self.position_fix_usable_history.append(position_usable)
         self._update_gps_probation(msg, position_usable)
@@ -3684,6 +3786,59 @@ class NavTfNode:
         pose.position.z = tz
         pose.orientation = self.fused_msg.orientation
         self.set_wheel_base_nav_pose(pose, frame='odom')
+
+    # ---- T36 F2: mode of the position anchor in loc_status (report only) ----
+
+    def _amr_setup(self):
+        """The one switch (~anchor_mode_report): without it nothing of F2 runs."""
+        self._amr_enable = bool(rospy.get_param('~anchor_mode_report', False))
+        if not self._amr_enable:
+            return
+        self._amr_cfg = dict(ANCHOR_MODE_CFG)
+        for key in ('window_s', 'starve_share', 'transport_s'):
+            self._amr_cfg[key] = float(rospy.get_param(
+                '~anchor_mode_report_' + key, self._amr_cfg[key]))
+        self._amr_lock = threading.Lock()
+        self._amr_st = anchor_mode_new_state()
+        self._amr_starving = False
+        self._amr_fix = (0.0, 0.0)       # receive time, stamp of the last /gnss/fix
+        rospy.loginfo('[anchor_mode] report of the position anchor mode ENABLED '
+                      '(report only, window %.0f s)', self._amr_cfg['window_s'])
+
+    def _amr_tick(self, continuous):
+        """loop3sec, a tick in which GPS owns the position (10 Hz)."""
+        try:
+            stamp = self.rtk_odom_msg.header.stamp.to_sec()
+            with self._amr_lock:
+                anchor_mode_tick(self._amr_st, rospy.get_time(), continuous, stamp,
+                                 self._last_buffered_gps_t, self._amr_cfg)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[anchor_mode] %s' % e)
+
+    def _amr_fields(self):
+        """The anchor_* / gps_clock_offset_s fields of /nav_tf/loc_status."""
+        try:
+            now = rospy.get_time()
+            rx, stamp = self._amr_fix
+            with self._amr_lock:
+                if stamp > 0.0 and 0.0 <= now - rx < self._rtk_fresh_s:
+                    anchor_mode_clock(self._amr_st, now, rx - stamp, self._amr_cfg)
+                out = anchor_mode_fields(self._amr_st, now, self._amr_cfg)
+            if out['anchor_starving'] != self._amr_starving:
+                self._amr_starving = out['anchor_starving']
+                if out['anchor_starving']:
+                    rospy.logwarn(
+                        '[anchor_mode] position anchor STARVING: %.0f %% of the GPS samples '
+                        'reach its buffer, %.0f %% of the ticks on the fallback set_pose '
+                        '(system clock - GPS stamps = %s s)',
+                        100.0 * out['anchor_buffered_share'],
+                        100.0 * out['anchor_fallback_share'], out['gps_clock_offset_s'])
+                else:
+                    rospy.loginfo('[anchor_mode] position anchor fed again')
+            return out
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[anchor_mode] %s' % e)
+            return {}
 
     def _note_ownership(self, wrote):
         """Track the GPS pose-ownership edge for the drift report. On the
@@ -4989,8 +5144,11 @@ class NavTfNode:
                         self._resume_rtk_pose = (rpos.x, rpos.y)
                         self._resume_rtk_fresh = (
                             (rospy.get_time() - self._rtk_odom_rx_t) < self._rtk_fresh_s)
-                    if not self._apply_continuous_anchor():
+                    _cont = self._apply_continuous_anchor()
+                    if not _cont:
                         self.set_wheel_base_nav_pose()   # bootstrap fallback
+                    if getattr(self, '_amr_enable', False):
+                        self._amr_tick(_cont)            # T36 F2, report only
                     # drift report AFTER the anchor call (snapshot already taken
                     # pre-correction above, so the measurement is uncontaminated).
                     if resumed:

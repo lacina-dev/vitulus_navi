@@ -98,6 +98,30 @@ F. Casy po opusteni doku (t0 = dock_status opusti 0); u vice vyjezdu max
 G. Kotvy (loc_status pri owner=gps)
    anchor_age_p95_s / _max_s, heading_anchor_age_p95_s / _max_s
    anchor_freezes, heading_anchor_freezes   pocet epizod se starim > 5 s
+   anchor_fallback_pct   podil vzorku loc_status pri owner=gps, kdy polohu
+         nepsala prubezna kotva, ale nouzovy set_pose na posledni zpravu GPS
+         (10x za sekundu). Z pole anchor_mode (navi_transform s parametrem
+         anchor_mode_report); kde pole chybi, plati vzorek s anchor_age_s
+         null (kotva se od startu uzlu ani jednou neposunula).
+   anchor_starving_pct   podil vzorku loc_status pri owner=gps s priznakem
+         anchor_starving (do bufferu kotvy se dostava mene nez polovina vzorku
+         GPS; kotva pak bezi na starych vzorcich). Jen s polem v nahravce.
+   gps_rx_minus_stamp_s  median (cas prijeti - header.stamp) /odometry/gps.
+         Razitko je cas prijimace GPS, zbytek systemovy cas. Jen udaj.
+   gps_buffered_est_pct  odhad podilu vzorku GPS, ktere se dostanou do bufferu
+         kotvy bez opravy razitek (navi_transform bez gps_stamp_offset_track):
+         vzorek se ulozi, kdyz v nekterem tiku 10 Hz, dokud je posledni zpravou
+         /odometry/gps, uz prisla zprava /odometry/ekf_wheel_odom s razitkem
+         >= razitko vzorku. Median pres 10 fazi tiku. Jen udaj; do priznaku
+         vstupuje jen u nahravek bez pole anchor_mode.
+   Priznak pos_metrics_invalid (vedle metrics; True/False/None = nelze urcit):
+   jizda bezela z vetsi casti v nouzovem rezimu kotvy nebo kotva hladovela,
+   takze kroky EKF, mezera fuze - GPS a kolisani polohy meri ten rezim, ne
+   upravu, ktera se porovnava. True, kdyz anchor_fallback_pct > 20 nebo
+   anchor_starving_pct > 20, a u nahravek bez pole anchor_mode take kdyz
+   gps_buffered_est_pct < 50 (stejny prah jako anchor_starving). Samotny
+   posun razitek nerozhoduje. Duvod je v pos_metrics_invalid_why; --compare
+   na priznak upozorni.
 H. Ostatni
    z_drift_m         z EKF na konci minus na zacatku;  z_range_m = max - min
    tf_gap_max_s      nejvetsi mezera mezi tiky /tf (cas bagu); tf_gap_p99_s
@@ -115,7 +139,7 @@ import sys
 
 import numpy as np
 
-VERSION = 1
+VERSION = 2
 
 TOPICS = {
     'tf': '/tf',
@@ -140,6 +164,8 @@ MOVE_W = 0.05          # rad/s
 SETTLE_M = 0.05        # m, mezera povazovana za dorovnanou
 SETTLE_HOLD_S = 1.0
 FREEZE_S = 5.0
+FALLBACK_INVALID_PCT = 20.0     # anchor_fallback_pct nad timto: polohove metriky neplati
+BUFFERED_INVALID_PCT = 50.0     # gps_buffered_est_pct pod timto (stare nahravky): kotva hladovela
 NA = 'neni v nahravce'
 
 
@@ -558,6 +584,63 @@ def age_stats(age, sel, prefix):
             prefix + '_freezes': n}
 
 
+def gps_buffered_est(gps, ekfw):
+    """Odhad podilu vzorku /odometry/gps [%], ktere navi_transform bez opravy
+    razitek ulozi do bufferu kotvy (viz docstring, gps_buffered_est_pct)."""
+    if gps is None or ekfw is None or len(gps) < 3 or len(ekfw) < 3:
+        return None
+    shares = []
+    for phi in np.arange(0.0, 0.1, 0.01):
+        T = np.arange(gps[0, 0] + phi, gps[-1, 0], 0.1)
+        if not len(T):
+            return None
+        newest = ekfw[np.clip(np.searchsorted(ekfw[:, 0], T, side='right') - 1, 0, len(ekfw) - 1), 1]
+        gi = np.searchsorted(gps[:, 0], T, side='right') - 1
+        ok = (gi >= 0) & (newest >= gps[np.clip(gi, 0, len(gps) - 1), 1])
+        shares.append(len(np.unique(gi[ok])) / float(len(gps)))
+    return 100.0 * float(np.median(shares))
+
+
+def anchor_fallback(owner, mode, anchor_age, gps, starving=None, ekfw=None):
+    """Oddil G: nouzovy rezim kotvy polohy. Vraci (metriky, priznak, duvod).
+    owner, mode, anchor_age, starving = pole z loc_status (mode muze byt None
+    nebo prazdne retezce = pole anchor_mode v nahravce neni; starving jen s
+    nim); gps = /odometry/gps, ekfw = /odometry/ekf_wheel_odom."""
+    M = {'anchor_fallback_pct': None, 'anchor_starving_pct': None, 'gps_rx_minus_stamp_s': None,
+         'gps_buffered_est_pct': gps_buffered_est(gps, ekfw)}
+    if gps is not None and len(gps) >= 3:
+        M['gps_rx_minus_stamp_s'] = float(np.median(gps[:, 0] - gps[:, 1]))
+    has_mode = False
+    if owner is not None:
+        sel = np.asarray(owner) == 'gps'
+        fb = np.isnan(np.asarray(anchor_age, dtype=float)) if anchor_age is not None \
+            else np.zeros(len(sel), dtype=bool)
+        if mode is not None:
+            m = np.asarray(mode)
+            known = m != ''
+            has_mode = bool((known & sel).any())
+            fb = np.where(known, m == 'fallback_set_pose', fb)
+            if has_mode and starving is not None:
+                M['anchor_starving_pct'] = 100.0 * float(
+                    np.asarray(starving, dtype=bool)[known & sel].mean())
+        if sel.any():
+            M['anchor_fallback_pct'] = 100.0 * float(fb[sel].mean())
+    pct_fb, est = M['anchor_fallback_pct'], M['gps_buffered_est_pct']
+    if pct_fb is not None and pct_fb > FALLBACK_INVALID_PCT:
+        return M, True, 'kotva polohy %.0f %% casu owner=gps v nouzovem rezimu (set_pose na posledni GPS)' % pct_fb
+    if M['anchor_starving_pct'] is not None and M['anchor_starving_pct'] > FALLBACK_INVALID_PCT:
+        return M, True, ('kotva polohy %.0f %% casu owner=gps hladovi (vetsina vzorku GPS se '
+                         'nedostane do jejiho bufferu)' % M['anchor_starving_pct'])
+    if not has_mode and est is not None and est < BUFFERED_INVALID_PCT:
+        return M, True, ('do bufferu kotvy polohy se podle razitek dostalo jen %.0f %% vzorku GPS '
+                         '(prijeti - razitko %+.2f s): kotva hladovela'
+                         % (est, M['gps_rx_minus_stamp_s']))
+    if pct_fb is None and (est is None or has_mode):
+        return M, None, 'nelze urcit (chybi %s nebo %s a %s)' % (
+            TOPICS['loc'], TOPICS['gps'], TOPICS['ekfw'])
+    return M, False, ''
+
+
 def tf_gap_stats(T, tau, wheel):
     """Oddil H: mezery /tf a podil opakovanych poz za jizdy."""
     g = np.diff(T['t'])
@@ -798,6 +881,21 @@ def score(D):
                 notes[k] = 'v nahravce neni zadny vzorek owner=gps s kotvou'
     else:
         missing(keysG, TOPICS['loc'])
+    mG, invalid, invalid_why = anchor_fallback(
+        owner if has_loc else None, D.get('loc_anchor_mode') if has_loc else None,
+        D.get('loc_anchor_age') if has_loc else None, D.get('gps') if _have(D, 'gps', 3) else None,
+        D.get('loc_anchor_starving') if has_loc else None,
+        D.get('ekfw') if _have(D, 'ekfw', 3) else None)
+    M.update(mG)
+    if mG['anchor_starving_pct'] is None:
+        notes['anchor_starving_pct'] = 'v nahravce neni pole anchor_starving (anchor_mode_report vypnuty)'
+    if mG['anchor_fallback_pct'] is None:
+        notes['anchor_fallback_pct'] = ('%s (chybi %s)' % (NA, TOPICS['loc']) if not has_loc
+                                        else 'v nahravce neni zadny vzorek owner=gps')
+    if mG['gps_rx_minus_stamp_s'] is None:
+        notes['gps_rx_minus_stamp_s'] = '%s (chybi %s)' % (NA, TOPICS['gps'])
+    if mG['gps_buffered_est_pct'] is None:
+        notes['gps_buffered_est_pct'] = '%s (chybi %s nebo %s)' % (NA, TOPICS['gps'], TOPICS['ekfw'])
 
     # H. ostatni
     if ekf is not None:
@@ -826,7 +924,8 @@ def score(D):
     else:
         missing(['mbf_fail_n'], TOPICS['res'])
     return {'tool': 'nav_score', 'version': VERSION, 'meta': meta, 'metrics': M,
-            'notes': notes, 'detail': detail}
+            'notes': notes, 'detail': detail,
+            'pos_metrics_invalid': invalid, 'pos_metrics_invalid_why': invalid_why}
 
 
 # --------------------------------------------------------------------------
@@ -947,6 +1046,8 @@ def extract(bag_path):
         D['loc_owner'] = np.array([str(j.get('owner')) for j in js])
         D['loc_anchor_age'] = np.array([fl(j.get('anchor_age_s')) for j in js])
         D['loc_heading_age'] = np.array([fl(j.get('heading_anchor_age_s')) for j in js])
+        D['loc_anchor_mode'] = np.array([str(j.get('anchor_mode') or '') for j in js])
+        D['loc_anchor_starving'] = np.array([bool(j.get('anchor_starving')) for j in js])
     if TOPICS['res'] in counts:
         D['res_outcome'] = np.array([r[1] for r in res], dtype=int)
     if TOPICS['rosout'] in counts or TOPICS['rosout_agg'] in counts:
@@ -1039,6 +1140,10 @@ SPEC = [
     ('heading_anchor_age_p95_s', 'stari kotvy kurzu p95', 's', 'low'),
     ('heading_anchor_age_max_s', 'stari kotvy kurzu max', 's', 'low'),
     ('heading_anchor_freezes', 'zamrznuti kotvy kurzu (> 5 s)', '', 'low'),
+    ('anchor_fallback_pct', 'kotva polohy v nouzovem rezimu (set_pose)', '%', 'low'),
+    ('anchor_starving_pct', 'kotva polohy hladovi (malo vzorku GPS)', '%', 'low'),
+    ('gps_rx_minus_stamp_s', '/odometry/gps: prijeti - razitko, median', 's', 'info'),
+    ('gps_buffered_est_pct', 'odhad: vzorky GPS do bufferu bez opravy razitek', '%', 'info'),
     ('H. Ostatni', None, None, None),
     ('z_drift_m', 'drift vysky EKF (konec - zacatek)', 'm', 'abs'),
     ('z_range_m', 'rozsah vysky EKF', 'm', 'low'),
@@ -1073,6 +1178,8 @@ def print_table(R, out=sys.stdout):
     if 'owner_share_pct' in meta:
         w('vlastnik pozy [%% casu]: %s\n' % ', '.join(
             '%s %.0f' % kv for kv in sorted(meta['owner_share_pct'].items(), key=lambda kv: -kv[1])))
+    if R.get('pos_metrics_invalid'):
+        w('POZOR: polohove metriky teto jizdy NEPLATI - %s\n' % R.get('pos_metrics_invalid_why', ''))
     for key, label, unit, _ in SPEC:
         if label is None:
             w('\n%s\n' % key)
@@ -1090,6 +1197,13 @@ def compare(A, B, out=sys.stdout):
     hodnota zmeni o vic nez 10 % a zaroven o vic nez nejmensi zobrazitelny krok."""
     w = out.write
     w('nav_score: porovnani\n  pred: %s\n  po:   %s\n' % (A.get('bag', '?'), B.get('bag', '?')))
+    for tag, X in (('pred', A), ('po', B)):
+        if X.get('pos_metrics_invalid'):
+            w('POZOR: polohove metriky jizdy "%s" NEPLATI - %s\n'
+              % (tag, X.get('pos_metrics_invalid_why', '')))
+    if bool(A.get('pos_metrics_invalid')) != bool(B.get('pos_metrics_invalid')):
+        w('POZOR: jizdy nejsou v poloze srovnatelne (kroky EKF, mezera fuze - GPS, kolisani '
+          'polohy): jedna bezela v nouzovem rezimu kotvy\n')
     n_up = n_dn = 0
     for key, label, unit, better in SPEC:
         if label is None:

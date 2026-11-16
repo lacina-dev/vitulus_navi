@@ -10,7 +10,7 @@ Zdroje čísel: **[B]** = `~/bags/nav_test/nav_baseline_2026-11-15_a.bag` (2× d
 
 ---
 
-## Stav vypínačů úprav (16. 11. 2026 07:00)
+## Stav vypínačů úprav (16. 11. 2026 07:45)
 
 | Úprava | Parametr | Stav | Důkaz | Vrácení |
 |---|---|---|---|---|
@@ -23,7 +23,7 @@ Zdroje čísel: **[B]** = `~/bags/nav_test/nav_baseline_2026-11-15_a.bag` (2× d
 | Hlídač kurzu magnetometrem (T35) | `mag_check_enable`, `mag_disagree_deg` 15 | **zapnuto**, jen hlásí | zpětný přepočet jízd: 0 planých poplachů i při 10° | `git revert d1f73c9` |
 | M1 hlídač kurzu i při výjezdu a příjezdu (T35) | `mag_check_wide` | **zapnuto**, jen hlásí | přepočet 18 jízd: pokrytí 6,9 → 70,7 % času mimo dok, 0 poplachů i při 6°; práh nesnižovat pod ~12° (rezerva mimo nahraná místa neověřená) | vrátit commit „M1 zapnuto“ v `navi_man.launch` (kód `3129059`) |
 | M2 hlášení RTK kurz × magnetometr (T35) | `rtk_mag_report`, 6° / 0,3 s | **zapnuto**, jen hlásí (pole `rtk_mag_*`) | přepočet: příznak u 9 z 36 příjezdů, medián 0,8 s před koncem RTK | `git revert fe70f0e` (kód `0b205dd`) |
-| F1 párování GPS odolné vůči posunu hodin (T36) | `gps_stamp_offset_track` | vypnuto, čeká na měřicí jízdu | přepočet nočních jízd s rozejitými hodinami: uložené vzorky GPS 0 → 100 %, kroky EKF nad 3 cm 29–38 → 5–9/min, odchylka podél dráhy −3 → ±0,3 cm; zdravé jízdy beze změny | `git revert 94ffd9a` |
+| F1 párování GPS odolné vůči posunu hodin (T36) | `gps_stamp_offset_track` | **zapnuto** | série 7 (2 jízdy proti 2, hodiny −0,68 s): nouzový režim kotvy 78–87 → 2,3 % času, kroky EKF nad 3 cm 30–45 → 5–11/min, odchylka podél dráhy −3 až −4 cm → 0 cm (po opravě razítek, v rámu odom); 0 planých skoků hodin, odhad posunu do ±0,024 s proti navpvt | `git revert f99b293` (kód `94ffd9a`) |
 | F2 hlášení režimu kotvy a posunu hodin (T36) | `anchor_mode_report` | **zapnuto**, jen hlásí (pole `anchor_mode`, `anchor_starving`, `gps_clock_offset_s`); `nav_score` označí jízdu s neplatnými polohovými metrikami | – | vrátit commit „F2 zapnuto“ v `navi_man.launch` (kód `8d0fe28`) |
 
 Past měření (15. 11.): běh `nav_s3_d3_1` jel ve skutečnosti s D2, měřicí skript restartoval cizí proces (hledání PID bez ukotvení). Skóre toho běhu se počítá k D2.
@@ -35,6 +35,8 @@ Série 5 (16. 11. 01:12–02:22, 9 jízd, výchozí = D1+D2+D4+E5, zátěž 15�
 Nález T35 (rozbor 18 jízd): „platný“ RTK kurz je v posledních 4–9 s před ztrátou u garáže (1,3–3,3 m od doku) mimo u 35 z 36 příjezdů (medián 6,3°, max 27°). Brána magnetometrem (M3, `rtk_mag_gate`) kontrolou NEPROŠLA a není v `main` (práh v šumu, plané zamítání při otáčení, cyklus při vadném magnetometru; patch odložen). Lepší kandidát k měření jízdou: delší `heading_anchor_lag_s` (dnes 2,5 s) – přepočet: 8 s → chyba kurzu při zadokování RMS 1,13°, 12 s → 0,90° proti dnešním 1,64°, bez zamítání; cena = každá korekce kurzu přijde později.
 
 Nález T36 (16. 11.): systémové hodiny robota nejsou synchronizované a zpožďují se o 0,093 s/h proti UTC z GPS (`/gnss/fix` má razítko přijímače, ostatní uzly systémový čas). Jakmile rozdíl přeroste ~0,2 s (2–3 h po startu), vzorky GPS se přestanou ukládat do bufferu kotvy polohy a uzel jede v nouzové větvi `set_wheel_base_nav_pose()` 10× za sekundu (podélná pila ±2,5 cm, bez ochrany kotvy a rewindu). Polohové metriky jízd `nav_s5_*_3` (kromě base) a celé série 6 jsou proto neplatné; rozhodnutí o D3, D4, E5 se opírají o dřívější kola. Kořen = synchronizace času (chrony), F1 je pojistka.
+
+Pozor na `nav_score` při rozejitých hodinách: `gps_gap_*` a `takeover_gap_*`/`takeover_settle_*` párují pózu EKF (systémový čas) s GPS podle razítka UTC a převádějí GPS do mapy přes `map→odom` z konce epizody → chyba posun × rychlost (při −0,68 s +12 až +19 cm) a další artefakt až desítky cm. Do opravy je nebrat jako důkaz; `gps_buffered_est_pct` s F1 nic neříká. Nezkreslené: kroky EKF, skoky TF, `gps_standing_*`, `anchor_*`.
 
 ## 1. Rámce a kdo je píše
 

@@ -172,7 +172,8 @@ def main():
         check('before any message: all fields there, null / false',
               [loc.get(k, 0) for k in KEYS] == [None, None, False, None, 0.0, False, 0, None],
               str([loc.get(k, 0) for k in KEYS]))
-        base = {k: v for k, v in loc.items() if k not in KEYS}
+        # rtk_mag_alarms: M2's own list of alarms (T35 K1, test_t35_k1_rtk_mag_alarm_log.py)
+        base = {k: v for k, v in loc.items() if k not in KEYS and k != 'rtk_mag_alarms'}
         loc = on.go(11.0, rtk_err=9.0)
         check('RTK 9 deg off the magnetometer -> diff +9.0, valid, disagree, count 1',
               loc['rtk_mag_diff_deg'] == 9.0 and loc['rtk_mag_valid'] is True

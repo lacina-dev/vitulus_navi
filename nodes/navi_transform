@@ -3718,6 +3718,9 @@ class NavTfNode:
         self._rmr_st = rtk_mag_report_new_state()
         self._rmr_ref = None        # (rx time, mag yaw - imu yaw) of the last `ok` message
         self._rmr_last = None       # (time, rtk - mag deg) of the last comparison
+        # T35 K1: the alarms themselves, for loc_status and the node's log
+        # (wall time, rtk - mag deg when raised, largest |rtk - mag| while up)
+        self._rmr_alarms = deque(maxlen=5)
         topic = rospy.get_param('~rtk_mag_report_topic', '/bno085/mag_heading')
         self._rmr_sub = rospy.Subscriber(topic, Imu, self._rmr_cb_mag, queue_size=5)
         rospy.loginfo(
@@ -3795,8 +3798,30 @@ class NavTfNode:
                     'report only', diff if diff is not None else float('nan'),
                     self._rmr_cfg['disagree_deg'], out['over_s'],
                     self._rmr_cfg['window_s'], count)
+            self._rmr_alarm_note(out, diff, count)        # T35 K1
         except Exception as e:
             rospy.logwarn_throttle(10.0, "[rtk_mag] %s" % e)
+
+    def _rmr_alarm_note(self, out, diff, count):
+        """T35 K1: one line per alarm where it can be found afterwards. The
+        node's warnings reach neither /rosout nor its log file (only INFO gets
+        to the stdout log), and loc_status showed an alarm only while it
+        lasted. Kept: the time, rtk - mag when raised, the largest while up."""
+        with self._rmr_lock:
+            if out['edge'] == 'raised':
+                d = round(diff, 1) if diff is not None else None
+                self._rmr_alarms.append({'t': round(time.time(), 1), 'diff_deg': d,
+                                         'max_deg': abs(d) if d is not None else None})
+            elif out['disagree'] and diff is not None and self._rmr_alarms:
+                a = self._rmr_alarms[-1]
+                if a['max_deg'] is None or abs(diff) > a['max_deg']:
+                    a['max_deg'] = round(abs(diff), 1)
+        if out['edge'] == 'raised':
+            rospy.loginfo('[rtk_mag] ALARM #%d: RTK heading %+.1f deg off the magnetometer '
+                          '(report only)' % (count, diff if diff is not None else float('nan')))
+        elif out['edge'] == 'cleared' and self._rmr_alarms:
+            rospy.loginfo('[rtk_mag] alarm #%d over, largest |rtk - mag| %s deg'
+                          % (count, self._rmr_alarms[-1]['max_deg']))
 
     def _rmr_fields(self):
         """rtk_mag_* fields of /nav_tf/loc_status (only with ~rtk_mag_report)."""
@@ -3805,6 +3830,7 @@ class NavTfNode:
             with self._rmr_lock:
                 self._rmr_st, out = rtk_mag_report_step(self._rmr_st, now, None, self._rmr_cfg)
                 st, last, ref = self._rmr_st, self._rmr_last, self._rmr_ref
+                alarms = [dict(a) for a in self._rmr_alarms]
             age = (now - last[0]) if last is not None else None
             ref_age = (now - ref[0]) if ref is not None else None
             return {
@@ -3819,13 +3845,16 @@ class NavTfNode:
                 'rtk_mag_disagree_count': int(st['count']),
                 'rtk_mag_disagree_age_s': (round(now - st['last_true'], 1)
                                            if st['last_true'] is not None else None),
+                # T35 K1: the last alarms (unix time, rtk - mag when raised,
+                # largest |rtk - mag| while it lasted)
+                'rtk_mag_alarms': alarms,
             }
         except Exception as e:
             rospy.logwarn_throttle(10.0, "[rtk_mag] %s" % e)
             return {'rtk_mag_diff_deg': None, 'rtk_mag_age_s': None, 'rtk_mag_valid': False,
                     'rtk_mag_ref_age_s': None, 'rtk_mag_over_s': None,
                     'rtk_mag_disagree': False, 'rtk_mag_disagree_count': None,
-                    'rtk_mag_disagree_age_s': None}
+                    'rtk_mag_disagree_age_s': None, 'rtk_mag_alarms': []}
 
     def publish_georef_status(self):
         """/nav_tf/georef_status (vitulus-field#32): which UTM frame the map

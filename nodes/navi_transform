@@ -967,6 +967,116 @@ ANCHOR_MODE_CFG = {
 }
 
 
+# T36 P3 (~dock_anchor_offset_report). REPORT ONLY: how far the DOCKED waypoint
+# is from where the GPS has the docked robot, measured at both ends of a stay
+# in the dock. Nothing is written to the map, to map->odom or to the EKF.
+#   undock: the map pose the dock left (+ odometry) against the pose after GPS
+#           took over and the georef settled:   GPS - DOCKED  = +offset
+#   dock:   the pose the robot arrived with (GPS + odometry of the blind last
+#           metres) against DOCKED:             DOCKED - GPS  = -offset
+# A real offset of the waypoint shows with opposite signs at the two ends;
+# odometry drift of the approach does not. All vectors in the frame of the
+# DOCKED waypoint: x along the robot's axis (+ forward), y to its left.
+DOCK_OFFSET_CFG = {
+    'settle_s': 3.0,        # georef done for this long before the undock sample
+    'timeout_s': 60.0,      # no settled takeover this long after it began: no sample
+    'max_dist_m': 10.0,     # takeover further from the release point: no sample
+    'max_move_m': 1.5,      # robot drove more between takeover and settle: no sample
+    'max_m': 0.5,           # a sample larger than this / max_deg is not counted
+    'max_deg': 10.0,
+    'keep': 30,             # samples kept per end
+    'min_n': 3,             # an estimate needs this many at an end
+}
+
+
+def _wrap_pi(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def dock_offset_frame(dx, dy, yaw):
+    """Map vector -> frame of the DOCKED waypoint (yaw = its heading)."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    return c * dx + s * dy, -s * dx + c * dy
+
+
+def dock_offset_undock_sample(head_ref, pose0, wheel0, pose1, wheel1, dock_yaw):
+    """Undock end. head_ref = (map heading - wheel-EKF yaw) when the dock hold
+    let go; pose0 / wheel0 = map pose and wheel-EKF pose (x, y, yaw) just
+    before GPS took over; pose1 / wheel1 = the same once the georef settled.
+    The wheel EKF is never corrected, so its path between the two moments,
+    turned into the map by the settled heading, is what the robot drove.
+    Returns (x_m, y_m, yaw_deg, moved_m) = GPS - DOCKED in the DOCKED frame."""
+    th = pose1[2] - wheel1[2]
+    wx, wy = wheel1[0] - wheel0[0], wheel1[1] - wheel0[1]
+    c, s = math.cos(th), math.sin(th)
+    dx = (pose1[0] - pose0[0]) - (c * wx - s * wy)
+    dy = (pose1[1] - pose0[1]) - (s * wx + c * wy)
+    fx, fy = dock_offset_frame(dx, dy, dock_yaw)
+    return fx, fy, math.degrees(_wrap_pi(th - head_ref)), math.hypot(wx, wy)
+
+
+def dock_offset_dock_sample(pose_arr, anchor):
+    """Dock end, at the docked edge before anything wrote the dock pose:
+    (x_m, y_m, yaw_deg) = DOCKED - arrived pose in the DOCKED frame."""
+    fx, fy = dock_offset_frame(anchor[0] - pose_arr[0], anchor[1] - pose_arr[1], anchor[2])
+    return fx, fy, math.degrees(_wrap_pi(anchor[2] - pose_arr[2]))
+
+
+def dock_offset_new_state():
+    return {'und': [], 'dock': [], 'arm': None, 'pend': None, 'rejected': 0, 'last': None}
+
+
+def dock_offset_add(st, end, sample, cfg=None):
+    """Count a sample (x_m, y_m, yaw_deg) at 'und' / 'dock'; False = out of
+    the sanity bounds (counted as rejected)."""
+    cfg = cfg or DOCK_OFFSET_CFG
+    if math.hypot(sample[0], sample[1]) > cfg['max_m'] or abs(sample[2]) > cfg['max_deg']:
+        st['rejected'] += 1
+        return False
+    rows = st[end]
+    rows.append((sample[0], sample[1], sample[2]))
+    del rows[:-int(cfg['keep'])]
+    st['last'] = {'end': 'undock' if end == 'und' else 'dock', 'x_m': round(sample[0], 3),
+                  'y_m': round(sample[1], 3), 'yaw_deg': round(sample[2], 2)}
+    return True
+
+
+def _dock_offset_median(rows, k):
+    v = sorted(r[k] for r in rows)
+    n = len(v)
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def dock_offset_fields(st, cfg=None):
+    """The dock_offset_* fields of /nav_tf/loc_status. dock_offset_est_x_m /
+    _est_yaw_deg: by how much DOCKED would have to move along the robot's
+    axis / turn for the difference to vanish at both ends = half the
+    difference of the two medians (None until both ends have min_n samples).
+    dock_offset_y_m likewise; dock_offset_y_offset_like False = the lateral
+    medians have the SAME sign at both ends, i.e. not an offset of the
+    waypoint (drift of the approach) - do not correct it."""
+    cfg = cfg or DOCK_OFFSET_CFG
+    und, dock = st['und'], st['dock']
+    out = {'dock_offset_n_undock': len(und), 'dock_offset_n_dock': len(dock),
+           'dock_offset_undock': None, 'dock_offset_dock': None,
+           'dock_offset_est_x_m': None, 'dock_offset_est_y_m': None,
+           'dock_offset_est_yaw_deg': None, 'dock_offset_y_offset_like': None,
+           'dock_offset_rejected': st['rejected'], 'dock_offset_last': st['last']}
+    mu = md = None
+    if und:
+        mu = [_dock_offset_median(und, k) for k in range(3)]
+        out['dock_offset_undock'] = [round(mu[0], 3), round(mu[1], 3), round(mu[2], 2)]
+    if dock:
+        md = [_dock_offset_median(dock, k) for k in range(3)]
+        out['dock_offset_dock'] = [round(md[0], 3), round(md[1], 3), round(md[2], 2)]
+    if len(und) >= cfg['min_n'] and len(dock) >= cfg['min_n']:
+        out['dock_offset_est_x_m'] = round(0.5 * (mu[0] - md[0]), 3)
+        out['dock_offset_est_y_m'] = round(0.5 * (mu[1] - md[1]), 3)
+        out['dock_offset_est_yaw_deg'] = round(0.5 * (mu[2] - md[2]), 2)
+        out['dock_offset_y_offset_like'] = bool(mu[1] * md[1] < 0.0)
+    return out
+
+
 def anchor_mode_new_state():
     return {'ticks': [], 'gps': [], 'clock': []}
 
@@ -2234,6 +2344,9 @@ class NavTfNode:
         # (gps-map-probe dD). JSON, latched, 1 Hz from loop1hz.
         self.georef_status_pub = rospy.Publisher("/nav_tf/georef_status", String, queue_size=1, latch=True)
         self._hhd_setup()     # T36 N1 (~heading_hold_near_dock, default off)
+        # T36 P3: how far DOCKED is from the GPS, in loc_status and the log.
+        # REPORT ONLY, off by default: then no state and no field.
+        self._dor_setup()
         # FIX4 (telemfix): edge-triggered loc_status. Baseline stays 1 Hz; on an
         # owner-change edge publish_loc_status is called immediately so an
         # ownership transition is not smeared into the next 1 Hz tick.
@@ -2439,6 +2552,8 @@ class NavTfNode:
         self._dock_status_val = val
         self._dock_status_rx_t = rospy.get_time()   # DOCKFIX: staleness clock
         self._docked = (val == 0)
+        if getattr(self, '_dor_enable', False) and val == 0 and prev not in (None, 0):
+            self._dor_docked_edge()       # T36 P3, report only
         # DOCKFIX-2026-08-29 (A2): debounce clock for the continuous dock hold.
         if val == 0:
             if prev != 0 or self._docked_since is None:
@@ -2754,6 +2869,8 @@ class NavTfNode:
                 rospy.logwarn('[dock_hold] RELEASED (dock_status=%s) — pose '
                               'returns to the normal arbiter',
                               self._dock_status_val)
+                if getattr(self, '_dor_enable', False):
+                    self._dor_released()          # T36 P3, report only
             if getattr(self, '_dock_engage_slew_mps', 0.0) > 0.0:      # T36 D4
                 self._dock_engage_walk_tick()
             return
@@ -3833,6 +3950,8 @@ class NavTfNode:
                 # T36 N1 (only with ~heading_hold_near_dock): heading_hold, _s,
                 # _m, _end, _count, _fuse_count
                 **(self._hhd_fields() if getattr(self, '_hhd_enable', False) else {}),
+                # T36 P3 (only with ~dock_anchor_offset_report): dock_offset_*
+                **(self._dor_fields() if getattr(self, '_dor_enable', False) else {}),
                 'rtabmap_confident': bool(self._rtabmap_confident),
                 'anchor_age_s': anchor_age,
                 'anchor_frozen': anchor_frozen,
@@ -4444,6 +4563,146 @@ class NavTfNode:
             else:
                 break
         return found
+
+    # ---- T36 P3: DOCKED waypoint against the GPS (report only) --------------
+
+    def _dor_setup(self):
+        """The one switch (~dock_anchor_offset_report): without it nothing of P3 runs."""
+        self._dor_enable = bool(rospy.get_param('~dock_anchor_offset_report', False))
+        if not self._dor_enable:
+            return
+        self._dor_cfg = dict(DOCK_OFFSET_CFG)
+        for key in ('settle_s', 'timeout_s', 'max_dist_m', 'max_move_m', 'max_m', 'max_deg'):
+            self._dor_cfg[key] = float(rospy.get_param(
+                '~dock_anchor_offset_report_' + key, self._dor_cfg[key]))
+        self._dor_lock = threading.Lock()
+        self._dor_st = dock_offset_new_state()
+        rospy.loginfo('[dock_offset] report of the DOCKED waypoint against the GPS ENABLED '
+                      '(report only - nothing is written to the map or the pose)')
+
+    def _dor_poses(self):
+        """(map pose, wheel-EKF pose) now, each (x, y, yaw); node state only."""
+        with self._map_odom_lock:
+            m = self.map_odom_transform.transform.translation
+            mx, my, myaw = m.x, m.y, self.map_odom_yaw
+        p = self.ekf_wheel_nav_odom_msg.pose.pose
+        q = p.orientation
+        yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        c, s = math.cos(myaw), math.sin(myaw)
+        w = self.ekf_wheel_odom_msg.pose.pose
+        wq = w.orientation
+        return ((mx + c * p.position.x - s * p.position.y,
+                 my + s * p.position.x + c * p.position.y, myaw + yaw),
+                (w.position.x, w.position.y,
+                 euler_from_quaternion([wq.x, wq.y, wq.z, wq.w])[2]))
+
+    def _dor_released(self):
+        """The dock hold let go (undock): remember the heading the dock gave."""
+        try:
+            anchor = self._dock_anchor_pose
+            if anchor is None:
+                return
+            pose, wheel = self._dor_poses()
+            with self._dor_lock:
+                self._dor_st['arm'] = {'head_ref': pose[2] - wheel[2], 'yaw': anchor[2],
+                                       'wxy': (wheel[0], wheel[1])}
+                self._dor_st['pend'] = None
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[dock_offset] %s' % e)
+
+    def _dor_takeover(self):
+        """loop3sec, before the anchor's first write after a break."""
+        try:
+            with self._dor_lock:
+                arm = self._dor_st['arm']
+                if arm is None:
+                    return
+                self._dor_st['arm'] = None
+                pose, wheel = self._dor_poses()
+                if math.hypot(wheel[0] - arm['wxy'][0],
+                              wheel[1] - arm['wxy'][1]) > self._dor_cfg['max_dist_m']:
+                    self._dor_st['rejected'] += 1
+                    return
+                self._dor_st['pend'] = dict(arm, t0=rospy.get_time(), pose0=pose, wheel0=wheel,
+                                            ok_since=None)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[dock_offset] %s' % e)
+
+    def _dor_tick(self):
+        """loop3sec (10 Hz): the undock sample once GPS owns the position, the
+        heading hand-over is over and the georef has walked map->odom home."""
+        try:
+            with self._dor_lock:
+                st = self._dor_st
+                pend = st['pend']
+                if pend is None:
+                    return
+                now = rospy.get_time()
+                if now - pend['t0'] > self._dor_cfg['timeout_s'] or self._docked:
+                    st['pend'] = None
+                    st['rejected'] += 1
+                    return
+                settled = (self._anchor_owned and self.map_odom_yaw == 0.0
+                           and self._georef_target is None
+                           and self._georef_last_t is not None
+                           and self._georef_last_t > pend['t0'])
+                if not settled:
+                    pend['ok_since'] = None
+                    return
+                if pend['ok_since'] is None:
+                    pend['ok_since'] = now
+                if now - pend['ok_since'] < self._dor_cfg['settle_s']:
+                    return
+                st['pend'] = None
+                pose, wheel = self._dor_poses()
+                x, y, yaw, moved = dock_offset_undock_sample(
+                    pend['head_ref'], pend['pose0'], pend['wheel0'], pose, wheel, pend['yaw'])
+                if moved > self._dor_cfg['max_move_m']:
+                    st['rejected'] += 1
+                    return
+                ok = dock_offset_add(st, 'und', (x, y, yaw), self._dor_cfg)
+                f = dock_offset_fields(st, self._dor_cfg)
+            self._dor_log('undock', (x, y, yaw), ok, f)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[dock_offset] %s' % e)
+
+    def _dor_docked_edge(self):
+        """dock_status -> 0: the pose the robot arrived with against DOCKED,
+        before the dock seed or the hold write anything."""
+        try:
+            anchor = self._dock_anchor_pose
+            if anchor is None:
+                return
+            pose, _ = self._dor_poses()
+            s = dock_offset_dock_sample(pose, anchor)
+            with self._dor_lock:
+                self._dor_st['arm'] = self._dor_st['pend'] = None
+                ok = dock_offset_add(self._dor_st, 'dock', s, self._dor_cfg)
+                f = dock_offset_fields(self._dor_st, self._dor_cfg)
+            self._dor_log('dock', s, ok, f)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[dock_offset] %s' % e)
+
+    def _dor_log(self, end, s, ok, f):
+        est = ''
+        if f['dock_offset_est_x_m'] is not None:
+            est = ('; estimate from %d undocks and %d dockings: DOCKED %+.3f m along the '
+                   'robot axis, %+.2f deg%s' % (
+                       f['dock_offset_n_undock'], f['dock_offset_n_dock'],
+                       f['dock_offset_est_x_m'], f['dock_offset_est_yaw_deg'],
+                       '' if f['dock_offset_y_offset_like'] else
+                       ' (lateral part is not an offset of the waypoint)'))
+        rospy.loginfo('[dock_offset] %s: %s x %+.3f m, y %+.3f m, yaw %+.2f deg%s%s',
+                      end, 'GPS - DOCKED' if end == 'undock' else 'DOCKED - arrived pose',
+                      s[0], s[1], s[2], '' if ok else ' (out of bounds, not counted)', est)
+
+    def _dor_fields(self):
+        try:
+            with self._dor_lock:
+                return dock_offset_fields(self._dor_st, self._dor_cfg)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[dock_offset] %s' % e)
+            return {}
 
     # ---- T36 N1: the heading rides the gyro on the last metres into the dock --
 
@@ -6341,6 +6600,8 @@ class NavTfNode:
                     # back to the legacy rtk(NOW) correction while the buffer is
                     # not yet lag-deep (bootstrap / just-acquired GPS).
                     resumed = not self._anchor_owned
+                    if resumed and getattr(self, '_dor_enable', False):   # T36 P3, report only
+                        self._dor_takeover()
                     # FIX1 (telemfix): on the resume tick, snapshot the live
                     # nav-EKF pose AND the time-paired RTK pose BEFORE the first
                     # new correction is applied — the drift report measures the
@@ -6400,6 +6661,8 @@ class NavTfNode:
         # Reconcile ownership edge ONCE per tick (records loss state on the
         # True->False transition for the next resume's drift report).
         self._note_ownership(wrote_anchor)
+        if getattr(self, '_dor_enable', False):       # T36 P3, report only
+            self._dor_tick()
         # FIX4 (telemfix): edge-triggered loc_status on owner change (this loop
         # runs at 10 Hz and is where ownership is decided; baseline 1 Hz stays).
         self.maybe_publish_owner_edge()

@@ -613,6 +613,36 @@ def anchor_freeze_step(st, now, xy, owner, heading_age, anchor_age, in_dock,
             'loc_blind_count': st['count']}
 
 
+ANCHOR_STALE_RESET_MIN_S = 10.0
+
+
+def anchor_stale_reset_limit(value):
+    """T36 P1: ~anchor_stale_reset_s -> the limit in use. 0, negative, NaN or
+    not a number = off (0.0). A positive value under ANCHOR_STALE_RESET_MIN_S
+    is raised to it: a shorter limit would drop the anchor after a GPS outage
+    barely longer than gps_dropout_grace_s and let rtk(now) be written without
+    the anchor's lag and motion check - its protection against a lying GPS
+    tail."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not v > 0.0:
+        return 0.0
+    return max(v, ANCHOR_STALE_RESET_MIN_S)
+
+
+def anchor_stale_reset_due(newest_t, now, limit_s):
+    """T36 P1 (~anchor_stale_reset_s): True when the position anchor resumes
+    after a break and what it would work from - the newest entry of the pose
+    buffer, else the last verified anchor - is older than limit_s. Such an
+    anchor is a GPS point from before the break (before the docking) carried on
+    by the wheels: for the first anchor_lag_s it pulled the EKF to a place
+    several cm off the GPS, then the fresh anchor pulled it back. 0 = never
+    (as before); nothing to work from = nothing to drop."""
+    return limit_s > 0.0 and newest_t is not None and (now - newest_t) > limit_s
+
+
 def utm_to_map_xy(e, n, utm_e, utm_n, yaw):
     """vitulus_mapping.geo.utm_to_map: UTM -> map through the datum."""
     dx, dy = e - utm_e, n - utm_n
@@ -1612,6 +1642,18 @@ class NavTfNode:
         # newest lag-old sample fails motion verification — protects the pose
         # from a lying multipath tail). None until the first verified anchor.
         self._anchor_verified = None
+        # T36 P1: when GPS takes the position over again and the anchor's
+        # buffer is older than this (s), the buffer and the verified anchor are
+        # dropped; the anchor then starts as after a node start (rtk(now) until
+        # the buffer is lag-deep again). 0 = off: they are kept for ever; a
+        # positive value under 10 s is raised to 10 s (anchor_stale_reset_limit).
+        _asr_raw = rospy.get_param('~anchor_stale_reset_s', 0.0)
+        self._asr_s = anchor_stale_reset_limit(_asr_raw)
+        if self._asr_s > 0.0:
+            rospy.loginfo('[anchor] anchor_stale_reset_s = %.0f s%s', self._asr_s,
+                          '' if float(_asr_raw) == self._asr_s else
+                          ' (asked %s, raised to the lower bound)' % _asr_raw)
+        self._asr_count = 0
         # FIX3 (telemfix 2026-07-11): anchor observability. Wall time the
         # verified anchor last ADVANCED (a fresh lag-old sample verified) so
         # loc_status can expose its age; a warn fires (throttled) when it stays
@@ -3651,6 +3693,9 @@ class NavTfNode:
                 # T36 F2 (only with ~anchor_mode_report): anchor_mode, shares,
                 # anchor_starving, gps_clock_offset_s
                 **(self._amr_fields() if getattr(self, '_amr_enable', False) else {}),
+                # T36 P1 (only with ~anchor_stale_reset_s > 0)
+                **({'anchor_stale_resets': self._asr_count}
+                   if getattr(self, '_asr_s', 0.0) > 0.0 else {}),
                 # heading anchor v2 observability: age since a verified heading
                 # anchor last applied; frozen = window failing >3 s (heading on
                 # gyro + last verified offset)
@@ -4500,6 +4545,25 @@ class NavTfNode:
         # explicit map-frame target and let set_wheel_base_nav_pose slew it).
         self._set_anchor_pose_slewed(tx, ty, pose.position.z)
         return True
+
+    def _asr_resume(self):
+        """T36 P1 (only with ~anchor_stale_reset_s > 0): first anchor tick after
+        a break. Buffer entries carry the system time of the GPS sample with F1
+        and the receiver's time without it; the limit is seconds to minutes, a
+        clock offset of a second does not matter."""
+        buf = self._pose_buffer
+        newest = buf[-1][0] if buf else (
+            self._anchor_verified[0] if self._anchor_verified is not None else None)
+        now = rospy.get_time()
+        if not anchor_stale_reset_due(newest, now, self._asr_s):
+            return
+        buf.clear()
+        self._anchor_verified = None
+        self._anchor_last_advance_t = None
+        self._asr_count += 1
+        rospy.loginfo('[anchor] position anchor resumed after %.0f s - its buffer and '
+                      'the verified anchor are dropped (stale, limit %.0f s; #%d)',
+                      now - newest, self._asr_s, self._asr_count)
 
     def _set_anchor_pose_slewed(self, tx, ty, tz):
         """Write a map/odom-frame position target into the nav EKF, deadbanded
@@ -5960,6 +6024,8 @@ class NavTfNode:
                     # stamp. The old latest-msg pairing at the 10 Hz tick put a
                     # v*age (96-196 ms) error into every entry — the anchor
                     # target jittered +-40 mm and the pose sawtoothed under TEB.
+                    if getattr(self, '_asr_s', 0.0) > 0.0 and not self._anchor_owned:     # T36 P1
+                        self._asr_resume()
                     gps_t = self.rtk_odom_msg.header.stamp.to_sec()
                     gps_key = gps_t
                     gso_on = getattr(self, '_gso_enable', False)

@@ -100,6 +100,24 @@ C2. Mezera EKF - GPS s opravou razitek, v ramu odom
          (0 = razitka sedi; obsahuje i zpozdeni dodani navpvt a kotvy).
    takeover_gap_odom_med_cm / _max_cm, takeover_settle_odom_med_s / _max_s
          jako takeover_gap_* / takeover_settle_*, ale z teto mezery.
+C3. "Pohyblive" prevzeti polohy po vyjezdu z doku (takeover_wander, v4)
+   Co vidi majitel na mape: obraz robota po prevzeti GPS cikcak ujede
+   desitky cm, i kdyz staci opravit par cm, a robot sam se pritom nehybe.
+   Prevzeti = prvni owner -> gps po opusteni doku (jedno na vyjezd). Okno
+   <-1 s, +10 s> kolem nej. R(t) = soucet pres tiky [zmena polohy map->base
+   minus draha kol dl ve smeru kurzu robota v mape] - pohyb obrazu, ktery
+   kola nevysvetli (jizda i otaceni robota se odecte).
+   takeover_path_map_cm     draha R(t): soucet |R(t + 0,1 s) - R(t)| pres
+                            kroky vetsi nez 2 mm (median pres vyjezdy)
+   takeover_needed_cm       skutecne potrebna oprava |R(konec) - R(zacatek)|
+                            (median); idealni prevzeti ma drahu = opravu
+   takeover_yaw_wobble_deg  kolisani kurzu: soucet |zmen H| po 0,5 s, H =
+                            yaw(map->base) - gyro, jen kroky v klidu kurzu
+                            (median); pri otaceni se kurz nehodnoti (0)
+   takeover_wander_med, takeover_wander_max
+         jedno cislo na vyjezd M = draha [cm] + 0,5 * kolisani kurzu [st]
+         (0,5 cm/st = roh robota na rameni 0,3 m); median a maximum pres
+         vyjezdy. Jednotlive vyjezdy: detail.takeover_wander.
 D. Predani kurzu po vyjezdu (dok -> GNSS)
    Okno predani = souvisly usek po opusteni doku, kdy se yaw map->odom meni
    (mezery mezi zmenami <= 5 s) a konci presnou nulou.
@@ -180,7 +198,8 @@ import sys
 
 import numpy as np
 
-VERSION = 3
+VERSION = 4
+EXTRACT_VERSION = 3    # format vytahu (.npz v --cache); v4 pridala jen metriky, vytah je stejny
 
 TOPICS = {
     'tf': '/tf',
@@ -205,6 +224,12 @@ MOVE_W = 0.05          # rad/s
 SETTLE_M = 0.05        # m, mezera povazovana za dorovnanou
 SETTLE_HOLD_S = 1.0
 FREEZE_S = 5.0
+WANDER_PRE_S = 1.0     # okno takeover_wander pred prevzetim
+WANDER_POST_S = 10.0   # ... a po nem
+WANDER_STEP_S = 0.1    # krok vzorkovani drahy obrazu
+WANDER_MIN_M = 0.002   # mensi kroky se do drahy nepocitaji (sum)
+WANDER_YAW_STEP_S = 0.5
+WANDER_YAW_CM_PER_DEG = 0.5    # vaha kolisani kurzu v M (roh robota na rameni 0,3 m)
 FALLBACK_INVALID_PCT = 20.0     # anchor_fallback_pct nad timto: polohove metriky neplati
 BUFFERED_INVALID_PCT = 50.0     # gps_buffered_est_pct pod timto (stare nahravky): kotva hladovela
 NA = 'neni v nahravce'
@@ -609,6 +634,48 @@ def takeover_stats(gt, gap, episodes):
     return out
 
 
+def takeover_wander(T, tau, wheel, yref_t, yref_yaw, imu, tg):
+    """Oddil C3 pro jedno prevzeti v case tg (cas bagu). Vraci dict {t,
+    path_cm, needed_cm, yaw_wobble_deg, wander} nebo None, kdyz okno
+    <tg - WANDER_PRE_S, tg + WANDER_POST_S> neni cele v nahravce."""
+    t = T['t']
+    a, b = tg - WANDER_PRE_S, tg + WANDER_POST_S
+    if not len(t) or a < t[0] or b > t[-1]:
+        return None
+    i0 = max(int(np.searchsorted(t, a)) - 2, 0)
+    i1 = min(int(np.searchsorted(t, b)) + 2, len(t))
+    if i1 - i0 < 3:
+        return None
+    sl = slice(i0, i1)
+    t, tq = t[sl], tau[sl]
+    myaw = T['myaw'][sl]
+    c, s = np.cos(myaw), np.sin(myaw)
+    bx = T['mx'][sl] + c * T['ox'][sl] - s * T['oy'][sl]
+    by = T['my'][sl] + s * T['ox'][sl] + c * T['oy'][sl]
+    h = np.unwrap(myaw + T['oyaw'][sl])
+    ref_t, ref_s = wheel_path(wheel)
+    dl = np.diff(np.interp(tq, ref_t, ref_s))
+    rx = np.concatenate([[0.0], np.cumsum(np.diff(bx) - dl * np.cos(h[1:]))])
+    ry = np.concatenate([[0.0], np.cumsum(np.diff(by) - dl * np.sin(h[1:]))])
+    n = int(round((WANDER_PRE_S + WANDER_POST_S) / WANDER_STEP_S))
+    tb = a + WANDER_STEP_S * np.arange(n + 1)
+    xb, yb = np.interp(tb, t, rx), np.interp(tb, t, ry)
+    st = np.hypot(np.diff(xb), np.diff(yb))
+    path = 100.0 * float(st[st > WANDER_MIN_M].sum())
+    needed = 100.0 * math.hypot(xb[-1] - xb[0], yb[-1] - yb[0])
+    hres = np.degrees(h - interp_yaw(tq, yref_t, yref_yaw))
+    n = int(round((WANDER_PRE_S + WANDER_POST_S) / WANDER_YAW_STEP_S))
+    th = a + WANDER_YAW_STEP_S * np.arange(n + 1)
+    w = np.abs(np.interp(tq, wheel[:, 1], wheel[:, 8]))
+    if imu is not None and len(imu) > 2:
+        w = np.maximum(w, np.abs(np.interp(tq, imu[:, 1], imu[:, 3])))
+    calm = np.interp(th, t, w) < 0.1
+    dh = np.abs(np.diff(np.interp(th, t, hres)))
+    wobble = float(dh[calm[1:] & calm[:-1]].sum())
+    return {'t': float(tg), 'path_cm': path, 'needed_cm': needed, 'yaw_wobble_deg': wobble,
+            'wander': path + WANDER_YAW_CM_PER_DEG * wobble}
+
+
 def dock_edges(dock):
     """Hrany dock_status. dock: N x 2 (bag_t, hodnota). Vraci (vyjezdy, zadokovani)
     = casy prechodu 0 -> jine a jine -> 0."""
@@ -966,6 +1033,8 @@ def score(D):
              'yaw_handover_max_step_deg']
     keysE = ['dock_jump_cm', 'dock_jump_deg', 'dock_shift_cm']
     keysF = ['to_rtk_fixed_s', 'to_owner_gps_s', 'to_undocked_s', 'to_depart_s', 'undock_standing_s']
+    keysW = ['takeover_wander_med', 'takeover_wander_max', 'takeover_path_map_cm',
+             'takeover_needed_cm', 'takeover_yaw_wobble_deg']
     if _have(D, 'dock', 2):
         und, dks = dock_edges(D['dock'])
         meta['undocks'], meta['docks'] = len(und), len(dks)
@@ -1033,8 +1102,42 @@ def score(D):
             for k in keysF:
                 M[k] = None
                 notes[k] = 'v nahravce neni vyjezd z doku'
+        # C3. pohyblive prevzeti polohy po vyjezdu
+        for k in keysW:
+            M[k] = None
+        if not und:
+            for k in keysW:
+                notes[k] = 'v nahravce neni vyjezd z doku'
+        elif not (has_tf and has_loc and wheel is not None and yref_t is not None):
+            missing(keysW, TOPICS['tf'], TOPICS['loc'], TOPICS['wheel'])
+        else:
+            tgs = []
+            for t0 in und:
+                first = [a for (a, _) in episodes if t0 < a <= nxt(t0)]
+                if first:
+                    tgs.append(first[0])
+            ws = [x for x in (takeover_wander(T, tau, wheel, yref_t, yref_yaw, imu, tg)
+                              for tg in tgs) if x]
+            if ws:
+                med = lambda key: float(np.median([x[key] for x in ws]))
+                M['takeover_wander_med'] = med('wander')
+                M['takeover_wander_max'] = max(x['wander'] for x in ws)
+                M['takeover_path_map_cm'] = med('path_cm')
+                M['takeover_needed_cm'] = med('needed_cm')
+                M['takeover_yaw_wobble_deg'] = med('yaw_wobble_deg')
+                if len(ws) < len(und):
+                    notes['takeover_wander_max'] = 'jen %d z %d vyjezdu (bez prevzeti nebo okno mimo nahravku)' % (
+                        len(ws), len(und))
+                for x in ws:
+                    x['t'] = round(x['t'] - t_beg, 2)
+                detail['takeover_wander'] = ws
+            else:
+                for k in keysW:
+                    notes[k] = ('po vyjezdu v nahravce nenastalo prevzeti (owner -> gps)' if not tgs else
+                                'okno prevzeti (-%g az +%g s) neni cele v nahravce'
+                                % (WANDER_PRE_S, WANDER_POST_S))
     else:
-        missing(keysD + keysE + keysF, TOPICS['dock'])
+        missing(keysD + keysE + keysF + keysW, TOPICS['dock'])
 
     keysS = ['gps_standing_yaw_std_deg', 'gps_standing_yaw_p2p_deg', 'gps_standing_pos_p95_cm']
     if has_tf and has_loc and wheel is not None and yref_t is not None:
@@ -1260,11 +1363,12 @@ def extract(bag_path):
 
 
 def load(bag_path, cache_dir=None):
-    """Vytah z bagu; s cache_dir se uklada do / cte z <cache_dir>/<bag>.<velikost>.v<N>.npz."""
+    """Vytah z bagu; s cache_dir se uklada do / cte z <cache_dir>/<bag>.<velikost>.v<N>.npz
+    (N = EXTRACT_VERSION)."""
     if not cache_dir:
         return extract(bag_path)
     st = os.stat(bag_path)
-    f = os.path.join(cache_dir, '%s.%d.v%d.npz' % (os.path.basename(bag_path), st.st_size, VERSION))
+    f = os.path.join(cache_dir, '%s.%d.v%d.npz' % (os.path.basename(bag_path), st.st_size, EXTRACT_VERSION))
     if os.path.exists(f) and os.path.getmtime(f) >= st.st_mtime:
         Z = np.load(f, allow_pickle=False)
         D = {k: Z[k] for k in Z.files if k != 'counts_json'}
@@ -1337,6 +1441,13 @@ SPEC = [
     ('takeover_gap_odom_max_cm', 'mezera pred prevzetim GPS, max', 'cm', 'low'),
     ('takeover_settle_odom_med_s', 'doba dorovnani po prevzeti, median', 's', 'low'),
     ('takeover_settle_odom_max_s', 'doba dorovnani po prevzeti, max', 's', 'low'),
+    ('C3. Pohyblive prevzeti po vyjezdu: pohyb obrazu robota v mape mimo kola, okno -1 az +10 s',
+     None, None, None),
+    ('takeover_wander_med', 'M = draha + 0,5 x kolisani kurzu, median', '', 'low'),
+    ('takeover_wander_max', 'M = draha + 0,5 x kolisani kurzu, max', '', 'low'),
+    ('takeover_path_map_cm', 'draha obrazu v mape mimo kola, median', 'cm', 'low'),
+    ('takeover_needed_cm', 'skutecne potrebna oprava polohy, median', 'cm', 'low'),
+    ('takeover_yaw_wobble_deg', 'kolisani kurzu pri prevzeti, median', 'st', 'low'),
     ('D. Kurz: predani po vyjezdu a klid ve stoje', None, None, None),
     ('yaw_handover_s', 'doba predani kurzu', 's', 'low'),
     ('yaw_handover_turn_deg', 'otoceni map->odom pri predani', 'st', 'info'),

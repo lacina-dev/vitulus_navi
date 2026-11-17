@@ -319,6 +319,134 @@ class Dock(unittest.TestCase):
         self.assertLess(m['gps_standing_pos_p95_cm'], 0.001)
 
 
+class TakeoverWander(unittest.TestCase):
+    """Oddil C3: pohyb obrazu robota v mape po prevzeti GPS, ktery kola nevysvetli."""
+    TG = 25.0          # s od T0: owner -> gps
+
+    def _run(self, v=0.0, w=0.0, n=1800):
+        t = T0 + np.arange(n) / 30.0
+        th = w * (t - T0)
+        if w:
+            x, y = v / w * np.sin(th), v / w * (1.0 - np.cos(th))     # presny oblouk
+        else:
+            x, y = v * (t - T0), np.zeros(n)
+        D = {'wheel': odo(t, x, y, th, v=v, w=w), 'ekf': odo(t, x, y, th, v=v, w=w),
+             'imu': imu(t, th, w), 'mo': tfrows(t, 0.0, 0.0), 'ob': tfrows(t, x, y, th),
+             'counts': {}}
+        dt = T0 + np.arange(0, n / 30.0, 0.1)
+        D['dock'] = np.column_stack([dt, np.where(dt >= T0 + 5.0, 1.0, 0.0)])
+        nl = int(n / 30.0)
+        D['loc_t'] = T0 + np.arange(nl, dtype=float)
+        D['loc_owner'] = np.array(['dock'] * 5 + ['dr'] * (int(self.TG) - 5) + ['gps'] * (nl - int(self.TG)))
+        D['loc_anchor_age'] = np.full(nl, 0.1)
+        D['loc_heading_age'] = np.full(nl, 0.1)
+        return D, t - T0 - self.TG                 # cas od prevzeti
+
+    @staticmethod
+    def _ramp(ts, a, b, size):
+        return size * np.clip((ts - a) / (b - a), 0.0, 1.0)
+
+    def test_smooth_takeover_equals_needed(self):
+        D, ts = self._run()
+        D['mo'] = tfrows(ts + T0 + self.TG, self._ramp(ts, 0.5, 2.5, 0.06), 0.0)   # 6 cm za 2 s
+        R = ns.score(D)
+        m = R['metrics']
+        self.assertAlmostEqual(m['takeover_needed_cm'], 6.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_path_map_cm'], 6.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_yaw_wobble_deg'], 0.0, delta=1e-6)
+        self.assertAlmostEqual(m['takeover_wander_med'], 6.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_wander_max'], m['takeover_wander_med'])
+        self.assertEqual(len(R['detail']['takeover_wander']), 1)
+        self.assertAlmostEqual(R['detail']['takeover_wander'][0]['t'], self.TG, delta=0.01)
+
+    def test_zigzag_is_larger(self):
+        D, ts = self._run()
+        # kotva v odom: +9 cm skokem a zpet; georef v map->odom: 6 cm; cisty posun 6 cm
+        oy = 0.09 * ((ts > 0.52) & (ts <= 2.02))
+        D['ob'] = tfrows(ts + T0 + self.TG, 0.0, oy)
+        D['ekf'] = odo(ts + T0 + self.TG, 0.0, oy, v=0.0)
+        D['mo'] = tfrows(ts + T0 + self.TG, self._ramp(ts, 3.0, 5.0, 0.06), 0.0)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['takeover_needed_cm'], 6.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_path_map_cm'], 24.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_wander_med'], 24.0, delta=0.01)
+
+    def test_yaw_wobble_adds_half_cm_per_deg(self):
+        D, ts = self._run()
+        # kurz v mape 4x preskoci o 1 st (po 1 s), poloha se nehne
+        k = np.clip(np.floor(ts - 0.27) + 1, 0, 4)
+        yaw = np.radians(1.0) * (k % 2)
+        D['ob'] = tfrows(ts + T0 + self.TG, 0.0, 0.0, yaw)
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['takeover_yaw_wobble_deg'], 4.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_path_map_cm'], 0.0, delta=1e-6)
+        self.assertAlmostEqual(m['takeover_wander_med'], 2.0, delta=0.01)
+
+    def test_real_motion_is_subtracted(self):
+        # robot behem prevzeti jede 0,3 m/s a otaci se: ujede 3,3 m, obraz mimo kola 0
+        D, ts = self._run(v=0.3, w=0.08)
+        m = ns.score(D)['metrics']
+        self.assertLess(m['takeover_path_map_cm'], 0.01)
+        self.assertLess(m['takeover_needed_cm'], 0.6)      # zbytek = krok integrace oblouku
+        self.assertLess(m['takeover_yaw_wobble_deg'], 0.01)
+        # stejna jizda + oprava 6 cm v map->odom: M = oprava, jizda se odecetla
+        D['mo'] = tfrows(ts + T0 + self.TG, 0.0, self._ramp(ts, 0.5, 2.5, 0.06))
+        m = ns.score(D)['metrics']
+        self.assertAlmostEqual(m['takeover_path_map_cm'], 6.0, delta=0.1)
+        self.assertAlmostEqual(m['takeover_wander_med'], 6.0, delta=0.1)
+
+    def test_turning_robot_yaw_not_scored(self):
+        # pri otaceni (|w| > 0,1 rad/s) se kolisani kurzu nehodnoti
+        D, ts = self._run(v=0.0, w=0.3)
+        ob = D['ob'].copy()
+        ob[:, 5] += np.radians(1.0) * (np.floor(ts) % 2)
+        D['ob'] = ob
+        m = ns.score(D)['metrics']
+        self.assertEqual(m['takeover_yaw_wobble_deg'], 0.0)
+
+    def test_two_undocks_median_and_max(self):
+        D, ts = self._run(n=3600)                          # 120 s
+        dt = D['dock'][:, 0] - T0
+        D['dock'][:, 1] = np.where((dt < 5) | ((dt >= 60) & (dt < 70)), 0.0, 1.0)
+        D['loc_owner'] = np.array(['dock'] * 5 + ['dr'] * 20 + ['gps'] * 35 + ['dock'] * 10
+                                  + ['dr'] * 15 + ['gps'] * 35)          # prevzeti v 25 a 85 s
+        mx = self._ramp(ts, 0.5, 2.5, 0.06) + self._ramp(ts, 60.5, 62.5, 0.10)
+        D['mo'] = tfrows(ts + T0 + self.TG, mx, 0.0)
+        R = ns.score(D)
+        m = R['metrics']
+        self.assertEqual([round(x['wander'], 2) for x in R['detail']['takeover_wander']], [6.0, 10.0])
+        self.assertAlmostEqual(m['takeover_wander_med'], 8.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_wander_max'], 10.0, delta=0.01)
+
+    def test_notes_when_not_measurable(self):
+        keys = ['takeover_wander_med', 'takeover_wander_max', 'takeover_path_map_cm',
+                'takeover_needed_cm', 'takeover_yaw_wobble_deg']
+        D, ts = self._run(n=900)                           # nahravka konci 5 s po prevzeti
+        R = ns.score(D)
+        for k in keys:
+            self.assertIsNone(R['metrics'][k])
+            self.assertIn('okno prevzeti', R['notes'][k])
+        D, ts = self._run()
+        D['loc_owner'] = np.array(['dock'] * 5 + ['dr'] * 55)       # bez prevzeti
+        R = ns.score(D)
+        self.assertIsNone(R['metrics']['takeover_wander_med'])
+        self.assertIn('nenastalo prevzeti', R['notes']['takeover_wander_med'])
+        D, ts = self._run()
+        D['dock'][:, 1] = 3.0                              # bez vyjezdu
+        R = ns.score(D)
+        self.assertIn('neni vyjezd', R['notes']['takeover_wander_max'])
+        del D['dock']
+        R = ns.score(D)
+        self.assertIn(ns.TOPICS['dock'], R['notes']['takeover_wander_max'])
+
+    def test_table_has_section(self):
+        D, ts = self._run()
+        buf = io.StringIO()
+        ns.print_table(ns._jsonable(dict(ns.score(D), bag='x')), buf)
+        self.assertIn('C3. Pohyblive prevzeti', buf.getvalue())
+        self.assertIn('M = draha + 0,5 x kolisani kurzu, median', buf.getvalue())
+
+
 class Missing(unittest.TestCase):
     def test_missing_topics_are_none_not_zero(self):
         D, *_ = base_extract()

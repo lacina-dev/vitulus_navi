@@ -124,6 +124,22 @@
              (load avg 15.9 in the dock, VO alone >1 core in the dark); resumes
              the instant undocking begins. ~enable:=false = no-op rollback. -->
         <node name="dock_idle" pkg="vitulus_navi" type="dock_idle" respawn="true" respawn_delay="2" output="log">
+            <!-- T39 (2026-11-18) LOST VO: outside the dock, pause the visual
+                 odometry while it is permanently lost (night: every message
+                 carries the 9999 covariance the EKF ignores, ~0.8 core burnt)
+                 and try it again every vo_lost_retry_s for vo_lost_probe_s.
+                 Only /vo/pause_odom + /vo/resume_odom are called; camera,
+                 depth_obstacles and lidar odometry are untouched. DEFAULT OFF.
+                 vo_lost_dry_run:=true = evaluate and report on
+                 /dock_idle/status (vo_lost), call nothing.
+                 ROLLBACK: vo_lost_pause:=false (nothing subscribed). -->
+            <param name="vo_lost_pause" value="false"/>
+            <param name="vo_lost_dry_run" value="false"/>
+            <param name="vo_lost_window_s" value="30.0"/>
+            <param name="vo_lost_max_good_frac" value="0.2"/>
+            <param name="vo_lost_min_msgs" value="30"/>
+            <param name="vo_lost_retry_s" value="90.0"/>
+            <param name="vo_lost_probe_s" value="8.0"/>
         </node>
     </group>
 

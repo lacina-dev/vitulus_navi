@@ -6656,6 +6656,10 @@ class NavTfNode:
                                                                       self.fused_msg.orientation.w])
         self.fused_yaw = fused_yaw
     def publish_yaws(self):
+        # T39: only for somebody listening (the IMU calibration page of the UI,
+        # a recorder); the topic is not latched, nobody else reads it
+        if self.yaws_pub.get_num_connections() == 0:
+            return
         yaws = Float32MultiArray()
         yaw_navheading = round(self.navheading_yaw * 180.0 / math.pi, 2)
         yaw_fused = round(self.fused_yaw * 180.0 / math.pi, 2)
@@ -6732,6 +6736,11 @@ class NavTfNode:
         return marker
 
     def publish_markers(self):
+        # T39: three markers built 3x a second only for somebody listening (the
+        # IMU calibration page of the UI); the marker_* attributes are read
+        # nowhere else
+        if self.marker_pub.get_num_connections() == 0:
+            return
         self.update_navheading_marker()
         self.update_fuse_marker()
         self.update_imu_marker()

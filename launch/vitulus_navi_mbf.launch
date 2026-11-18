@@ -11,6 +11,9 @@
   <arg name="traversability_nav" default="$(optenv VITULUS_TRAVERSABILITY_NAV false)"/>
   <arg name="traversability_node" default="$(optenv VITULUS_TRAVERSABILITY false)"/>
   <arg name="traversability_stack_node" default="$(optenv VITULUS_TRAVERSABILITY_NODE false)"/>
+  <!-- Corridor preference (T36): navi_man passes corridor_prefer:=true when navi_manager.yaml map_corridor_prefer is
+       true and the layer is built. Anything but "true" = parameters exactly as before. -->
+  <arg name="corridor_prefer" default="false"/>
 
 <!-- work around for footprint reload -->
   <rosparam command="delete" ns="move_base_flex" />
@@ -34,6 +37,10 @@
       <rosparam file="$(find vitulus_navi)/config/graceful_controller_params.yaml" command="load" />
       <rosparam file="$(find vitulus_navi)/config/neo_local_planner_params.yaml" command="load" />
       <rosparam file="$(find vitulus_navi)/config/global_planner_params.yaml" command="load" />
+      <!-- corridor switch: after global_costmap_params.yaml and global_planner_params.yaml (corridor_layer last in
+           global_costmap/plugins + the planner's neutral_cost and cost_factor that go with it) -->
+      <rosparam if="$(eval str(arg('corridor_prefer')).strip().lower() == 'true')"
+                file="$(find vitulus_navi)/config/global_costmap_corridor.yaml" command="load" />
       <rosparam file="$(find vitulus_navi)/config/recovery_behavior.yaml" command="load" />
 
       <param name="base_global_planner" value="global_planner/GlobalPlanner" />

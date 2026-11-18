@@ -13,6 +13,8 @@
   <build_depend>rospy</build_depend>
   <build_depend>std_msgs</build_depend>
   <build_depend>costmap_2d</build_depend>
+  <build_depend>nav_msgs</build_depend>
+  <build_depend>pluginlib</build_depend>
 
 
   <build_export_depend>roscpp</build_export_depend>
@@ -24,6 +26,8 @@
     <exec_depend>move_base_flex</exec_depend>
   <exec_depend>move_base</exec_depend>
   <exec_depend>costmap_2d</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>pluginlib</exec_depend>
   <!-- global costmap uses the memoryless obstacle layer; the plugin name
        costmap_2d::NonPersistentVoxelLayer is REGISTERED by this package
        (SteveMacenski/nonpersistent_voxel_layer, released to Noetic):
@@ -32,6 +36,11 @@
   <exec_depend>weather_alert</exec_depend>
   <exec_depend>vitulus_msgs</exec_depend>
   <exec_depend>ublox_msgs</exec_depend>
+
+  <export>
+    <!-- corridor preference layer of the global costmap (T36), used only with map_corridor_prefer -->
+    <costmap_2d plugin="${prefix}/corridor_layer_plugin.xml"/>
+  </export>
 
 <!--  <export>-->
 <!--        <costmap_2d plugin="${vitulus_navi}/costmap_plugins.xml"/>-->

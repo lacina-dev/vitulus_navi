@@ -76,6 +76,36 @@ map_source_republish: false
 #   false = as before (nogo areas only in the site raster)
 map_nogo_always: true
 
+# T36: the owner's corridors (map editor, object type "corridor": a line with
+# width_m) as a SOFT preference of the global planner. true = navi_man sends
+# /navi_manager/corridor_cost (map_corridor_cost inside the corridors, 0 elsewhere,
+# an empty grid without a corridor) and starts move_base_flex with
+# config/global_costmap_corridor.yaml: the corridor layer LAST in the global
+# costmap (plugins/corridor_layer.cpp) and a planner with a lower neutral_cost.
+# Together they make a corridor cell cheaper for the planner and leave the price
+# of every other cell exactly as it is today, so a plan that gains nothing from
+# a corridor is priced as before (the same distance from obstacles, the same
+# choice at narrow gaps); nothing becomes an obstacle, a nogo area or an obstacle
+# under a corridor stays one, the local costmap and TEB do not see it. The grid
+# is built only when the corridors, the dock points, the served site or the map
+# geometry change. Takes effect with the next start of navi_man. navi_man first
+# tries to load the built library libvitulus_navi_corridor_layer.so in a process
+# of its own: missing, not loadable or another version = the switch stays off
+# with one error in the log (move_base_flex is never asked for a plugin it cannot
+# load). The costs of /move_base_flex/global_costmap/costmap are then 2c + 8
+# instead of c (free space 8, not 0) - only the planner reads them as prices.
+# Mowing paths do not go through the global planner; transfers, detours and goto do.
+#   false = as before (the planner does not know the corridors)
+map_corridor_prefer: false
+# Strength, 1..8: a corridor cell costs the planner 1.5 * strength less than the
+# 50 of a free cell, so a way along a corridor wins while it is not longer than
+# 50 / (50 - 1.5 * strength) times the direct one: 5 -> 1.18, 6 -> 1.22,
+# 7 -> 1.27, 8 -> 1.32 (the most the planner started this way can give).
+map_corridor_cost: 7
+# Docking and undocking stay the very same plans: within this distance of the line
+# DOCKED - DOCK - UNDOCK a corridor is not cheaper. 0 = no such area.
+map_corridor_dock_radius_m: 2.5
+
 # ============================================================================
 # SITE-NATIVE MODE  (mapping-v3 site bundles as the runtime map authority)
 # ============================================================================

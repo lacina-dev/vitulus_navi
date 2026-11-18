@@ -12,6 +12,8 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   costmap_2d
+  nav_msgs
+  pluginlib
 )
 
 ## System dependencies are found with CMake's conventions
@@ -124,6 +126,16 @@ catkin_package(
 include_directories(
 # include
   ${catkin_INCLUDE_DIRS}
+)
+
+## Corridor preference layer of the global costmap (T36, navi_manager.yaml map_corridor_prefer)
+add_library(${PROJECT_NAME}_corridor_layer plugins/corridor_layer.cpp)
+target_link_libraries(${PROJECT_NAME}_corridor_layer ${catkin_LIBRARIES})
+install(TARGETS ${PROJECT_NAME}_corridor_layer
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+)
+install(FILES corridor_layer_plugin.xml
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
 ## Declare a C++ library

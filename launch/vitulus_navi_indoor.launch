@@ -1,5 +1,6 @@
 <launch>
     <arg name="map_topic" />
+    <arg name="corridor_prefer" default="false"/>
 <!--    <include file="$(find vitulus_gnss)/launch/vitulus_ardusimple_heading.launch"/>-->
 <!--    <include file="$(find vitulus_gnss)/launch/vitulus_ardusimple_gnss.launch"/>-->
 
@@ -10,6 +11,7 @@
     <!--    MOVE BASE FLEX -->
     <include file="$(find vitulus_navi)/launch/vitulus_navi_mbf.launch">
         <arg name="map_topic" value="$(arg map_topic)"/>
+        <arg name="corridor_prefer" value="$(arg corridor_prefer)"/>
     </include>
 
     <!-- Phase 1 bridge odometry sources (VO + lidar ICP). Included in the nav

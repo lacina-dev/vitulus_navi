@@ -1,0 +1,33 @@
+# Corridor preference of the global planner (T36). Loaded by vitulus_navi_mbf.launch AFTER
+# global_costmap_params.yaml and global_planner_params.yaml, only with corridor_prefer:=true, which
+# navi_man passes when navi_manager.yaml map_corridor_prefer is true and the layer can be loaded.
+# Without it the parameters are exactly as before.
+#
+# The planner cannot pay less than neutral_cost for a cell, so "cheaper in a corridor" needs a lower
+# neutral_cost; the corridor layer then gives every cell OUTSIDE the corridors the cost for which the
+# planner pays exactly what it pays today:
+#     today      50 + 3.0 * c          (global_planner_params.yaml, ceiling 252)
+#     here       38 + 1.5 * (2c + 8)   = the same, cell by cell, the same ceiling
+#     corridor   38 + 1.5 * (2c + 8 - v), v = map_corridor_cost (7: 39.5 + 3c)
+# BOTH parts belong together: the two planner values without the layer would halve the weight of the
+# inflation. The layer knows today's values (50, 3.0, 253) itself; when the planner started with the
+# values below cannot pay those prices exactly, navi_man does not use this file at all, and a layer
+# started anyway gives the planner 50 and 3.0 back and changes nothing (one error in the log).
+# test/test_map_corridor.py keeps this file in step with the other two.
+GlobalPlanner:
+  neutral_cost: 38
+  cost_factor: 1.5
+global_costmap:
+  # replaces global_costmap/plugins as a whole (rosparam replaces a list): the plugins of
+  # global_costmap_params.yaml + corridor_layer LAST, after inflation
+  plugins:
+    - name: static_layer
+      type: "costmap_2d::StaticLayer"
+    - name: obstacle_layer
+      type: "costmap_2d::NonPersistentVoxelLayer"
+    - name: inflation_layer
+      type: "costmap_2d::InflationLayer"
+    - name: corridor_layer
+      type: "vitulus_navi::CorridorLayer"
+  corridor_layer:
+    topic: /navi_manager/corridor_cost

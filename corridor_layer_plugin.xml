@@ -1,0 +1,7 @@
+<class_libraries>
+  <library path="lib/libvitulus_navi_corridor_layer">
+    <class type="vitulus_navi::CorridorLayer" base_class_type="costmap_2d::Layer">
+      <description>Soft preference of the owner's map corridors in the global costmap (navi_manager.yaml map_corridor_prefer).</description>
+    </class>
+  </library>
+</class_libraries>

@@ -43,6 +43,7 @@ from navi_man import mapdata
 from navi_man import path_rules
 from navi_man import map_dedup
 from navi_man import map_nogo
+from navi_man import map_corridor
 sys.modules['mapdata'] = mapdata
 from mapdata import MapPoint, MapData, MapPath
 
@@ -107,6 +108,7 @@ def _pkg_path(pkg):
 
 
 NAVI_PKG_DIR = _pkg_path('vitulus_navi')
+_NM_CORRIDOR_INIT = threading.Lock()     # first read of map_corridor_prefer
 
 
 def rtabmap_docker_dir():
@@ -808,6 +810,71 @@ class Node:
                               "turned into obstacles here." % (said[1], said[0], said[2]))
         return out
 
+    def _nm_corridor_on(self):
+        # T36 switch map_corridor_prefer (navi_manager.yaml, default false):
+        # the owner's corridors as a soft preference of the global planner
+        # (map_corridor). On only when the layer of the global costmap is built;
+        # the same answer goes to the navi launch (corridor_prefer:=true).
+        if getattr(self, '_nm_corridor', None) is None:
+            params = getattr(self, 'params', None)
+            if params is None:
+                return False
+            with _NM_CORRIDOR_INIT:
+                if getattr(self, '_nm_corridor', None) is None:
+                    self._nm_corridor_init(params)
+        return bool(self._nm_corridor)
+
+    def _nm_corridor_init(self, params):
+        self._nm_corridor_lock = threading.Lock()
+        corridor = False
+        if bool(params.get('map_corridor_prefer', False)):
+            problem = map_corridor.library_problem(config_dir=os.path.join(NAVI_PKG_DIR, 'config'))
+            if problem:
+                rospy.logerr("navi_man: map_corridor_prefer=true, but the corridor layer cannot "
+                             "be used (%s) - the corridor preference stays OFF." % problem)
+            else:
+                corridor = map_corridor.Corridors(params.get('map_corridor_cost', 7),
+                                                  params.get('map_corridor_dock_radius_m', 2.5))
+                if getattr(self, '_nm_corridor_pub', None) is None:
+                    self._nm_corridor_pub = rospy.Publisher(
+                        map_corridor.TOPIC, OccupancyGrid, queue_size=1, latch=True)
+                # what came before navi_manager.yaml was read
+                raw, last = getattr(self, '_nm_corridor_raw', None), getattr(self, '_nm_corridor_map', None)
+                if raw is not None:
+                    corridor.on_objects(raw)
+                if last is not None:
+                    corridor.on_map(last)
+                rospy.loginfo("navi_man: map_corridor_prefer=true - corridors of the map are "
+                              "cheaper for the global planner (by %d)." % corridor.cost)
+        self._nm_corridor = corridor
+
+    def _nm_corridor_update(self, map_msg=None, objects_raw=None):
+        # Sends /navi_manager/corridor_cost when the corridors, the served site
+        # or the geometry of /navi_manager/map changed; nothing otherwise.
+        if objects_raw is not None:
+            self._nm_corridor_raw = objects_raw     # the switch may be read later
+        if map_msg is not None:
+            self._nm_corridor_map = map_msg
+        if not self._nm_corridor_on():
+            return
+        cor = self._nm_corridor
+        with self._nm_corridor_lock:
+            if objects_raw is not None and not cor.on_objects(objects_raw):
+                return
+            if map_msg is not None:
+                cor.on_map(map_msg)
+            rule_set = getattr(self, 'rule_set', None)
+            t0 = time.time()
+            out = cor.build(OccupancyGrid, None if rule_set is None else rule_set.served)
+            if cor.error:
+                rospy.logerr_throttle(60.0, "navi_man: corridor grid not built (%s) - "
+                                      "no corridor preference." % cor.error)
+            if out is None:
+                return
+            self._nm_corridor_pub.publish(out)
+            rospy.loginfo("navi_man: corridor preference sent: %d corridor cell(s) of %d, "
+                          "built in %.0f ms." % (cor.cells, len(out.data), (time.time() - t0) * 1e3))
+
     def _nm_map_publish(self, msg):
         # T39 C2: /navi_manager/map only when the grid changed (switch
         # map_publish_on_change in navi_manager.yaml; off = always, as before).
@@ -822,6 +889,7 @@ class Node:
                 return
             self._nm_map_dedup.note_published(msg)
         self.nm_map_pub.publish(msg)
+        self._nm_corridor_update(map_msg=msg)
 
     def publish_map(self):
         if self.is_map_to_publish:
@@ -1161,12 +1229,14 @@ class Node:
     def callback_rules_status(self, msg):
         self.rule_set.on_status(msg.data)       # which site's rules apply
         self._nm_nogo_changed()
+        self._nm_corridor_update()
 
     def callback_map_edits(self, msg):
         try:
             self.rule_lethal, self.rule_free = path_rules.parse_edits(msg.data)
         except (ValueError, TypeError, AttributeError) as e:
             rospy.logwarn("navi_man: bad /map_objects/objects: {}".format(e))
+        self._nm_corridor_update(objects_raw=msg.data)
 
     def path_refusal(self, path):
         xy = [(p.position.x, p.position.y) for p in path.poses]
@@ -2296,6 +2366,10 @@ class Node:
         else:
             return False
 
+    def _nm_corridor_launch_args(self):
+        # The corridor layer of the global costmap is loaded only with the switch.
+        return ['corridor_prefer:=true'] if self._nm_corridor_on() else []
+
     def start_navi_launch(self, args=[]):
         self.status_msg_pub.publish("Starting navi module...")
         rospy.loginfo("Starting navi module...")
@@ -2336,7 +2410,7 @@ class Node:
             #     self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
             # else:
             cli_args = [os.path.join(NAVI_PKG_DIR, 'launch', 'vitulus_navi_indoor.launch'),
-                        'map_topic:=/navi_manager/map']
+                        'map_topic:=/navi_manager/map'] + self._nm_corridor_launch_args()
             roslaunch_args = cli_args[1:]
             roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
             self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
@@ -2349,7 +2423,7 @@ class Node:
             #     self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)
             # else:
             cli_args = [os.path.join(NAVI_PKG_DIR, 'launch', 'vitulus_navi_outdoor.launch'),
-                        'map_topic:=/navi_manager/map']
+                        'map_topic:=/navi_manager/map'] + self._nm_corridor_launch_args()
             roslaunch_args = cli_args[1:]
             roslaunch_file = [(roslaunch.rlutil.resolve_launch_arguments(cli_args)[0], roslaunch_args)]
             self.navi_launch = roslaunch.parent.ROSLaunchParent(uuid, roslaunch_file)

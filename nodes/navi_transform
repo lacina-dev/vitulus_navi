@@ -16,7 +16,6 @@ from sensor_msgs.msg import MagneticField, Imu
 from sensor_msgs_ext.msg import magnetometer, accelerometer
 from std_srvs.srv import Empty, EmptyResponse
 from vitulus_msgs.msg import Navi_transform
-from tf import TransformListener
 from vitulus_msgs.msg import Imu_status
 from std_msgs.msg import Bool, Float32MultiArray, String, Float64
 from vitulus_navi.srv import Point_pose, Point_poseResponse
@@ -2484,7 +2483,6 @@ class NavTfNode:
 
         self.tf2_Buffer = tf2_ros.Buffer()
         self.tf2_TransformListener = tf2_ros.TransformListener(self.tf2_Buffer)
-        self.tf = TransformListener()
         self.tf2_StaticTransformBroadcaster = tf2_ros.StaticTransformBroadcaster()
         self.tf2_TransformBroadcaster = tf2_ros.TransformBroadcaster()
 

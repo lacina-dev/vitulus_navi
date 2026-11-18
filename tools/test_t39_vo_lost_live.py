@@ -17,7 +17,13 @@ measured values while "light"), serves /vo/pause_odom + /vo/resume_odom (and the
   3. light comes: the next probe keeps the VO running;
   4. dock: the dock pause takes over and leaving the dock resumes VO + lidar;
   5. dry run: reports, calls nothing;
-  6. shutdown while the watch holds the pause: the VO is resumed.
+  6. shutdown while the watch holds the pause: the VO is resumed;
+  7. (A739) a dock_idle killed (SIGKILL) while it holds the pause: the next
+     instance resumes the VO at its start and puts the logger back;
+  8. (A739) the REAL rgbd_odometry binary without input: it warns "Did not
+     receive data since 5 seconds!"; set_logger_level ros.rtabmap_odom error
+     (what dock_idle calls while the watch holds the pause) silences it, warn
+     brings it back.
 """
 import json
 import os
@@ -54,6 +60,8 @@ def main():
         import rospy
         from nav_msgs.msg import Odometry
         from std_msgs.msg import Int8, String
+        from roscpp.srv import SetLoggerLevel, SetLoggerLevelResponse
+        from rosgraph_msgs.msg import Log
         from std_srvs.srv import Empty, EmptyResponse
         assert rospy.get_master().getUri()[2].rstrip('/').endswith(':%d' % PORT)
         rospy.init_node('vo_lost_test', anonymous=True, disable_signals=True)
@@ -72,6 +80,13 @@ def main():
         for name, flag in (('/vo/pause_odom', True), ('/vo/resume_odom', False),
                            ('/licp/pause_odom', True), ('/licp/resume_odom', False)):
             srv(name, flag)
+        levels = []                      # what the stand-in VO's logger was set to
+
+        def set_level(req):
+            levels.append((req.logger, req.level))
+            return SetLoggerLevelResponse()
+        fake_logger = rospy.Service('/vo_rgbd_odometry/set_logger_level', SetLoggerLevel,
+                                    set_level)
         pub = rospy.Publisher('/vo/odom', Odometry, queue_size=5)
         dock = rospy.Publisher('/dock_smach/dock_status', Int8, queue_size=2, latch=True)
         rospy.Subscriber('/dock_idle/status', String,
@@ -101,10 +116,17 @@ def main():
             rospy.set_param('/dock_idle/vo_lost_min_msgs', 20)
             rospy.set_param('/dock_idle/dock_hold_s', HOLD)
             del calls[:]
-            vo['paused'] = False
+            if not params.get('keep_vo_state'):
+                vo['paused'] = False
             node[0] = subprocess.Popen([sys.executable, NODE, '__name:=dock_idle'],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(3.0)
+            if params.get('vo_lost_pause') and not params.get('vo_lost_dry_run') \
+                    and not params.get('keep_vo_state'):
+                ok('  (start: one resume of the VO, logger put back)',
+                   names() == ['/vo/resume_odom'] and levels[-1:] == [('ros.rtabmap_odom', 'warn')],
+                   (names(), levels[-1:]))
+                del calls[:]
 
         def stop():
             if node[0] is not None:
@@ -157,6 +179,8 @@ def main():
            WINDOW - 0.5 <= t_pause - t0 <= WINDOW + 3.0, t_pause - t0)
         ok('status: vo_lost paused', (status[0] or {}).get('vo_lost', {}).get('paused') is True
            and status[0].get('paused') is False, status[0])
+        ok('VO logger at ERROR while the watch holds the pause',
+           levels[-1:] == [('ros.rtabmap_odom', 'error')], levels[-3:])
         run0, m0 = vo['run_s'], time.monotonic()
         time.sleep(2 * (RETRY + PROBE) + 1.0)
         seq = names()
@@ -184,6 +208,7 @@ def main():
            and not vo['paused'], names()[n0:])
         time.sleep(WINDOW + 3.0)
         ok('tracking VO stays running', names()[n0:] == ['/vo/resume_odom'], names()[n0:])
+        ok('VO logger back at WARN', levels[-1:] == [('ros.rtabmap_odom', 'warn')], levels[-3:])
         ok('status: state run, probes_ok 1',
            (status[0] or {}).get('vo_lost', {}).get('state') == 'run'
            and status[0]['vo_lost'].get('probes_ok') == 1, status[0])
@@ -222,6 +247,31 @@ def main():
         stop()
         ok('VO resumed on shutdown', names()[n0:] == ['/vo/resume_odom'] and not vo['paused'],
            names()[n0:])
+        ok('VO logger back at WARN on shutdown', levels[-1:] == [('ros.rtabmap_odom', 'warn')],
+           levels[-3:])
+
+        # ---- 7. killed while holding the pause ---------------------------------
+        print('7. dock_idle killed (SIGKILL) while the watch holds the pause')
+        dock.publish(Int8(3))
+        vo['light'] = False
+        start(vo_lost_pause=True)
+        time.sleep(WINDOW + 3.0)
+        ok('paused by the watch, logger at ERROR',
+           vo['paused'] and levels[-1:] == [('ros.rtabmap_odom', 'error')], (names(), levels[-2:]))
+        node[0].kill()
+        node[0].wait()
+        node[0] = None
+        time.sleep(1.0)
+        ok('after the kill the VO is still paused (nobody resumed it)', vo['paused'])
+        t_kill = time.monotonic()
+        start(vo_lost_pause=True, keep_vo_state=True)
+        first = [t for t, n in calls if n == '/vo/resume_odom']
+        ok('the new instance resumes the VO at its start',
+           not vo['paused'] and names()[:1] == ['/vo/resume_odom'], names())
+        if first:
+            print('     resumed %.1f s after the new instance was launched' % (first[0] - t_kill))
+        ok('... and puts the logger back', ('ros.rtabmap_odom', 'warn') in levels[-2:], levels[-3:])
+        stop()
 
         # ---- 5. dry run -------------------------------------------------------
         print('5. dry run')
@@ -234,6 +284,46 @@ def main():
            and status[0]['vo_lost'].get('dry_run') is True, status[0])
         stop()
         alive[0] = False
+
+        # ---- 8. the real rgbd_odometry and its logger --------------------------
+        print('8. real rgbd_odometry (no input): the 5 s warning and its logger')
+        fake_logger.shutdown()
+        time.sleep(1.0)
+        warns = []
+        rospy.Subscriber('/rosout', Log, lambda m: warns.append((time.monotonic(), m.msg))
+                         if m.name == '/vo_rgbd_odometry' and m.level >= Log.WARN
+                         and 'Did not receive data' in m.msg else None, queue_size=100)
+        env = dict(os.environ, ROSCONSOLE_CONFIG_FILE=os.path.join(
+            os.path.dirname(HERE), 'config', 'rosconsole_quiet_odom.config'))
+        real = subprocess.Popen(['rosrun', 'rtabmap_odom', 'rgbd_odometry',
+                                 '__name:=vo_rgbd_odometry', 'odom:=/vo/odom_real',
+                                 'rgb/image:=/none/rgb', 'depth/image:=/none/depth',
+                                 'rgb/camera_info:=/none/info'],
+                                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            def count(seconds):
+                t0 = time.monotonic()
+                time.sleep(seconds)
+                return len([1 for t, _m in warns if t >= t0])
+            rospy.wait_for_service('/vo_rgbd_odometry/set_logger_level', timeout=30.0)
+            setl = rospy.ServiceProxy('/vo_rgbd_odometry/set_logger_level', SetLoggerLevel)
+            n_warn = count(17.0)
+            ok('as started (WARN): the warning comes every 5 s (%d in 17 s)' % n_warn,
+               2 <= n_warn <= 4, n_warn)
+            setl('ros.rtabmap_odom', 'error')
+            time.sleep(1.0)
+            n_err = count(17.0)
+            ok('logger ros.rtabmap_odom at ERROR: silent (%d in 17 s)' % n_err, n_err == 0, n_err)
+            setl('ros.rtabmap_odom', 'warn')
+            time.sleep(1.0)
+            n_back = count(17.0)
+            ok('back at WARN: the warning is back (%d in 17 s)' % n_back, n_back >= 2, n_back)
+        finally:
+            real.send_signal(signal.SIGINT)
+            try:
+                real.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                real.kill()
     finally:
         if node[0] is not None:
             node[0].kill()

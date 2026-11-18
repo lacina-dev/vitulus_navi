@@ -6,7 +6,8 @@
     retry_s for probe_s, and paused again while it stays lost;
   - a VO that tracks (day) or is lost only now and then (dawn) is never paused;
   - a probe that tracks keeps the VO running, and a later loss pauses it again;
-  - no messages at all (camera dead, VO down) pauses nothing;
+  - no messages at all (camera dead, VO down, paused by a dock_idle that died)
+    pauses nothing and asks for ONE resume per silence;
   - messages arriving while "paused" (someone resumed it, the VO respawned)
     put the watch back to plain watching;
   - the dock pause restarts the watch (reset).
@@ -135,10 +136,28 @@ class Day(unittest.TestCase):
         s.run(600, good=good)
         self.assertEqual(s.actions, [])
 
-    def test_silence_pauses_nothing(self):
+    def test_silence_pauses_nothing_and_asks_one_resume(self):
+        """A VO silent for a whole window may be paused by a dock_idle that
+        died: one resume (safe direction), never a pause, never a second one."""
         s = Sim()
         s.run(600, good=False, publish=False)
-        self.assertEqual(s.actions, [])
+        self.assertEqual(s.actions, [(30, 'resume')])
+        self.assertEqual(s.w.state, 'run')
+
+    def test_silence_resume_is_rearmed_by_a_message(self):
+        w = di.VoLostWatch()
+        w.reset(0.0)
+        self.assertIsNone(w.step(29.0))
+        self.assertEqual(w.step(30.0), 'resume')
+        self.assertIsNone(w.step(100.0))
+        w.on_msg(101.0, True)                  # it came back ...
+        self.assertIsNone(w.step(130.0))
+        self.assertEqual(w.step(131.0), 'resume')   # ... and went silent again
+
+    def test_no_silence_resume_while_the_watch_holds_the_pause(self):
+        s = Sim()
+        s.run(100, good=False)                 # paused at 30, VO silent since
+        self.assertEqual(s.actions, [(30, 'pause')])
 
 
 class Recovery(unittest.TestCase):

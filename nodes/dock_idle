@@ -32,6 +32,12 @@ it tracks again. Only the VO is touched (the camera, depth_obstacles and the
 lidar odometry are not). The dock pause wins: while it holds, the lost watch
 is idle, and leaving the dock resumes everything and starts the watch afresh.
 ~vo_lost_dry_run:=true evaluates and reports but never calls a service.
+A739: no lock is held across a service call (the wake-up on undocking never
+waits for the watch); at its start, and when the VO has been silent for a whole
+window, the node resumes the VO once (a previous instance may have died holding
+the pause); while the watch holds the pause the VO node's logger is at ERROR
+(~vo_lost_quiet_log, the paused node otherwise warns "Did not receive data
+since 5 seconds!" 720 times an hour) and back at ~vo_logger_level_run after.
 With the switch off nothing is subscribed and the node behaves as before.
 """
 
@@ -42,6 +48,7 @@ from collections import deque
 
 import rospy
 from nav_msgs.msg import Odometry
+from roscpp.srv import SetLoggerLevel
 from std_msgs.msg import Int8, String
 from std_srvs.srv import Empty
 
@@ -88,8 +95,12 @@ class VoLostWatch(object):
         self.since = float(t)          # when the current state began
         self.samples = deque()         # (t, usable)
         self.stray = 0                 # messages seen while PAUSED
+        self.last_msg = None           # arrival of the last message (any state)
+        self.silence_done = False      # the one resume of a silent VO was asked
 
     def on_msg(self, t, usable):
+        self.last_msg = float(t)
+        self.silence_done = False
         if self.state == self.PAUSED:
             if t - self.since > self.EXTERNAL_GRACE_S:
                 self.stray += 1
@@ -115,6 +126,14 @@ class VoLostWatch(object):
                 self._to(self.PAUSED, t)
                 self.pauses += 1
                 return 'pause'
+            # A VO that should run and has been silent for a whole window may
+            # be paused by someone this watch does not know about (a previous
+            # dock_idle that died holding the pause): ask for one resume, the
+            # safe direction. Once per silence; a dead VO just stays silent.
+            quiet_from = self.since if self.last_msg is None else max(self.since, self.last_msg)
+            if not self.silence_done and t - quiet_from >= self.window_s:
+                self.silence_done = True
+                return 'resume'
             return None
         if self.state == self.PAUSED:
             if self.stray >= self.EXTERNAL_MSGS:
@@ -165,10 +184,24 @@ class DockIdle(object):
         self.vo_bad_cov = float(rospy.get_param('~vo_lost_bad_cov', 1000.0))
         self.vo_pause_srv = rospy.get_param('~vo_pause_service', '/vo/pause_odom')
         self.vo_resume_srv = rospy.get_param('~vo_resume_service', '/vo/resume_odom')
+        # T39 A739: a paused rgbd_odometry warns "Did not receive data since 5
+        # seconds!" every 5 s (rtabmap_sync SyncDiagnostic, logger of the
+        # package, no parameter for it). While the WATCH holds the pause the
+        # node's logger is raised to ERROR and put back on resume.
+        self.vo_quiet_log = bool(rospy.get_param('~vo_lost_quiet_log', True))
+        self.vo_logger_srv = rospy.get_param('~vo_logger_service',
+                                             '/vo_rgbd_odometry/set_logger_level')
+        self.vo_logger = rospy.get_param('~vo_logger_name', 'ros.rtabmap_odom')
+        self.vo_logger_run = rospy.get_param('~vo_logger_level_run', 'warn')
         self.vo_watch = None
         self.vo_paused = False            # paused by the lost watch (not the dock)
         self.vo_resume_pending = False    # a resume call failed, try again
-        self.vo_lock = threading.RLock()
+        self.vo_quieted = False           # the VO logger is (or may be) at ERROR
+        self.vo_startup = False           # one resume owed at the start (see below)
+        self.vo_epoch = 0                 # bumped whenever the dock takes/releases the VO
+        # state only - NEVER held across a service call (A739: a 3 s wait for a
+        # service in the lost watch must not delay the wake-up on undocking)
+        self.vo_lock = threading.Lock()
         self.status_pub = rospy.Publisher('/dock_idle/status', String,
                                           queue_size=1, latch=True)
         rospy.Subscriber('/dock_smach/dock_status', Int8, self.cb_dock,
@@ -182,6 +215,12 @@ class DockIdle(object):
                 retry_s=rospy.get_param('~vo_lost_retry_s', 90.0),
                 probe_s=rospy.get_param('~vo_lost_probe_s', 8.0))
             self.vo_watch.reset(time.time())
+            # A739: a previous instance may have died (kill -9, crash) holding
+            # the watch's pause and the quiet logger; this one cannot know.
+            # Safe direction: the first tick outside the dock pause resumes the
+            # VO and puts its logger back, then the watch judges afresh.
+            self.vo_startup = not self.vo_dry_run
+            self.vo_quieted = self.vo_quiet_log and not self.vo_dry_run
             rospy.Subscriber(rospy.get_param('~vo_odom_topic', '/vo/odom'), Odometry,
                              self.cb_vo_odom, queue_size=5)
             rospy.Timer(rospy.Duration(1.0), self.vo_tick)
@@ -198,13 +237,15 @@ class DockIdle(object):
                 self.docked_since = time.time()
         else:
             self.docked_since = None
-            if self.paused:
-                # leaving the dock (undocking has begun) — wake the odometries
-                # BEFORE any motion happens
-                with self.vo_lock:
-                    self._call_all(self.resume_srvs, 'resume')
+            with self.vo_lock:
+                was = self.paused
+                if was:
                     self.paused = False
                     self._vo_watch_restart()
+            if was:
+                # leaving the dock (undocking has begun) — wake the odometries
+                # BEFORE any motion happens
+                self._call_all(self.resume_srvs, 'resume')
                 self._publish()
 
     def tick(self, _evt):
@@ -212,19 +253,27 @@ class DockIdle(object):
             return
         if (time.time() - self.docked_since) >= self.hold_s:
             with self.vo_lock:
-                self._call_all(self.pause_srvs, 'pause')
                 self.paused = True
                 self._vo_watch_restart()
+            self._call_all(self.pause_srvs, 'pause')
+            with self.vo_lock:
+                left = not self.paused
+            if left:
+                # undocking began while the pause calls were on their way: the
+                # resume of cb_dock may have landed first - wake them again
+                self._call_all(self.resume_srvs, 'resume(after pause)')
             self._publish()
 
     # ---- lost VO (T39, ~vo_lost_pause) ---------------------------------------
     def _vo_watch_restart(self):
         """The dock pause took over or ended: the lost watch starts afresh and
-        no longer holds a pause of its own."""
+        no longer holds a pause of its own. Call with vo_lock held."""
         if self.vo_watch is not None:
             self.vo_watch.reset(time.time())
         self.vo_paused = False
         self.vo_resume_pending = False
+        self.vo_startup = False
+        self.vo_epoch += 1
 
     def cb_vo_odom(self, msg):
         ok = vo_twist_usable(msg.twist.covariance, self.vo_bad_cov)
@@ -232,29 +281,63 @@ class DockIdle(object):
             self.vo_watch.on_msg(time.time(), ok)
 
     def vo_tick(self, _evt):
+        todo = None
         with self.vo_lock:
-            if self.paused:
-                return                     # the dock pause owns the VO
-            if self.vo_resume_pending:
-                self.vo_resume_pending = not self._vo_call(self.vo_resume_srv, 'resume')
+            epoch = self.vo_epoch
+            dock = self.paused
             before = self.vo_watch.state
-            action = self.vo_watch.step(time.time())
-            if action == 'pause':
-                rospy.loginfo('[dock_idle] VO lost (usable %s of the window) -> pause, '
-                              'next try in %.0f s', self.vo_watch.last_frac,
-                              self.vo_watch.retry_s)
-                self._vo_call(self.vo_pause_srv, 'pause')
-                self.vo_paused = True
-                self.vo_resume_pending = False
-            elif action == 'resume':
-                self.vo_paused = False
-                self.vo_resume_pending = not self._vo_call(self.vo_resume_srv, 'resume')
-            elif before != self.vo_watch.state:
-                self.vo_paused = False
-                rospy.loginfo('[dock_idle] VO %s -> %s (usable %s)', before,
-                              self.vo_watch.state, self.vo_watch.last_frac)
-            changed = action is not None or before != self.vo_watch.state
-        if changed:
+            action = None
+            if not dock:               # under the dock pause the watch is idle
+                if self.vo_startup:
+                    self.vo_startup = False
+                    todo = 'resume'
+                elif self.vo_resume_pending:
+                    todo = 'resume'
+                action = self.vo_watch.step(time.time())
+                if action == 'pause':
+                    self.vo_paused = not self.vo_dry_run
+                    self.vo_resume_pending = False
+                    todo = 'pause'
+                elif action == 'resume':
+                    self.vo_paused = False
+                    todo = 'resume'
+                elif before != self.vo_watch.state:
+                    self.vo_paused = False
+            after, frac = self.vo_watch.state, self.vo_watch.last_frac
+            unquiet = self.vo_quieted and not self.vo_paused and todo != 'pause'
+        # ---- service calls: no lock held from here on -------------------------
+        if action == 'pause':
+            rospy.loginfo('[dock_idle] VO lost (usable %s of the window) -> pause, '
+                          'next try in %.0f s', frac, self.vo_watch.retry_s)
+        elif before != after:
+            rospy.loginfo('[dock_idle] VO %s -> %s (usable %s)', before, after, frac)
+        ok = None
+        if todo == 'pause':
+            ok = self._vo_call(self.vo_pause_srv, 'pause')
+            if ok and self._vo_log_level('error'):
+                with self.vo_lock:
+                    self.vo_quieted = True
+        elif todo == 'resume':
+            ok = self._vo_call(self.vo_resume_srv, 'resume')
+        if unquiet and self._vo_log_level(self.vo_logger_run):
+            with self.vo_lock:
+                self.vo_quieted = self.vo_paused     # a new pause may have come
+        if todo is not None:
+            with self.vo_lock:
+                moved = epoch != self.vo_epoch       # the dock took or released the VO
+                dock_now = self.paused
+                if not moved and todo == 'resume':
+                    self.vo_resume_pending = not ok
+            if moved and todo == 'pause' and not dock_now:
+                # undocking resumed everything while this pause was on its way
+                self._vo_call(self.vo_resume_srv, 'resume(after dock)')
+                if self._vo_log_level(self.vo_logger_run):
+                    with self.vo_lock:
+                        self.vo_quieted = self.vo_paused
+            elif moved and todo == 'resume' and dock_now:
+                # the dock pause came while this resume was on its way
+                self._vo_call(self.vo_pause_srv, 'pause(dock)')
+        if todo is not None or before != after:
             self._publish()
 
     def _vo_call(self, name, what):
@@ -269,6 +352,19 @@ class DockIdle(object):
         except Exception as e:
             rospy.logwarn_throttle(
                 30.0, '[dock_idle] vo_lost %s via %s failed: %s', what, name, e)
+            return False
+
+    def _vo_log_level(self, level):
+        """Level of the VO node's package logger; True when set (or not wanted)."""
+        if not self.vo_quiet_log or self.vo_dry_run:
+            return True
+        try:
+            rospy.wait_for_service(self.vo_logger_srv, timeout=1.0)
+            rospy.ServiceProxy(self.vo_logger_srv, SetLoggerLevel)(self.vo_logger, level)
+            return True
+        except Exception as e:
+            rospy.logwarn_throttle(
+                60.0, '[dock_idle] VO logger %s -> %s failed: %s', self.vo_logger, level, e)
             return False
 
     # ---- plumbing -----------------------------------------------------------
@@ -294,6 +390,8 @@ class DockIdle(object):
             self._call_all(self.resume_srvs, 'resume(shutdown)')
         elif self.vo_paused or self.vo_resume_pending:
             self._vo_call(self.vo_resume_srv, 'resume(shutdown)')
+        if self.vo_watch is not None and self.vo_quieted:
+            self._vo_log_level(self.vo_logger_run)
 
 
 if __name__ == '__main__':

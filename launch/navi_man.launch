@@ -140,6 +140,11 @@
             <param name="vo_lost_min_msgs" value="30"/>
             <param name="vo_lost_retry_s" value="90.0"/>
             <param name="vo_lost_probe_s" value="8.0"/>
+            <!-- while the WATCH holds the pause, the VO node's logger
+                 ros.rtabmap_odom goes to ERROR (the paused node warns "Did not
+                 receive data since 5 seconds!" every 5 s) and back to WARN
+                 on resume; false = logger never touched -->
+            <param name="vo_lost_quiet_log" value="true"/>
         </node>
     </group>
 

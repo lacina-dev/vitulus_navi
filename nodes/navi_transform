@@ -72,6 +72,29 @@ def euler_from_quaternion(quaternion, axes='sxyz'):
         return (math.atan2(q12 + q03, 1.0 - q00 - q11), math.atan2(-m20, cy),
                 math.atan2(m10, m00))
     return math.atan2(-(q12 - q03), 1.0 - q00 - q22), math.atan2(-m20, cy), 0.0
+
+
+def quat_from_euler_sxyz(ai, aj, ak):
+    """T39: tf.transformations.quaternion_from_euler(ai, aj, ak) for the default
+    axes 'sxyz' written out - the same operations in the same order on the same
+    doubles, so the result is BIT FOR BIT the numpy array's four values; a
+    tuple (x, y, z, w), no numpy array per IMU sample."""
+    ai = float(ai) / 2.0
+    aj = float(aj) / 2.0
+    ak = float(ak) / 2.0
+    ci = math.cos(ai)
+    si = math.sin(ai)
+    cj = math.cos(aj)
+    sj = math.sin(aj)
+    ck = math.cos(ak)
+    sk = math.sin(ak)
+    cc = ci * ck
+    cs = ci * sk
+    sc = si * ck
+    ss = si * sk
+    return (cj * sc - sj * cs, cj * ss + sj * cc, cj * cs - sj * sc, cj * cc + sj * ss)
+
+
 from visualization_msgs.msg import Marker, MarkerArray
 from collections import deque
 
@@ -5550,7 +5573,7 @@ class NavTfNode:
         self.imu_yaw = yaw
         if getattr(self, '_hi_enable', False):     # T36 D2
             self._hi_imu_sample(msg.header.stamp.to_sec(), yaw)
-        self.publish_fused_navheading()
+        self.publish_fused_navheading((roll, pitch, yaw))
 
     def transform_odom_to_base_link(self, stamp=None):
         """Build odom->base_link for this tick and return it (None indoors).
@@ -6591,15 +6614,20 @@ class NavTfNode:
 
     # AUDIT T3: publish_imu_baselink removed (docstring said Obsolete; zero consumers)
 
-    def publish_fused_navheading(self):
+    def publish_fused_navheading(self, imu_rpy=None):
         """
         Publish fused navheading based on the imu heading and the offset.
+        T39: callback_imu (100 Hz) hands over the Euler angles it has just
+        computed from the same message (imu_rpy) instead of having them
+        computed here a second time; without them they are computed as before.
         :return:
         """
-        (imu_roll, imu_pitch, imu_yaw) = euler_from_quaternion([self.imu_msg.orientation.x,
-                                                                self.imu_msg.orientation.y,
-                                                                self.imu_msg.orientation.z,
-                                                                self.imu_msg.orientation.w])
+        if imu_rpy is None:
+            imu_rpy = euler_from_quaternion([self.imu_msg.orientation.x,
+                                             self.imu_msg.orientation.y,
+                                             self.imu_msg.orientation.z,
+                                             self.imu_msg.orientation.w])
+        (imu_roll, imu_pitch, imu_yaw) = imu_rpy
         if imu_yaw < 0:
             imu_yaw += 2 * math.pi
 
@@ -6607,7 +6635,7 @@ class NavTfNode:
             imu_yaw = imu_yaw + self.set_pose_yaw
         else:
             imu_yaw = imu_yaw + self.diff_yaw
-        quaternion = quaternion_from_euler(imu_roll, imu_pitch, imu_yaw)
+        quaternion = quat_from_euler_sxyz(imu_roll, imu_pitch, imu_yaw)
         fused_nav = Imu()
         fused_nav.header.stamp = rospy.Time.now()
         fused_nav.header.frame_id = "base_link"

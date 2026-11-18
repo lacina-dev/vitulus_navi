@@ -72,6 +72,22 @@ Přehrání skutečného uzlu po opravě P2 (18. 11., soukromý master, nahrávk
 
 Doporučení: P1 zapnout natrvalo až PO potvrzení noční sérií (`nav_n1_*`, výchozí × P1, tři výjezdy na jízdu, první se nepočítá) a jen pokud v ní P1 nevyjde hůř u převzetí za jízdy; jinak nejdřív doplnit přímé větvi posun vzorku GPS o dráhu kol od jeho razítka (samostatný vypínač). P2 jen spolu s P1. Hodnotit `takeover_wander_warm_*` a `takeover_step_warm_max_cm` (`nav_score` v5: bez prvního výjezdu po startu uzlu; největší pohyb obrazu za 0,1 s).
 
+Noční série (18. 11. 02:00–03:50, naživo, 8 jízd, 20 výjezdů; rozbor `T36_A728`) – kořen „pohyblivého“ převzetí: rozhoduje, jestli robot při převzetí GPS stojí. Dráha pózy v mapě nevysvětlená koly [cm], v závorce kroky EKF nad 1 cm za 5 s; třída podle dráhy kol za 3,5 s po převzetí (ve stoje < 0,05 m, dojezd, za jízdy > 0,25 m):
+
+| třída | výchozí | P1 | H1 |
+|---|---|---|---|
+| další výjezd, ve stoje | 26,7 (3); 15,4 (1); 18,8 (3) | 22,2 (4) | 13,3 (1) |
+| další výjezd, dojezd | 36,1 (7) | – | – |
+| další výjezd, za jízdy | 38,8 (9); 40,8 (7) | 90,0 (22); 59,2 (23); 80,8 (25) | 28,0 (4) |
+| první po startu uzlu, ve stoje | 17,9 (1); 21,3 (3) | – | 19,9 (3) |
+| první po startu uzlu, za jízdy | 46,3 (8); 85,6 (24) | 18,6 (2); 110,0 (24) | 94,9 (31) |
+
+Hodnoty 60–110 cm dělá přímá větev kotvy (`set_wheel_base_nav_pose()`: poslední vzorek GPS bez posunu o dráhu od jeho razítka proti dnešní póze) za jízdy – spustí ji P1 po smazání kotvy a stejně tak každý první výjezd po startu uzlu. Všech 20 převzetí proběhlo při `dock_status` 1: robota veze `dock_smach` (`UNDOCK_SITE_MAP_NAVIGATION`, „GPS is awaited at UNDOCK“) na bod UNDOCK, kam dojede kolem 49. s po opuštění doku; přijde-li kurzový RTK dřív (11 z 20, dříve 6 ze 14), převezme GPS polohu za jízdy. Mise ani agent do `dock_status` 3 nejedou. P1 natrvalo nezapínat bez Q1.
+
+Přehrání skutečného uzlu s Q1 `takeover_wait_still` (18. 11., soukromý master, bez VO a lidaru; dráha pózy / největší pohyb za 0,1 s, vypnuto → zapnuto, v závorce zdržení převzetí): první výjezd po startu uzlu za jízdy `nav_n2_base_5` 98,9 / 5,7 → 16,3 / 1,1 cm (5,5 s), `nav_n2_h1_6` 109,9 / 4,4 → 13,6 / 1,0 (6,7 s), `nav_n1_p1_2` 33,7 / 3,2 → 14,2 / 1,9 (2,9 s); ve stoje beze změny (`nav_n1_base_1` 17,3 → 16,7, `nav_n2_base_8` 14,5 → 15,5, `nav_s9_p2_3` 7,4 → 7,4, zdržení 0). Druhý výjezd za jízdy: `nav_n2_base_5` 81,8 → 70,0 (5,3 s), `nav_n2_h1_6` 71,4 → 67,3 (4,5 s), `nav_s9_p2_3` 57,1 → 40,8 (4,5 s), `nav_n1_p1_2` 95,3 → 51,0 (5,7 s), s P1 126,4 / 11,6 → 49,7 / 5,0; `nav_n2_base_5` s Q1+P1 57,9. Zdržení 0,6–6,7 s, strop 15 s nenastal. U druhých výjezdů zbývá v přehrání 40–70 cm i ve stoje (`nav_n2_base_8` ve stoje 97,1 a 104,1): přehrávaný EKF bez VO a lidaru má mezeru ke GPS 22–25 cm (naživo 5–16 cm) a stará kotva s ní ve stoje udělá 5–23 kroků; s Q1+P1 jde EKF ke GPS přímo (dráha EKF = mezera 24–25 cm) a zbytek je cesta tam a zpět přes georef, kterou řeší P2. Naživo dávají převzetí ve stoje 15–27 cm. Čas do `dock_status` 3 přehrání neměří (stav doku je z nahrávky); naživo se má prodloužit nejvýš o zdržení.
+
+Druhá půlka (návrh, `vitulus_dock` beze změny): Q1 na robota čeká, nezastavuje ho. Kdyby `dock_smach` jel na UNDOCK déle než 15 s po připravenosti GPS, převezme se za jízdy jako dnes. Jistotu „vždy ve stoje“ dá až pořadí v `dock_smach`: na UNDOCK dojet, zastavit a teprve pak čekat na `odom_status` – to už dnes dělá; chybí jen to, aby `navi_transform` nepřevzal dřív, což je Q1. Zastavovat robota uprostřed cesty kvůli převzetí nedoporučuji (delší výjezd, žádný přínos navíc).
+
 ## 1. Rámce a kdo je píše
 
 ### 1.1 Transformace

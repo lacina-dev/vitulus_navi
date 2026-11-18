@@ -147,6 +147,26 @@ def _dock_point_pose(srv, name):
     return resp
 
 
+# T36 nav_ekf_vz: how ~nav_ekf_vz reaches launch/vitulus_ekf_outdoor.launch.
+# The launch file reads its argument nav_ekf_vz from this variable of the
+# process that starts it (this node); absent = false = the base config only.
+NAV_EKF_VZ_ENV = 'VITULUS_NAV_EKF_VZ'
+
+
+def ekf_launch_env(nav_ekf_vz, env=None):
+    """Sets (true) or removes (false, the default) NAV_EKF_VZ_ENV in `env`
+    (os.environ when None) before the EKF launch file is started. With it the
+    launch file lays config/ekf/ekf_nav_vz.yaml over the base config: the nav
+    EKF then also fuses the vertical speed of the wheel odometry (always 0 in
+    the body frame). Returns `env`."""
+    env = os.environ if env is None else env
+    if nav_ekf_vz:
+        env[NAV_EKF_VZ_ENV] = 'true'
+    else:
+        env.pop(NAV_EKF_VZ_ENV, None)
+    return env
+
+
 def cart2pol(x, y):
     rho = np.sqrt(x ** 2 + y ** 2)
     phi = np.arctan2(y, x)
@@ -2386,6 +2406,12 @@ class NavTfNode:
         self._amr_setup()
 
     def roslaunch_ekf(self):
+        vz = bool(rospy.get_param('~nav_ekf_vz', False))            # T36 nav_ekf_vz, default off
+        ekf_launch_env(vz)
+        if vz:
+            rospy.loginfo("<{}> ~nav_ekf_vz: the nav EKF also fuses the vertical speed of "
+                          "the wheel odometry (config/ekf/ekf_nav_vz.yaml).".format(
+                              rospy.get_caller_id()))
         uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
         roslaunch.configure_logging(uuid)
         # T36 J2 (~nav_ekf_gyro, default off = the same launch as before)

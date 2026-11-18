@@ -1,0 +1,21 @@
+# T36 nav_ekf_vz (~nav_ekf_vz of navi_transform, default off): laid OVER
+# ekf_base_outdoor.yaml by launch/vitulus_ekf_outdoor.launch nav_ekf_vz:=true.
+# Only what differs from the base config is here.
+#
+# The nav EKF runs in 3D (two_d_mode false: slopes) and nothing measures its
+# vertical speed: the wheels give vx, vy, VO / lidar vx, vyaw, the IMU roll /
+# pitch / yaw. The covariance of vz and z therefore grows without bound (Pzz
+# 2e9 within minutes) and only the set_pose of the GPS position anchor, 10
+# times a second, puts it back. The state itself stays sane as long as no
+# absolute position is fused; the first x, y measurement would kick vz through
+# its coupling with x, y on a tilted robot and z would run away.
+# /mobile_base_controller/odom already carries twist.linear.z = 0 (variance
+# 0.001) in the body frame - a wheeled robot does not move along its own z.
+# Fusing it (index 8, vz) keeps vz at 0 and its covariance bounded; the height
+# is still the integral of vx over the pitch, as before.
+ekf_wheel_nav_odometry:
+  odom0_config: [ false, false, false,
+                  false, false, false,
+                  true, true, true,
+                  false, false, false,
+                  false, false, false ]

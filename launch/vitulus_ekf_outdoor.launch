@@ -22,4 +22,12 @@
     <remap from="odometry/filtered" to="/odometry/ekf_wheel_nav_odom"/>
     <remap from="set_pose" to="/ekf_wheel_nav_odometry/set_pose"/>
   </node>
+
+  <!-- T36 nav_ekf_vz: true = the nav EKF also fuses the vertical speed of the
+       wheel odometry (config/ekf/ekf_nav_vz.yaml laid over the config loaded
+       above; it changes another key than nav_ekf_gyro, the two combine). Set
+       by navi_transform from its ~nav_ekf_vz through the environment variable
+       VITULUS_NAV_EKF_VZ; absent / false = nothing more is loaded. -->
+  <arg name="nav_ekf_vz" default="$(optenv VITULUS_NAV_EKF_VZ false)"/>
+  <rosparam if="$(arg nav_ekf_vz)" command="load" file="$(find vitulus_navi)/config/ekf/ekf_nav_vz.yaml" />
 </launch>

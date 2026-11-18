@@ -375,6 +375,93 @@ def heading_hold_step(st, now, dock_status, dock_dist_m, xy, cfg=None):
     return st, True
 
 
+# T36 Q1 (~takeover_wait_still). After an undock dock_smach drives the robot to
+# the UNDOCK waypoint and only there waits for the GPS. When the RTK heading
+# comes before the robot has arrived, GPS used to take the position over in the
+# middle of that drive: the anchor's first seconds (its direct branch after a
+# node start or a dropped anchor, a stale anchor otherwise) then pair a lagging
+# GPS with a moving robot and the map pose travels 40-110 cm instead of 15-27 cm
+# (night series 2026-11-18, 20 undocks). With the switch the takeover of the
+# position waits, during the undock program only, until the wheels have stood
+# still for still_s - at most max_wait_s, then it goes ahead as before.
+TAKEOVER_WAIT_STILL_CFG = {
+    'still_s': 0.5,         # wheels at rest this long = the robot stands
+    'max_wait_s': 15.0,     # the takeover is never held longer than this
+    'v_mps': 0.02,          # |v| of the wheels under this ...
+    'w_rps': 0.05,          # ... and |w| under this = at rest
+    'wheel_stale_s': 0.5,   # wheel odometry older than this: not known, nothing is held
+}
+
+
+def takeover_wait_still_new_state():
+    return {'prev_dock': None, 'armed': False, 'ready_since': None, 'still_since': None,
+            'holding': False, 'last_s': None, 'n': 0, 'timeouts': 0, 'event': ''}
+
+
+def takeover_wait_still_step(st, now, dock_status, base_ok, v, w, wheel_age, cfg=None):
+    """One look (any thread, any rate; the answer depends on the times only).
+    dock_status: /dock_smach/dock_status (1 = the undock program runs), base_ok:
+    GPS would own the position now, v / w / wheel_age: wheel odometry. Returns
+    True = hold the takeover. Armed by the first look of an undock program
+    (status 1 after any other status), for that one takeover; any other status (3 undocked, 2 docking, 0 docked, unknown)
+    disarms - outside the undock program nothing is ever held. st['event'] is
+    set to 'hold' / 'still' / 'timeout' / 'left' when that happened in this look
+    (the caller logs and clears it)."""
+    cfg = cfg or TAKEOVER_WAIT_STILL_CFG
+    prev, st['prev_dock'] = st['prev_dock'], dock_status
+    if dock_status == 1 and prev != 1:
+        # a new undock program. The node looks here only when GPS could own
+        # the position (not while docked), so the docked status itself is not
+        # seen - the first look with status 1 after any other one arms.
+        st['armed'] = True
+        st['ready_since'] = None
+    # a stamp a little ahead of the clock still counts (clock granularity; a
+    # replay's /clock runs in 10 ms steps behind the recorded stamps)
+    known = wheel_age is not None and -0.2 <= wheel_age <= cfg['wheel_stale_s']
+    at_rest = known and abs(v) <= cfg['v_mps'] and abs(w) <= cfg['w_rps']
+    if not at_rest:
+        st['still_since'] = None
+    elif st['still_since'] is None:
+        st['still_since'] = now
+
+    def release(why):
+        if st['holding']:
+            st['last_s'] = round(now - st['ready_since'], 2)
+            st['event'] = why
+        st['armed'] = False
+        st['holding'] = False
+        st['ready_since'] = None
+        return False
+
+    if not st['armed']:
+        return False
+    if dock_status != 1:
+        return release('left')
+    if not base_ok:
+        return st['holding']      # GPS itself is not ready (again): nothing to decide yet
+    if st['ready_since'] is None:
+        st['ready_since'] = now
+    if not known:
+        return release('left')
+    if st['still_since'] is not None and now - st['still_since'] >= cfg['still_s']:
+        return release('still')
+    if now - st['ready_since'] >= cfg['max_wait_s']:
+        if st['holding']:
+            st['timeouts'] += 1
+        return release('timeout')
+    if not st['holding']:
+        st['holding'] = True
+        st['n'] += 1
+        st['event'] = 'hold'
+    return True
+
+
+def takeover_wait_still_fields(st):
+    """The takeover_wait_* fields of /nav_tf/loc_status."""
+    return {'takeover_wait_active': bool(st['holding']), 'takeover_wait_n': st['n'],
+            'takeover_wait_last_s': st['last_s'], 'takeover_wait_timeouts': st['timeouts']}
+
+
 def utm_band_of(lat):
     """MGRS latitude band letter (C..X, 8 deg each from 80 S; X is 12 deg)."""
     if lat is None or not (-80.0 <= lat <= 84.0):
@@ -2418,6 +2505,9 @@ class NavTfNode:
         # T36 F2: mode of the position anchor in loc_status. REPORT ONLY, off
         # by default: then no state and no field.
         self._amr_setup()
+        # T36 Q1: after an undock GPS takes the position over only once the
+        # robot stands. Off by default: then no state, no field, nothing runs.
+        self._tws_setup()
 
     def roslaunch_ekf(self):
         vz = bool(rospy.get_param('~nav_ekf_vz', False))            # T36 nav_ekf_vz, default off
@@ -2578,6 +2668,11 @@ class NavTfNode:
         # cover it). Standing still never proves; ownership engages within
         # the first metre of driving on usable fix.
         if not self._gps_proven:
+            return False
+        if getattr(self, '_tws_enable', False) and self._tws_hold(      # T36 Q1
+                self._gps_good_since is not None
+                and (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s
+                and self._heading_good_after_acq):
             return False
         return self._gps_good_since is not None and \
             (rospy.get_time() - self._gps_good_since) >= self._map_coords_hysteresis_s and \
@@ -4019,6 +4114,9 @@ class NavTfNode:
                 'dock_status': self._dock_status_val,
                 'dock_hold_active': bool(self._dock_hold_active),
                 'dock_hold_refusals': self._dock_hold_refusals,
+                # T36 Q1 (only with ~takeover_wait_still): takeover_wait_active, _n,
+                # _last_s, _timeouts
+                **(self._tws_fields() if getattr(self, '_tws_enable', False) else {}),
                 # T36 J1 (only with ~odom_step_report): odom_step_n, _max_xy_m,
                 # _max_yaw_deg, _spikes, _causes, _last
                 **(self._osr_fields(now_s) if getattr(self, '_osr_enable', False) else {}),
@@ -5579,6 +5677,63 @@ class NavTfNode:
             self._set_map_odom_yaw_keep_base(new)
             if new == 0.0:
                 self._yaw_level = False
+
+    # ---- T36 Q1: after an undock the GPS takeover waits for a standing robot --
+
+    def _tws_setup(self):
+        """The one switch (~takeover_wait_still): without it nothing of Q1 runs."""
+        self._tws_enable = bool(rospy.get_param('~takeover_wait_still', False))
+        if not self._tws_enable:
+            return
+        self._tws_cfg = dict(TAKEOVER_WAIT_STILL_CFG)
+        for key, name in (('still_s', '~takeover_wait_still_s'),
+                          ('max_wait_s', '~takeover_wait_max_s'),
+                          ('v_mps', '~takeover_wait_v_mps'), ('w_rps', '~takeover_wait_w_rps')):
+            self._tws_cfg[key] = float(rospy.get_param(name, self._tws_cfg[key]))
+        self._tws_lock = threading.Lock()
+        self._tws_st = takeover_wait_still_new_state()
+        rospy.loginfo('[takeover_wait] ENABLED: after an undock GPS takes the position over '
+                      'once the wheels stood still %.1f s (held at most %.0f s)',
+                      self._tws_cfg['still_s'], self._tws_cfg['max_wait_s'])
+
+    def _tws_hold(self, base_ok):
+        """_gps_stable(): True = not yet. Only the position takeover is held
+        (owner, the anchor's set_pose, the georef, navsat's first start); the
+        GNSS heading goes on as before. /nav_tf/odom_status turns SAT with the
+        takeover, so dock_smach's wait at UNDOCK just lasts that much longer."""
+        try:
+            now = rospy.get_time()
+            m = self.wheel_odom_msg
+            stamp = m.header.stamp.to_sec()
+            with self._tws_lock:
+                st = self._tws_st
+                hold = takeover_wait_still_step(
+                    st, now, self._dock_status_val, bool(base_ok), m.twist.twist.linear.x,
+                    m.twist.twist.angular.z, (now - stamp) if stamp > 0.0 else None,
+                    self._tws_cfg)
+                ev, st['event'] = st['event'], ''
+                last, n_to = st['last_s'], st['timeouts']
+            if ev == 'hold':
+                rospy.loginfo('[takeover_wait] GPS is ready but the robot still drives out of '
+                              'the dock - the position takeover waits for it to stand')
+            elif ev == 'timeout':
+                rospy.logwarn('[takeover_wait] the robot did not stand still within %.0f s - '
+                              'GPS takes the position over as without the parameter (#%d)',
+                              self._tws_cfg['max_wait_s'], n_to)
+            elif ev:
+                rospy.loginfo('[takeover_wait] takeover released after %.1f s (%s)', last, ev)
+            return hold
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[takeover_wait] %s' % e)
+            return False
+
+    def _tws_fields(self):
+        try:
+            with self._tws_lock:
+                return takeover_wait_still_fields(self._tws_st)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, '[takeover_wait] %s' % e)
+            return {}
 
     # ---- T36 D3: smooth map->base heading during the GNSS heading hand-over ----
 

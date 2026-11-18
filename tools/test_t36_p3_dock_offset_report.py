@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""T36 P3 (~dock_anchor_offset_report): /nav_tf/loc_status and the log say how
+"""T36 P3 (~dock_offset_report; first name ~dock_anchor_offset_report): /nav_tf/loc_status and the log say how
 far the DOCKED waypoint is from where the GPS has the docked robot, from every
 undock (pose the dock left against the pose after the GPS takeover) and every
 docking (pose the robot arrived with against DOCKED). REPORT ONLY: nothing is
@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import _t36_replay as R  # noqa: E402
 import test_t36_f2_anchor_mode_report as F2  # noqa: E402
 
-ON = {'dock_anchor_offset_report': True}
+ON = {'dock_offset_report': True}
 D = math.radians
 ANCHOR = (5.0, -8.0, D(-15.7))          # DOCKED as saved
 OFF_X, OFF_YAW = 0.055, -1.7            # the truth against it (robot axis, deg)
@@ -72,7 +72,7 @@ class Sim(object):
     def status(self, v):
         self.n.callback_dock_status(types.SimpleNamespace(data=v))
 
-    def round(self, drift_y=0.03, settle=True, drive_on=0.0, absurd=False):
+    def round(self, drift_y=0.03, settle=True, drive_on=0.0, absurd=False, target=None):
         """Docked with the pose = DOCKED -> release -> drive out 3 m -> GPS
         takeover -> heading hand-over and georef (the pose becomes the truth)
         -> back and the docked edge (arrived pose = truth + lateral drift)."""
@@ -111,9 +111,15 @@ class Sim(object):
             self.set(true, 0.0)
             n._georef_last_t = R.CLOCK[0]
             n._georef_target = None
-            for _ in range(35):                 # 3.5 s of 10 Hz ticks
+            for _ in range(35 if target != 'far' else 700):    # 3.5 s of 10 Hz ticks
                 self.t(0.1)
+                if target is not None:
+                    # navi_man's map_coords set the georef target again and again:
+                    # 'near' = where map->odom is (georef done), 'far' = 5 cm off
+                    m = n.map_odom_transform.transform.translation
+                    n._georef_target = (m.x + (0.003 if target == 'near' else 0.05), m.y, 0.0)
                 n._dor_tick()
+            n._georef_target = None
         else:
             for _ in range(700):
                 self.t(0.1)
@@ -215,11 +221,20 @@ def run_node(nt, check):
     j = on.round(absurd=True)
     check('GPS 0.95 m from DOCKED at the undock: not counted (bounds), rejected + 1',
           j['dock_offset_n_undock'] == n0 + 1 and j['dock_offset_rejected'] == 3)
+    j = on.round(target='near')
+    check('georef target set again every tick, 3 mm from map->odom (live map_coords): sample taken',
+          j['dock_offset_n_undock'] == n0 + 2 and abs(j['dock_offset_est_x_m'] - OFF_X) <= 0.002)
+    j = on.round(target='far')
+    check('georef still 5 cm from its target for 70 s: no undock sample, rejected + 1',
+          j['dock_offset_n_undock'] == n0 + 2 and j['dock_offset_rejected'] == 4)
+    old = Sim(nt, {'dock_anchor_offset_report': True})
+    check('the first parameter name still switches the report on',
+          'dock_offset_n_undock' in old.round())
     on.n._dock_anchor_pose = None
     nd = j['dock_offset_n_dock']
     j = on.round()
     check('DOCKED waypoint unknown: nothing measured',
-          j['dock_offset_n_dock'] == nd and j['dock_offset_n_undock'] == n0 + 1)
+          j['dock_offset_n_dock'] == nd and j['dock_offset_n_undock'] == n0 + 2)
 
 
 def main():

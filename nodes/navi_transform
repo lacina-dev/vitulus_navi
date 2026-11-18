@@ -999,7 +999,8 @@ ANCHOR_MODE_CFG = {
 }
 
 
-# T36 P3 (~dock_anchor_offset_report). REPORT ONLY: how far the DOCKED waypoint
+# T36 P3 (~dock_offset_report; the first name ~dock_anchor_offset_report is
+# still taken). REPORT ONLY: how far the DOCKED waypoint
 # is from where the GPS has the docked robot, measured at both ends of a stay
 # in the dock. Nothing is written to the map, to map->odom or to the EKF.
 #   undock: the map pose the dock left (+ odometry) against the pose after GPS
@@ -1011,6 +1012,7 @@ ANCHOR_MODE_CFG = {
 # DOCKED waypoint: x along the robot's axis (+ forward), y to its left.
 DOCK_OFFSET_CFG = {
     'settle_s': 3.0,        # georef done for this long before the undock sample
+    'settle_m': 0.01,       # 'done' = map->odom this near to the georef target
     'timeout_s': 60.0,      # no settled takeover this long after it began: no sample
     'max_dist_m': 10.0,     # takeover further from the release point: no sample
     'max_move_m': 1.5,      # robot drove more between takeover and settle: no sample
@@ -3988,7 +3990,7 @@ class NavTfNode:
                 # T36 N1 (only with ~heading_hold_near_dock): heading_hold, _s,
                 # _m, _end, _count, _fuse_count
                 **(self._hhd_fields() if getattr(self, '_hhd_enable', False) else {}),
-                # T36 P3 (only with ~dock_anchor_offset_report): dock_offset_*
+                # T36 P3 (only with ~dock_offset_report): dock_offset_*
                 **(self._dor_fields() if getattr(self, '_dor_enable', False) else {}),
                 'rtabmap_confident': bool(self._rtabmap_confident),
                 'anchor_age_s': anchor_age,
@@ -4605,14 +4607,20 @@ class NavTfNode:
     # ---- T36 P3: DOCKED waypoint against the GPS (report only) --------------
 
     def _dor_setup(self):
-        """The one switch (~dock_anchor_offset_report): without it nothing of P3 runs."""
-        self._dor_enable = bool(rospy.get_param('~dock_anchor_offset_report', False))
+        """The one switch (~dock_offset_report, named like its dock_offset_*
+        fields and its [dock_offset] log lines; the first name
+        ~dock_anchor_offset_report still switches it on): without it nothing
+        of P3 runs."""
+        self._dor_enable = bool(rospy.get_param(
+            '~dock_offset_report', rospy.get_param('~dock_anchor_offset_report', False)))
         if not self._dor_enable:
             return
         self._dor_cfg = dict(DOCK_OFFSET_CFG)
-        for key in ('settle_s', 'timeout_s', 'max_dist_m', 'max_move_m', 'max_m', 'max_deg'):
+        for key in ('settle_s', 'settle_m', 'timeout_s', 'max_dist_m', 'max_move_m', 'max_m',
+                    'max_deg'):
             self._dor_cfg[key] = float(rospy.get_param(
-                '~dock_anchor_offset_report_' + key, self._dor_cfg[key]))
+                '~dock_offset_report_' + key, rospy.get_param(
+                    '~dock_anchor_offset_report_' + key, self._dor_cfg[key])))
         self._dor_lock = threading.Lock()
         self._dor_st = dock_offset_new_state()
         rospy.loginfo('[dock_offset] report of the DOCKED waypoint against the GPS ENABLED '
@@ -4680,8 +4688,18 @@ class NavTfNode:
                     st['pend'] = None
                     st['rejected'] += 1
                     return
+                # "georef done" by the distance to its target, not by the target
+                # being None: navi_man publishes /navi_manager/map_coords in its
+                # main loop and every message sets the target again (cleared by
+                # the next 30 Hz tick), so on the robot a 10 Hz look never saw it
+                # None for 3 s in a row - series 9: no undock sample, all timed out
+                tgt = self._georef_target
+                near = True
+                if tgt is not None:
+                    m = self.map_odom_transform.transform.translation
+                    near = math.hypot(tgt[0] - m.x, tgt[1] - m.y) <= self._dor_cfg['settle_m']
                 settled = (self._anchor_owned and self.map_odom_yaw == 0.0
-                           and self._georef_target is None
+                           and near
                            and self._georef_last_t is not None
                            and self._georef_last_t > pend['t0'])
                 if not settled:

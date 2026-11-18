@@ -118,6 +118,18 @@ C3. "Pohyblive" prevzeti polohy po vyjezdu z doku (takeover_wander, v4)
          jedno cislo na vyjezd M = draha [cm] + 0,5 * kolisani kurzu [st]
          (0,5 cm/st = roh robota na rameni 0,3 m); median a maximum pres
          vyjezdy. Jednotlive vyjezdy: detail.takeover_wander.
+   v5: PRVNI VYJEZD PO STARTU UZLU neni vypovidajici (navsat teprve bere
+   datum, EKF je na GPS a kotva nema co dotahovat; serie 9: 7-17 cm bez
+   ohledu na vypinace). Pozna se tak, ze mezi opustenim doku a prevzetim
+   neprisla zadna zprava /odometry/gps (kdyz tema v nahravce chybi: |yaw
+   map->odom| v doku > 5 st.) - v detailu cold = true. Stare klice vyse
+   berou vsechny vyjezdy jako dosud.
+   takeover_wander_warm_med, takeover_wander_warm_max
+         M jen z vyjezdu, ktere nejsou prvni po startu uzlu
+   takeover_warm_n          pocet takovych vyjezdu (jen udaj)
+   takeover_step_max_cm     nejvetsi pohyb obrazu za 0,1 s pri prevzeti
+                            (max pres vsechny vyjezdy) - skok, ktery je videt
+   takeover_step_warm_max_cm   totez bez prvniho vyjezdu po startu uzlu
 D. Predani kurzu po vyjezdu (dok -> GNSS)
    Okno predani = souvisly usek po opusteni doku, kdy se yaw map->odom meni
    (mezery mezi zmenami <= 5 s) a konci presnou nulou.
@@ -198,8 +210,8 @@ import sys
 
 import numpy as np
 
-VERSION = 4
-EXTRACT_VERSION = 3    # format vytahu (.npz v --cache); v4 pridala jen metriky, vytah je stejny
+VERSION = 5
+EXTRACT_VERSION = 3    # format vytahu (.npz v --cache); v4 a v5 pridaly jen metriky, vytah je stejny
 
 TOPICS = {
     'tf': '/tf',
@@ -230,6 +242,7 @@ WANDER_STEP_S = 0.1    # krok vzorkovani drahy obrazu
 WANDER_MIN_M = 0.002   # mensi kroky se do drahy nepocitaji (sum)
 WANDER_YAW_STEP_S = 0.5
 WANDER_YAW_CM_PER_DEG = 0.5    # vaha kolisani kurzu v M (roh robota na rameni 0,3 m)
+WANDER_COLD_YAW_DEG = 5.0      # bez /odometry/gps: |yaw map->odom| v doku nad timto = po startu uzlu
 FALLBACK_INVALID_PCT = 20.0     # anchor_fallback_pct nad timto: polohove metriky neplati
 BUFFERED_INVALID_PCT = 50.0     # gps_buffered_est_pct pod timto (stare nahravky): kotva hladovela
 NA = 'neni v nahravce'
@@ -673,7 +686,8 @@ def takeover_wander(T, tau, wheel, yref_t, yref_yaw, imu, tg):
     dh = np.abs(np.diff(np.interp(th, t, hres)))
     wobble = float(dh[calm[1:] & calm[:-1]].sum())
     return {'t': float(tg), 'path_cm': path, 'needed_cm': needed, 'yaw_wobble_deg': wobble,
-            'wander': path + WANDER_YAW_CM_PER_DEG * wobble}
+            'wander': path + WANDER_YAW_CM_PER_DEG * wobble,
+            'step_max_cm': 100.0 * float(st.max()) if len(st) else 0.0}
 
 
 def dock_edges(dock):
@@ -1034,7 +1048,9 @@ def score(D):
     keysE = ['dock_jump_cm', 'dock_jump_deg', 'dock_shift_cm']
     keysF = ['to_rtk_fixed_s', 'to_owner_gps_s', 'to_undocked_s', 'to_depart_s', 'undock_standing_s']
     keysW = ['takeover_wander_med', 'takeover_wander_max', 'takeover_path_map_cm',
-             'takeover_needed_cm', 'takeover_yaw_wobble_deg']
+             'takeover_needed_cm', 'takeover_yaw_wobble_deg',
+             'takeover_wander_warm_med', 'takeover_wander_warm_max', 'takeover_warm_n',
+             'takeover_step_max_cm', 'takeover_step_warm_max_cm']
     if _have(D, 'dock', 2):
         und, dks = dock_edges(D['dock'])
         meta['undocks'], meta['docks'] = len(und), len(dks)
@@ -1115,9 +1131,20 @@ def score(D):
             for t0 in und:
                 first = [a for (a, _) in episodes if t0 < a <= nxt(t0)]
                 if first:
-                    tgs.append(first[0])
-            ws = [x for x in (takeover_wander(T, tau, wheel, yref_t, yref_yaw, imu, tg)
-                              for tg in tgs) if x]
+                    tgs.append((t0, first[0]))
+            gps_t = D['gps'][:, 0] if _have(D, 'gps', 3) else None
+            ws = []
+            for t0, tg in tgs:
+                x = takeover_wander(T, tau, wheel, yref_t, yref_yaw, imu, tg)
+                if not x:
+                    continue
+                if gps_t is not None:       # v5: prvni vyjezd po startu uzlu
+                    x['cold'] = not bool(np.any((gps_t > t0) & (gps_t < tg - 0.3)))
+                else:
+                    k = min(int(np.searchsorted(T['t'], t0)), len(T['t']) - 1)
+                    x['cold'] = bool(abs(math.degrees(T['myaw'][k])) > WANDER_COLD_YAW_DEG)
+                ws.append(x)
+            tgs = [tg for _, tg in tgs]
             if ws:
                 med = lambda key: float(np.median([x[key] for x in ws]))
                 M['takeover_wander_med'] = med('wander')
@@ -1125,6 +1152,17 @@ def score(D):
                 M['takeover_path_map_cm'] = med('path_cm')
                 M['takeover_needed_cm'] = med('needed_cm')
                 M['takeover_yaw_wobble_deg'] = med('yaw_wobble_deg')
+                warm = [x for x in ws if not x['cold']]
+                M['takeover_warm_n'] = len(warm)
+                M['takeover_step_max_cm'] = max(x['step_max_cm'] for x in ws)
+                if warm:
+                    M['takeover_wander_warm_med'] = float(np.median([x['wander'] for x in warm]))
+                    M['takeover_wander_warm_max'] = max(x['wander'] for x in warm)
+                    M['takeover_step_warm_max_cm'] = max(x['step_max_cm'] for x in warm)
+                else:
+                    for k in ('takeover_wander_warm_med', 'takeover_wander_warm_max',
+                              'takeover_step_warm_max_cm'):
+                        notes[k] = 'v nahravce je jen prvni vyjezd po startu uzlu'
                 if len(ws) < len(und):
                     notes['takeover_wander_max'] = 'jen %d z %d vyjezdu (bez prevzeti nebo okno mimo nahravku)' % (
                         len(ws), len(und))
@@ -1448,6 +1486,11 @@ SPEC = [
     ('takeover_path_map_cm', 'draha obrazu v mape mimo kola, median', 'cm', 'low'),
     ('takeover_needed_cm', 'skutecne potrebna oprava polohy, median', 'cm', 'low'),
     ('takeover_yaw_wobble_deg', 'kolisani kurzu pri prevzeti, median', 'st', 'low'),
+    ('takeover_wander_warm_med', 'M bez prvniho vyjezdu po startu uzlu, median', '', 'low'),
+    ('takeover_wander_warm_max', 'M bez prvniho vyjezdu po startu uzlu, max', '', 'low'),
+    ('takeover_warm_n', 'pocet vyjezdu mimo prvni po startu uzlu', '', 'info'),
+    ('takeover_step_max_cm', 'nejvetsi pohyb obrazu za 0,1 s pri prevzeti', 'cm', 'low'),
+    ('takeover_step_warm_max_cm', '... bez prvniho vyjezdu po startu uzlu', 'cm', 'low'),
     ('D. Kurz: predani po vyjezdu a klid ve stoje', None, None, None),
     ('yaw_handover_s', 'doba predani kurzu', 's', 'low'),
     ('yaw_handover_turn_deg', 'otoceni map->odom pri predani', 'st', 'info'),

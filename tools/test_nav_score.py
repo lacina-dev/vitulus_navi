@@ -418,6 +418,59 @@ class TakeoverWander(unittest.TestCase):
         self.assertAlmostEqual(m['takeover_wander_med'], 8.0, delta=0.01)
         self.assertAlmostEqual(m['takeover_wander_max'], 10.0, delta=0.01)
 
+    def _two(self, yaw0_deg=0.0, gps=None):
+        D, ts = self._run(n=3600)                          # 120 s, prevzeti v 25 a 85 s
+        dt = D['dock'][:, 0] - T0
+        D['dock'][:, 1] = np.where((dt < 5) | ((dt >= 60) & (dt < 70)), 0.0, 1.0)
+        D['loc_owner'] = np.array(['dock'] * 5 + ['dr'] * 20 + ['gps'] * 35 + ['dock'] * 10
+                                  + ['dr'] * 15 + ['gps'] * 35)
+        # 1. vyjezd: 6 cm plynule; 2. vyjezd: 10 cm, z toho 5 cm jednim skokem
+        mx = self._ramp(ts, 0.5, 2.5, 0.06) + self._ramp(ts, 60.5, 61.5, 0.05) + 0.05 * (ts > 62.02)
+        yaw = np.radians(yaw0_deg) * (ts < 0.0)            # yaw map->odom do 1. prevzeti
+        D['mo'] = tfrows(ts + T0 + self.TG, mx, 0.0, yaw)
+        D['ob'] = tfrows(ts + T0 + self.TG, 0.0, 0.0, -yaw)
+        if gps is not None:
+            g = T0 + np.arange(gps, 120.0, 0.2)            # /odometry/gps az od casu gps
+            D['gps'] = odo(g, 0.0, 0.0, v=0.0)
+        return ns.score(D)
+
+    def test_v5_first_undock_after_node_start_left_out(self):
+        # navsat jeste nebezi: do 1. prevzeti zadna zprava /odometry/gps -> cold
+        R = self._two(gps=26.0)
+        m = R['metrics']
+        self.assertEqual([x['cold'] for x in R['detail']['takeover_wander']], [True, False])
+        self.assertAlmostEqual(m['takeover_wander_med'], 8.0, delta=0.01)       # stare klice: oba
+        self.assertAlmostEqual(m['takeover_wander_max'], 10.0, delta=0.01)
+        self.assertEqual(m['takeover_warm_n'], 1)
+        self.assertAlmostEqual(m['takeover_wander_warm_med'], 10.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_wander_warm_max'], 10.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_step_max_cm'], 5.0, delta=0.01)
+        self.assertAlmostEqual(m['takeover_step_warm_max_cm'], 5.0, delta=0.01)
+        self.assertAlmostEqual(R['detail']['takeover_wander'][0]['step_max_cm'], 0.3, delta=0.01)
+
+    def test_v5_gps_running_before_both_takeovers(self):
+        R = self._two(gps=0.0)
+        self.assertEqual([x['cold'] for x in R['detail']['takeover_wander']], [False, False])
+        self.assertEqual(R['metrics']['takeover_warm_n'], 2)
+        self.assertAlmostEqual(R['metrics']['takeover_wander_warm_med'], 8.0, delta=0.01)
+
+    def test_v5_without_gps_topic_by_map_odom_yaw(self):
+        R = self._two(yaw0_deg=-22.0)
+        self.assertEqual([x['cold'] for x in R['detail']['takeover_wander']], [True, False])
+        R = self._two(yaw0_deg=2.0)
+        self.assertEqual([x['cold'] for x in R['detail']['takeover_wander']], [False, False])
+
+    def test_v5_only_cold_undock(self):
+        D, ts = self._run()
+        D['mo'] = tfrows(ts + T0 + self.TG, self._ramp(ts, 0.5, 2.5, 0.06), 0.0,
+                         np.radians(-22.0) * (ts < 0.0))
+        D['ob'] = tfrows(ts + T0 + self.TG, 0.0, 0.0, np.radians(22.0) * (ts < 0.0))
+        R = ns.score(D)
+        self.assertEqual(R['metrics']['takeover_warm_n'], 0)
+        self.assertIsNone(R['metrics']['takeover_wander_warm_med'])
+        self.assertIn('prvni vyjezd po startu', R['notes']['takeover_wander_warm_med'])
+        self.assertIsNotNone(R['metrics']['takeover_step_max_cm'])
+
     def test_notes_when_not_measurable(self):
         keys = ['takeover_wander_med', 'takeover_wander_max', 'takeover_path_map_cm',
                 'takeover_needed_cm', 'takeover_yaw_wobble_deg']

@@ -32,6 +32,14 @@ it tracks again. Only the VO is touched (the camera, depth_obstacles and the
 lidar odometry are not). The dock pause wins: while it holds, the lost watch
 is idle, and leaving the dock resumes everything and starts the watch afresh.
 ~vo_lost_dry_run:=true evaluates and reports but never calls a service.
+A742 — ~resume_on_start (default TRUE): a new instance cannot know whether the
+previous one died while it held the dock pause. It owes ONE resume of both
+odometries: paid the moment the dock status is anything but docked (at the
+start or on undocking before this instance paused them itself), or after
+~resume_on_start_timeout_s without any dock status; dropped once this instance
+has made its own dock pause. In the dock nothing is called at the start.
+Before, a robot that undocked within ~dock_hold_s of a dock_idle restart drove
+with VO and lidar odometry still paused.
 A739: no lock is held across a service call (the wake-up on undocking never
 waits for the watch); at its start, and when the VO has been silent for a whole
 window, the node resumes the VO once (a previous instance may have died holding
@@ -178,6 +186,11 @@ class DockIdle(object):
             '~resume_services', ['/vo/resume_odom', '/licp/resume_odom'])
         self.paused = False
         self.docked_since = None
+        # A742: one resume owed after a (re)start, see the module docstring
+        self.resume_owed = self.enable and bool(rospy.get_param('~resume_on_start', True))
+        self.resume_timeout_s = float(rospy.get_param('~resume_on_start_timeout_s', 10.0))
+        self.status_seen = False
+        self.started = time.time()
         # T39 lost-VO watch (default off = nothing subscribed, nothing changes)
         self.vo_lost_enable = bool(rospy.get_param('~vo_lost_pause', False))
         self.vo_dry_run = bool(rospy.get_param('~vo_lost_dry_run', False))
@@ -226,12 +239,14 @@ class DockIdle(object):
             rospy.Timer(rospy.Duration(1.0), self.vo_tick)
         rospy.on_shutdown(self.on_shutdown)
         self._publish()
-        rospy.loginfo('[dock_idle] up (enable=%s, hold=%.0fs, pause=%s, vo_lost_pause=%s%s)',
-                      self.enable, self.hold_s, self.pause_srvs, self.vo_lost_enable,
+        rospy.loginfo('[dock_idle] up (enable=%s, hold=%.0fs, pause=%s, resume_on_start=%s, '
+                      'vo_lost_pause=%s%s)', self.enable, self.hold_s, self.pause_srvs,
+                      self.resume_owed, self.vo_lost_enable,
                       ' DRY RUN' if self.vo_lost_enable and self.vo_dry_run else '')
 
     # ---- dock state ---------------------------------------------------------
     def cb_dock(self, msg):
+        self.status_seen = True
         if msg.data == DOCKED:
             if self.docked_since is None:
                 self.docked_since = time.time()
@@ -239,21 +254,33 @@ class DockIdle(object):
             self.docked_since = None
             with self.vo_lock:
                 was = self.paused
+                owed, self.resume_owed = self.resume_owed, False
                 if was:
                     self.paused = False
+                if was or owed:
                     self._vo_watch_restart()
-            if was:
+            if was or owed:
                 # leaving the dock (undocking has begun) — wake the odometries
-                # BEFORE any motion happens
-                self._call_all(self.resume_srvs, 'resume')
+                # BEFORE any motion happens. `owed`: not docked and this
+                # instance never paused them - a previous one may have.
+                self._call_all(self.resume_srvs, 'resume' if was else 'resume(start)')
                 self._publish()
 
     def tick(self, _evt):
+        if (self.resume_owed and not self.status_seen
+                and time.time() - self.started >= self.resume_timeout_s):
+            with self.vo_lock:
+                owed, self.resume_owed = self.resume_owed, False
+            if owed:                   # dock state unknown: the safe direction
+                rospy.logwarn('[dock_idle] no dock status %.0f s after the start - '
+                              'resuming the odometries once', self.resume_timeout_s)
+                self._call_all(self.resume_srvs, 'resume(start, no dock status)')
         if not self.enable or self.paused or self.docked_since is None:
             return
         if (time.time() - self.docked_since) >= self.hold_s:
             with self.vo_lock:
                 self.paused = True
+                self.resume_owed = False   # from here on the pause is our own
                 self._vo_watch_restart()
             self._call_all(self.pause_srvs, 'pause')
             with self.vo_lock:

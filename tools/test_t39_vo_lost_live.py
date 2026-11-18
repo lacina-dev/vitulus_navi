@@ -66,7 +66,7 @@ def main():
         assert rospy.get_master().getUri()[2].rstrip('/').endswith(':%d' % PORT)
         rospy.init_node('vo_lost_test', anonymous=True, disable_signals=True)
 
-        vo = {'paused': False, 'light': False, 'run_s': 0.0, 'mark': None}
+        vo = {'paused': False, 'licp_paused': False, 'light': False, 'run_s': 0.0, 'mark': None}
         calls = []                       # (monotonic, name)
         status = [None]
 
@@ -75,6 +75,8 @@ def main():
                 calls.append((time.monotonic(), name))
                 if name.startswith('/vo/'):
                     vo['paused'] = flag
+                else:
+                    vo['licp_paused'] = flag
                 return EmptyResponse()
             return rospy.Service(name, Empty, h)
         for name, flag in (('/vo/pause_odom', True), ('/vo/resume_odom', False),
@@ -114,19 +116,23 @@ def main():
             rospy.set_param('/dock_idle/vo_lost_retry_s', RETRY)
             rospy.set_param('/dock_idle/vo_lost_probe_s', PROBE)
             rospy.set_param('/dock_idle/vo_lost_min_msgs', 20)
-            rospy.set_param('/dock_idle/dock_hold_s', HOLD)
+            rospy.set_param('/dock_idle/dock_hold_s', params.get('hold', HOLD))
+            rospy.set_param('/dock_idle/resume_on_start', params.get('resume_on_start', True))
             del calls[:]
             if not params.get('keep_vo_state'):
                 vo['paused'] = False
             node[0] = subprocess.Popen([sys.executable, NODE, '__name:=dock_idle'],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(3.0)
-            if params.get('vo_lost_pause') and not params.get('vo_lost_dry_run') \
-                    and not params.get('keep_vo_state'):
-                ok('  (start: one resume of the VO, logger put back)',
-                   names() == ['/vo/resume_odom'] and levels[-1:] == [('ros.rtabmap_odom', 'warn')],
-                   (names(), levels[-1:]))
-                del calls[:]
+            if params.get('keep_vo_state'):
+                return
+            # A742: started outside the dock -> one resume of both odometries
+            ok('  (start outside the dock: VO + lidar resumed once)',
+               names() == ['/vo/resume_odom', '/licp/resume_odom'], names())
+            if params.get('vo_lost_pause') and not params.get('vo_lost_dry_run'):
+                ok('  (start: VO logger put back)', levels[-1:] == [('ros.rtabmap_odom', 'warn')],
+                   levels[-1:])
+            del calls[:]
 
         def stop():
             if node[0] is not None:
@@ -283,9 +289,37 @@ def main():
            (status[0] or {}).get('vo_lost', {}).get('pauses', 0) >= 1
            and status[0]['vo_lost'].get('dry_run') is True, status[0])
         stop()
-        alive[0] = False
+
+        # ---- 9. A742: killed in the dock, undocking within the hold --------------
+        for ros_on in (True, False):
+            print('9. dock_idle killed in the dock, undocking %.0f s after its restart '
+                  '(resume_on_start %s)' % (4.0, ros_on))
+            dock.publish(Int8(3))
+            start()
+            dock.publish(Int8(0))
+            time.sleep(HOLD + 3.5)
+            ok('docked: VO + lidar paused', vo['paused'] and vo['licp_paused'])
+            node[0].kill()
+            node[0].wait()
+            node[0] = None
+            start(keep_vo_state=True, hold=20.0, resume_on_start=ros_on)   # still docked
+            ok('new instance in the dock: nothing called, both still paused',
+               names() == [] and vo['paused'] and vo['licp_paused'], names())
+            time.sleep(1.0)
+            dock.publish(Int8(1))                      # undocking ~4 s after the restart
+            time.sleep(2.0)
+            if ros_on:
+                ok('undocking: VO + lidar odometry resumed',
+                   names() == ['/vo/resume_odom', '/licp/resume_odom']
+                   and not vo['paused'] and not vo['licp_paused'], names())
+            else:
+                ok('off (as before): both stay paused - the hole',
+                   names() == [] and vo['paused'] and vo['licp_paused'], names())
+            stop()
+            vo['paused'] = vo['licp_paused'] = False
 
         # ---- 8. the real rgbd_odometry and its logger --------------------------
+        alive[0] = False
         print('8. real rgbd_odometry (no input): the 5 s warning and its logger')
         fake_logger.shutdown()
         time.sleep(1.0)

@@ -124,6 +124,14 @@
              (load avg 15.9 in the dock, VO alone >1 core in the dark); resumes
              the instant undocking begins. ~enable:=false = no-op rollback. -->
         <node name="dock_idle" pkg="vitulus_navi" type="dock_idle" respawn="true" respawn_delay="2" output="log">
+            <!-- A742: a restarted dock_idle does not know whether the previous
+                 instance died holding the dock pause. true = it resumes VO +
+                 lidar odometry once as soon as the robot is not docked (at
+                 the start, or on undocking before it paused them itself; with
+                 no dock status at all after 10 s). In the dock nothing is
+                 called. false = as before (a robot undocking within
+                 dock_hold_s of the restart drove with both still paused). -->
+            <param name="resume_on_start" value="true"/>
             <!-- T39 (2026-11-18) LOST VO: outside the dock, pause the visual
                  odometry while it is permanently lost (night: every message
                  carries the 9999 covariance the EKF ignores, ~0.8 core burnt)

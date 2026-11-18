@@ -329,6 +329,85 @@ class NoLockAcrossCalls(Base):
         self.assertFalse(node.paused)
 
 
+class ResumeOnStart(Base):
+    """A742: a restarted dock_idle owes one resume of both odometries."""
+    BOTH = ['/vo/resume_odom', '/licp/resume_odom']
+
+    def left_paused(self):
+        self.world.vo_paused = self.world.licp_paused = True   # by a dead instance
+
+    def test_not_docked_at_start_resumes_once(self):
+        node = self.make(vo_lost_pause=False)
+        self.left_paused()
+        node.cb_dock(Int8(3))
+        self.assertEqual(self.world.calls, self.BOTH)
+        self.assertFalse(self.world.vo_paused or self.world.licp_paused)
+        node.cb_dock(Int8(1))
+        node.cb_dock(Int8(3))
+        self.assertEqual(self.world.calls, self.BOTH)          # once
+
+    def test_docked_at_start_calls_nothing_then_undock_within_hold_resumes(self):
+        node = self.make(vo_lost_pause=False)
+        self.left_paused()
+        node.cb_dock(Int8(0))
+        Clock.t += 5.0
+        node.tick(None)
+        self.assertEqual(self.world.calls, [])                 # in the dock: as before
+        node.cb_dock(Int8(1))                                  # undocking 5 s after the restart
+        self.assertEqual(self.world.calls, self.BOTH)
+        self.assertFalse(self.world.vo_paused or self.world.licp_paused)
+
+    def test_own_dock_pause_settles_the_debt(self):
+        node = self.make(vo_lost_pause=False)
+        node.cb_dock(Int8(0))
+        Clock.t += 21.0
+        node.tick(None)
+        node.cb_dock(Int8(1))
+        self.assertEqual(self.world.calls, ['/vo/pause_odom', '/licp/pause_odom'] + self.BOTH)
+        node.cb_dock(Int8(3))
+        self.assertEqual(len(self.world.calls), 4)
+
+    def test_no_dock_status_resumes_after_the_timeout(self):
+        node = self.make(vo_lost_pause=False)
+        self.left_paused()
+        Clock.t += 9.0
+        node.tick(None)
+        self.assertEqual(self.world.calls, [])
+        Clock.t += 2.0
+        node.tick(None)
+        self.assertEqual(self.world.calls, self.BOTH)
+        Clock.t += 20.0
+        node.tick(None)
+        node.cb_dock(Int8(3))
+        self.assertEqual(self.world.calls, self.BOTH)          # once
+
+    def test_switch_off_is_the_old_behaviour(self):
+        node = self.make(vo_lost_pause=False, resume_on_start=False)
+        self.left_paused()
+        node.cb_dock(Int8(0))
+        Clock.t += 5.0
+        node.tick(None)
+        node.cb_dock(Int8(1))
+        Clock.t += 30.0
+        node.tick(None)
+        self.assertEqual(self.world.calls, [])                 # the hole: both stay paused
+        self.assertTrue(self.world.vo_paused and self.world.licp_paused)
+
+    def test_enable_false_stays_a_no_op(self):
+        node = self.make(vo_lost_pause=False, enable=False)
+        node.cb_dock(Int8(3))
+        Clock.t += 30.0
+        node.tick(None)
+        self.assertEqual(self.world.calls, [])
+
+    def test_with_the_lost_watch_no_second_startup_resume(self):
+        node = self.make()
+        node.cb_dock(Int8(3))
+        node.vo_tick(None)
+        self.assertEqual(self.vo_calls(), self.BOTH)
+        self.assertEqual(self.levels(), ['warn'])
+
+
 class Off(Base):
     def test_switch_off_no_vo_watch(self):
         node = self.make(vo_lost_pause=False)

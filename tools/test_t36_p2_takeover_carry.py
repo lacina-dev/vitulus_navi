@@ -72,7 +72,7 @@ class Drive(F2.Drive):
 
 
 def built(nt, params, lost=(30.0, 80.0), dur=90.0, mo_yaw=0.0, georef_at=None,
-          dock=True, datum=True, utm_odom=True):
+          dock=True, datum=True, utm_odom=True, fresh=True):
     """The drive of the P1 test with the 30 Hz loop; after the break the GPS
     is DRIFT away from where the odom frame has the robot."""
     F2.install()
@@ -122,6 +122,10 @@ def built(nt, params, lost=(30.0, 80.0), dur=90.0, mo_yaw=0.0, georef_at=None,
                   ip(ty, tm) + off[1] + float(nz[1]))
         else:
             d.owned = not (lost[0] <= tau < lost[1])
+            if fresh and lost[1] - 0.1 <= tau < lost[1]:
+                # the anchor does not work from before the break (as with P1 on)
+                n._pose_buffer.clear()
+                n._anchor_verified = None
             d.tick(T_SYS + tau)
     return d
 
@@ -202,12 +206,16 @@ def run_pure(nt, check):
     check('EKF 2 cm from the GPS at the takeover (under 3): nothing to carry, no window',
           not start(st3, 400.0, None, None, True, True, 0.02) and st3['windows'] == 0)
     check('EKF 12 cm from the GPS: window', start(st3, 400.0, None, None, True, True, 0.12))
-    r = [note(st3, 400.1, 400.1, (0, 0), (0.05, 0), None, None, 0.07),
-         note(st3, 400.2, 400.2, (0.05, 0), (0.10, 0), None, None, 0.02),
-         note(st3, 400.3, 400.3, (0.10, 0), (0.115, 0), None, None, 0.01)]
-    check('the step that brings the EKF within 3 cm of the GPS is carried and ends the window',
+    r = [note(st3, 400.1, 400.1, (0, 0), (0.05, 0), None, None, False),
+         note(st3, 400.2, 400.2, (0.05, 0), (0.07, 0), None, None, True),
+         note(st3, 400.3, 400.3, (0.07, 0), (0.085, 0), None, None, True)]
+    check('the step the anchor did not have to cap (EKF at its target) is carried and ends the window',
           r == ['', '', 'inactive'] and len(st3['pending']) == 2
           and not fields(st3, 400.25)['takeover_carry_active'])
+    st4 = new()
+    check('stale anchor at the takeover: no window, counted',
+          not start(st4, 500.0, None, None, True, True, 0.12, True) and st4['windows'] == 0
+          and st4['stale_anchor'] == 1 and fields(st4, 500.0)['takeover_carry_stale_anchor'] == 1)
     cfg = dict(nt.TAKEOVER_CARRY_CFG, total_max_m=0.12)
     r = [note(st, 200.0 + 0.1 * k, 200.0 + 0.1 * k, (0.05 * k, 0), (0.05 * k + 0.05, 0), cfg)
          for k in range(4)]
@@ -222,7 +230,7 @@ def run_built(nt, check):
     if ref is not None:
         r = built(ref, {})
         check('off: set_pose calls EQUAL to main %s (%d calls)' % (BASE_REF, len(off.calls)),
-              off.calls == r.calls and len(off.calls) > 20)
+              off.calls == r.calls and len(off.calls) > 10)
         check('off: every broadcast transform EQUAL to main (%d ticks)' % len(off.tf),
               off.tf == r.tf and len(off.tf) > 2000)
     else:
@@ -238,7 +246,7 @@ def run_built(nt, check):
     print('    map pose in the 3 s after the takeover (robot stands): off path %.1f cm, net '
           '%.1f cm, largest tick %.1f cm; on path %.2f cm, net %.2f cm, largest tick %.2f cm'
           % (100 * p_off, 100 * n_off, 100 * s_off, 100 * p_on, 100 * n_on, 100 * s_on))
-    check('off: the map pose travels over 30 cm for a net 12 cm', p_off > 0.30 and 0.10 < n_off < 0.14)
+    check('off: the map pose jumps the 12 cm with the EKF', p_off > 0.11 and 0.10 < n_off < 0.14)
     check('on: the map pose does not move (path under 1 mm)', p_on < 0.001)
     mo = np.array([r_[1:3] for r_ in on.tf if 82.9 < r_[0] < 83.0])[-1]
     ob_on = np.array([r_[4:6] for r_ in on.tf if 82.9 < r_[0] < 83.0])[-1]
@@ -250,7 +258,7 @@ def run_built(nt, check):
           '(%.3f, %.3f)' % (mo[0] - MO0[0], mo[1] - MO0[1]))
     j = on.loc[-1][1]
     check('on: loc_status - one window, steps counted, about 0.12 m, nothing stopped or dropped',
-          j['takeover_carry_windows'] == 1 and j['takeover_carry_n'] >= 6
+          j['takeover_carry_windows'] == 1 and j['takeover_carry_n'] >= 3
           and abs(j['takeover_carry_m'] - 0.12) < 0.015 and j['takeover_carry_stopped'] == ''
           and j['takeover_carry_dropped'] == 0 and not j['takeover_carry_active'],
           str({k: v for k, v in j.items() if k.startswith('takeover_carry')}))
@@ -271,6 +279,16 @@ def run_built(nt, check):
     s_off = built(nt, {}, lost=(30.0, 33.0), dur=45.0)
     check('break of 3 s: no new window, transforms EQUAL to off',
           s_on.tf == s_off.tf and s_on.loc[-1][1]['takeover_carry_windows'] == 0)
+    so, sn = built(nt, {}, fresh=False), built(nt, ON, fresh=False)
+    p_so, n_so, _ = travel(so, 79.9, 83.0)
+    print('    stale anchor (buffer of before the break kept, P1 off): off path %.1f cm, net %.1f cm'
+          % (100 * p_so, 100 * n_so))
+    check('stale anchor: off - the EKF is pulled away and back (path over 30 cm)', p_so > 0.30)
+    check('stale anchor: on - no window, transforms EQUAL to off, counted',
+          sn.tf == so.tf and sn.loc[-1][1]['takeover_carry_windows'] == 0
+          and sn.loc[-1][1]['takeover_carry_stale_anchor'] == 1
+          and off.loc[-1][1].get('takeover_carry_stale_anchor') is None
+          and on.loc[-1][1]['takeover_carry_stale_anchor'] == 0)
     nd = built(nt, ON, dock=False)
     check('GPS returns in the middle of a drive (no dock in the break): nothing carried, '
           'transforms EQUAL to off',

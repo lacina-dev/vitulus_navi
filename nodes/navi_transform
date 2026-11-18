@@ -792,18 +792,19 @@ TAKEOVER_CARRY_CFG = {
     'step_max_m': 0.06,     # a larger single step is not carried (window ends)
     'total_max_m': 0.5,     # nor more than this in one window
     'timeout_s': 0.5,       # a step the EKF never showed is forgotten
+    'stale_s': 15.0,        # anchor buffer / verified anchor older than this = stale
     'open_min_m': 0.03,     # EKF nearer to the GPS than this at the takeover: nothing to carry
-    'done_m': 0.03,         # EKF this near to the GPS after a step: the window ends
 }
 
 
 def takeover_carry_new_state():
     return {'until': None, 'pending': [], 'sum': [0.0, 0.0], 'n': 0, 'windows': 0,
-            'stopped': '', 'stops': 0, 'dropped': 0, 'reported': True, 'no_georef': 0}
+            'stopped': '', 'stops': 0, 'dropped': 0, 'reported': True, 'no_georef': 0,
+            'stale_anchor': 0}
 
 
 def takeover_carry_start(st, now, lost_t, cfg=None, after_dock=True, georef_ready=True,
-                         gap_m=None):
+                         gap_m=None, anchor_stale=False):
     """The anchor writes again after not having written (resume tick). Opens a
     carry window when GPS did not own the position for min_gap_s (lost_t None:
     it never did), the dock held the pose since GPS last owned it (after_dock;
@@ -824,6 +825,15 @@ def takeover_carry_start(st, now, lost_t, cfg=None, after_dock=True, georef_read
         return False
     if gap_m is not None and gap_m < cfg['open_min_m']:
         return False
+    if anchor_stale:
+        # The anchor still works from a GPS point of before the break (P1,
+        # ~anchor_stale_reset_s, is off): its first steps pull the EKF AWAY
+        # from the GPS and ~2 s later back. Carried, the pull would be hidden,
+        # walked back into the map by the georef, and the return hidden again
+        # (series 9: map pose travelled 59.6 cm for a net 10.5 cm). So nothing
+        # of this takeover is carried - it runs as without the parameter.
+        st['stale_anchor'] += 1
+        return False
     if not georef_ready:
         st['no_georef'] += 1
         return False
@@ -836,12 +846,13 @@ def takeover_carry_start(st, now, lost_t, cfg=None, after_dock=True, georef_read
     return True
 
 
-def takeover_carry_note(st, now, t_call, pre, tgt, cfg=None, t_ret=None, gap_after=None):
+def takeover_carry_note(st, now, t_call, pre, tgt, cfg=None, t_ret=None, reached=False):
     """A set_pose of the position anchor was sent at t_call and answered at
     t_ret (None: t_call): EKF position pre -> tgt (odom frame). Queued for the
-    30 Hz tick. gap_after = distance of tgt from the GPS: under done_m the EKF
-    has reached the GPS - this step is still carried and the window ends, so
-    the anchor's ordinary corrections that follow are not. '' = queued, else why not:
+    30 Hz tick. reached = the anchor did not have to cap this step, i.e. the
+    EKF is at the anchor's target now: the step is still carried and the
+    window ends, so the anchor's ordinary corrections that follow are not.
+    '' = queued, else why not:
     'inactive' (no window), 'step' / 'total' (over the limit: the window ends,
     nothing more is carried in it - the caller reports it)."""
     cfg = cfg or TAKEOVER_CARRY_CFG
@@ -862,7 +873,7 @@ def takeover_carry_note(st, now, t_call, pre, tgt, cfg=None, t_ret=None, gap_aft
         return why
     st['pending'].append((t_call, dx, dy, (pre[0], pre[1]), (tgt[0], tgt[1]),
                           t_call if t_ret is None else max(t_ret, t_call)))
-    if gap_after is not None and gap_after < cfg['done_m']:
+    if reached:
         st['until'] = now          # reached the GPS: nothing more to carry
     return ''
 
@@ -915,6 +926,7 @@ def takeover_carry_fields(st, now):
         'takeover_carry_stops': st['stops'],
         'takeover_carry_dropped': st['dropped'],
         'takeover_carry_no_georef': st['no_georef'],
+        'takeover_carry_stale_anchor': st['stale_anchor'],
     }
 
 
@@ -5038,6 +5050,7 @@ class NavTfNode:
         for key, name in (('window_s', '~takeover_carry_s'),
                           ('min_gap_s', '~takeover_carry_min_gap_s'),
                           ('step_max_m', '~takeover_carry_step_max_m'),
+                          ('stale_s', '~takeover_carry_stale_s'),
                           ('total_max_m', '~takeover_carry_max_m')):
             self._tc_cfg[key] = float(rospy.get_param(name, self._tc_cfg[key]))
         self._tc_lock = threading.Lock()
@@ -5070,14 +5083,27 @@ class NavTfNode:
         lost = self._anchor_lost_t
         after_dock = self._map_pose_last_accept.get('dock', 0.0) > (lost or 0.0)
         ready = after_dock and self._tc_georef_ready()
+        # stale = what _apply_continuous_anchor would work from is older than
+        # stale_s (P1 has already dropped it earlier in this tick when it is on)
+        old = now - self._tc_cfg['stale_s']
+        buf = self._pose_buffer
+        ver = self._anchor_verified
+        stale = bool((len(buf) and buf[0][0] < old) or (ver is not None and ver[0] < old))
         with self._tc_lock:
             before = self._tc_st['no_georef']
+            before_stale = self._tc_st['stale_anchor']
             g = self.rtk_odom_msg.pose.pose.position
             e = self.ekf_wheel_nav_odom_msg.pose.pose.position
             opened = takeover_carry_start(self._tc_st, now, lost, self._tc_cfg,
                                           after_dock, ready,
-                                          math.hypot(g.x - e.x, g.y - e.y))
+                                          math.hypot(g.x - e.x, g.y - e.y), stale)
             refused = self._tc_st['no_georef'] > before
+            refused_stale = self._tc_st['stale_anchor'] > before_stale
+        if refused_stale and before_stale == 0:
+            rospy.logwarn('[takeover_carry] the position anchor still works from a GPS point of '
+                          'before the break (anchor_stale_reset_s is off) - anchor steps are NOT '
+                          'carried, the takeover moves the map pose as without the parameter '
+                          '(reported once; counted in takeover_carry_stale_anchor)')
         if refused and before == 0:
             rospy.logwarn('[takeover_carry] the georef cannot run (no site datum / live map '
                           'georef, or no utm->odom from navsat) - anchor steps are NOT carried, '
@@ -5091,10 +5117,10 @@ class NavTfNode:
         """After a set_pose of the position anchor (loop3sec thread)."""
         now = rospy.get_time()
         with self._tc_lock:
-            g = self.rtk_odom_msg.pose.pose.position
+            reached = math.hypot(step[2] - step[0], step[3] - step[1]) \
+                < self._pos_slew_mps * 0.1 - 1e-6       # the anchor's step was not capped
             why = takeover_carry_note(self._tc_st, now, t_call, step[0:2], step[2:4],
-                                      self._tc_cfg, t_ret,
-                                      math.hypot(g.x - step[2], g.y - step[3]))
+                                      self._tc_cfg, t_ret, reached)
         if why in ('step', 'total'):
             rospy.logwarn(
                 '[takeover_carry] anchor step %.3f m not carried (%s limit: step %.2f m, '

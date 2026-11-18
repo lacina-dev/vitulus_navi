@@ -460,6 +460,27 @@ class TakeoverWander(unittest.TestCase):
         R = self._two(yaw0_deg=2.0)
         self.assertEqual([x['cold'] for x in R['detail']['takeover_wander']], [False, False])
 
+    def test_v6_takeover_class(self):
+        for v, cls, key in ((0.0, 'stoji', 'standing'), (0.04, 'dojezd', 'coasting'),
+                            (0.25, 'jizda', 'driving')):
+            D, ts = self._run(v=v)
+            D['mo'] = tfrows(ts + T0 + self.TG, 0.0, self._ramp(ts, 0.5, 2.5, 0.06))
+            R = ns.score(D)
+            x = R['detail']['takeover_wander'][0]
+            self.assertEqual(x['cls'], cls)
+            self.assertAlmostEqual(x['wheel_m'], v * 3.5, delta=1e-6)
+            m = R['metrics']
+            self.assertEqual([m['takeover_n_standing'], m['takeover_n_coasting'], m['takeover_n_driving']],
+                             [int(key == k) for k in ('standing', 'coasting', 'driving')])
+            self.assertAlmostEqual(m['takeover_wander_med'], 6.0, delta=0.1)      # stary klic beze zmeny
+            if key == 'standing':
+                self.assertAlmostEqual(m['takeover_wander_standing_med'], 6.0, delta=0.01)
+                self.assertIsNone(m['takeover_wander_driving_med'])
+                self.assertIn('zadne prevzeti', R['notes']['takeover_wander_driving_med'])
+            if key == 'driving':
+                self.assertAlmostEqual(m['takeover_wander_driving_med'], 6.0, delta=0.1)
+                self.assertIsNone(m['takeover_wander_standing_med'])
+
     def test_v5_only_cold_undock(self):
         D, ts = self._run()
         D['mo'] = tfrows(ts + T0 + self.TG, self._ramp(ts, 0.5, 2.5, 0.06), 0.0,

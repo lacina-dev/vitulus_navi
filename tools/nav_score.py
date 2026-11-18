@@ -130,6 +130,15 @@ C3. "Pohyblive" prevzeti polohy po vyjezdu z doku (takeover_wander, v4)
    takeover_step_max_cm     nejvetsi pohyb obrazu za 0,1 s pri prevzeti
                             (max pres vsechny vyjezdy) - skok, ktery je videt
    takeover_step_warm_max_cm   totez bez prvniho vyjezdu po startu uzlu
+   v6: TRIDA PREVZETI. Co s obrazem udela prevzeti, zavisi hlavne na tom,
+   jestli robot pri nem stoji (nocni serie 18. 11.: ve stoje 15-27 cm, za
+   jizdy 39-110 cm) - ruzne tridy se nesmi porovnavat mezi sebou. Trida
+   podle drahy kol (prumer |vx| x 3,5 s) za 3,5 s po prevzeti: 'stoji' do
+   0,05 m, 'dojezd' do 0,25 m, 'jizda' nad. V detailu vyjezdu: wheel_m, cls.
+   takeover_n_standing, takeover_n_coasting, takeover_n_driving
+         pocty prevzeti v tridach (vsechny vyjezdy, i prvni po startu uzlu)
+   takeover_wander_standing_med, takeover_wander_driving_med
+         median M ve tride ve stoje / za jizdy (None, kdyz ve tride nic neni)
 D. Predani kurzu po vyjezdu (dok -> GNSS)
    Okno predani = souvisly usek po opusteni doku, kdy se yaw map->odom meni
    (mezery mezi zmenami <= 5 s) a konci presnou nulou.
@@ -210,8 +219,8 @@ import sys
 
 import numpy as np
 
-VERSION = 5
-EXTRACT_VERSION = 3    # format vytahu (.npz v --cache); v4 a v5 pridaly jen metriky, vytah je stejny
+VERSION = 6
+EXTRACT_VERSION = 3    # format vytahu (.npz v --cache); v4 az v6 pridaly jen metriky, vytah je stejny
 
 TOPICS = {
     'tf': '/tf',
@@ -242,6 +251,9 @@ WANDER_STEP_S = 0.1    # krok vzorkovani drahy obrazu
 WANDER_MIN_M = 0.002   # mensi kroky se do drahy nepocitaji (sum)
 WANDER_YAW_STEP_S = 0.5
 WANDER_YAW_CM_PER_DEG = 0.5    # vaha kolisani kurzu v M (roh robota na rameni 0,3 m)
+WANDER_CLASS_S = 3.5           # trida prevzeti: draha kol za tuto dobu po prevzeti
+WANDER_CLASS_STAND_M = 0.05    # do teto drahy 've stoje'
+WANDER_CLASS_DRIVE_M = 0.25    # nad tuto 'za jizdy', mezi 'dojezd'
 WANDER_COLD_YAW_DEG = 5.0      # bez /odometry/gps: |yaw map->odom| v doku nad timto = po startu uzlu
 FALLBACK_INVALID_PCT = 20.0     # anchor_fallback_pct nad timto: polohove metriky neplati
 BUFFERED_INVALID_PCT = 50.0     # gps_buffered_est_pct pod timto (stare nahravky): kotva hladovela
@@ -647,6 +659,17 @@ def takeover_stats(gt, gap, episodes):
     return out
 
 
+def takeover_class(wheel, tg):
+    """v6: trida prevzeti podle drahy kol za WANDER_CLASS_S po prevzeti tg
+    (cas bagu): {'wheel_m', 'cls'}; cls None, kdyz v okne nejsou data kol."""
+    m = (wheel[:, 0] >= tg) & (wheel[:, 0] < tg + WANDER_CLASS_S)
+    if not np.any(m):
+        return {'wheel_m': None, 'cls': None}
+    d = float(np.abs(wheel[m, 6]).mean()) * WANDER_CLASS_S
+    cls = 'stoji' if d < WANDER_CLASS_STAND_M else ('dojezd' if d < WANDER_CLASS_DRIVE_M else 'jizda')
+    return {'wheel_m': d, 'cls': cls}
+
+
 def takeover_wander(T, tau, wheel, yref_t, yref_yaw, imu, tg):
     """Oddil C3 pro jedno prevzeti v case tg (cas bagu). Vraci dict {t,
     path_cm, needed_cm, yaw_wobble_deg, wander} nebo None, kdyz okno
@@ -687,7 +710,8 @@ def takeover_wander(T, tau, wheel, yref_t, yref_yaw, imu, tg):
     wobble = float(dh[calm[1:] & calm[:-1]].sum())
     return {'t': float(tg), 'path_cm': path, 'needed_cm': needed, 'yaw_wobble_deg': wobble,
             'wander': path + WANDER_YAW_CM_PER_DEG * wobble,
-            'step_max_cm': 100.0 * float(st.max()) if len(st) else 0.0}
+            'step_max_cm': 100.0 * float(st.max()) if len(st) else 0.0,
+            **takeover_class(wheel, tg)}
 
 
 def dock_edges(dock):
@@ -1050,7 +1074,9 @@ def score(D):
     keysW = ['takeover_wander_med', 'takeover_wander_max', 'takeover_path_map_cm',
              'takeover_needed_cm', 'takeover_yaw_wobble_deg',
              'takeover_wander_warm_med', 'takeover_wander_warm_max', 'takeover_warm_n',
-             'takeover_step_max_cm', 'takeover_step_warm_max_cm']
+             'takeover_step_max_cm', 'takeover_step_warm_max_cm',
+             'takeover_n_standing', 'takeover_n_coasting', 'takeover_n_driving',
+             'takeover_wander_standing_med', 'takeover_wander_driving_med']
     if _have(D, 'dock', 2):
         und, dks = dock_edges(D['dock'])
         meta['undocks'], meta['docks'] = len(und), len(dks)
@@ -1152,6 +1178,13 @@ def score(D):
                 M['takeover_path_map_cm'] = med('path_cm')
                 M['takeover_needed_cm'] = med('needed_cm')
                 M['takeover_yaw_wobble_deg'] = med('yaw_wobble_deg')
+                for key, cls in (('standing', 'stoji'), ('coasting', 'dojezd'), ('driving', 'jizda')):
+                    inc = [x['wander'] for x in ws if x['cls'] == cls]
+                    M['takeover_n_' + key] = len(inc)
+                    if key != 'coasting':
+                        M['takeover_wander_%s_med' % key] = float(np.median(inc)) if inc else None
+                        if not inc:
+                            notes['takeover_wander_%s_med' % key] = 'zadne prevzeti v teto tride'
                 warm = [x for x in ws if not x['cold']]
                 M['takeover_warm_n'] = len(warm)
                 M['takeover_step_max_cm'] = max(x['step_max_cm'] for x in ws)
@@ -1491,6 +1524,11 @@ SPEC = [
     ('takeover_warm_n', 'pocet vyjezdu mimo prvni po startu uzlu', '', 'info'),
     ('takeover_step_max_cm', 'nejvetsi pohyb obrazu za 0,1 s pri prevzeti', 'cm', 'low'),
     ('takeover_step_warm_max_cm', '... bez prvniho vyjezdu po startu uzlu', 'cm', 'low'),
+    ('takeover_n_standing', 'prevzeti ve stoje (kola do 0,05 m za 3,5 s)', '', 'info'),
+    ('takeover_n_coasting', 'prevzeti pri dojezdu (0,05-0,25 m)', '', 'info'),
+    ('takeover_n_driving', 'prevzeti za jizdy (nad 0,25 m)', '', 'info'),
+    ('takeover_wander_standing_med', 'M u prevzeti ve stoje, median', '', 'low'),
+    ('takeover_wander_driving_med', 'M u prevzeti za jizdy, median', '', 'low'),
     ('D. Kurz: predani po vyjezdu a klid ve stoje', None, None, None),
     ('yaw_handover_s', 'doba predani kurzu', 's', 'low'),
     ('yaw_handover_turn_deg', 'otoceni map->odom pri predani', 'st', 'info'),

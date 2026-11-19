@@ -15,6 +15,7 @@ Zdroje čísel: **[B]** = `~/bags/nav_test/nav_baseline_2026-11-15_a.bag` (2× d
 | Úprava | Parametr | Stav | Důkaz | Vrácení |
 |---|---|---|---|---|
 | D1 rychlost odometrie z kol při výpadku EKF | `odom_twist_from_wheels` | **zapnuto** | jízda: výpadky nulové rychlosti 2,0 % → 0,03 % | `git revert 3ef52fc` |
+| T39 poslední `/odometry/odom` si uzel uloží při vyslání, vlastní téma venku neodebírá | `odom_self_cache` | vypnuto | přehrání jízdy `nav_n2_base_8` (558 s): `/tf` 16 737, `/odometry/odom` 16 737, `nav_fused` 55 568 zpráv bajt po bajtu shodné s vypnutým; úspora odhad 0,3–0,6 % jádra, jízdou neměřeno. Indoor odběr zůstává (téma tam vydává indoor EKF) | vypnout parametr |
 | D2 kurz mezi vzorky RTK z IMU | `heading_imu_interp` | **zapnuto** | 3 jízdy proti 3 výchozím: skoky kurzu mapy nad 0,3° 31–40 → 4–24, zamrznutí kotvy kurzu 5–7 → 2, zastaralé TF 3–10 % → 0,7–2,8 % | `git revert 91a24d7` |
 | D3 dotáčení při předání podle EKF | `handover_follow_ekf` | **zapnuto** | série 4 a 5 (5 jízd proti 5): skoky kurzu mapy nad 0,3° 15–40 → 10–18 (v každém kole méně než výchozí), největší krok při předání 0,71–0,85° → 0,43–0,52°, nadbytečné otáčení 9–34° → 6–10°; rozkmit kurzu ve stoje beze změny (std 0,31–0,42° proti 0,36–0,47°) | `git revert 2502d6b` |
 | D4 plynulý první zápis dokové pózy | `dock_engage_slew_mps` 0,10 | **zapnuto** | série 4 (2 proti 2): skok při zadokování 16,1 a 6,4 cm → 0,37 a 0,38 cm; 3,3 a 2,4° → 0,38 a 0,28° | `git revert 856fd6b` |

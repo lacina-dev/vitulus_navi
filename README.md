@@ -90,6 +90,15 @@ Header, pose, both covariances and the TF are unchanged, and the EKF itself is
 not touched. When either source is missing, not finite or older than
 `~odom_twist_max_age_s` (0.2) the EKF message goes out as before.
 
+`~odom_self_cache` (T39, `false`): the node used to subscribe to its own
+`/odometry/odom` (30 Hz back over TCP) only to keep the last message for the
+bridge preview (`~bridge/compute_enable`, off). With `true` it keeps the message
+it publishes and holds no subscription to the topic while outdoor; indoor
+(`/navi_manager/is_indoor` true, also from start until navi_man says outdoor)
+the topic comes from the indoor EKF, so the subscription exists as before.
+Outputs are unchanged; with the preview on it reads the message of the same
+tick instead of the same or the previous one.
+
 Readers of the twist: the TEB local planner (`odom_topic`: the start velocity of
 every plan, so it stops planning from a standstill that is not there) and the
 agent's telemetry (`speed`, `yaw_rate`). `traversability_local`,

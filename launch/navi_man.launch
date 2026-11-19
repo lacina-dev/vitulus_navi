@@ -75,6 +75,11 @@
                  vynecha: jizda 15. 11. vypadky nulove rychlosti 2.0 % -> 0.03 %.
                  ROLLBACK: odom_twist_from_wheels:=false -->
             <param name="odom_twist_from_wheels" value="true"/>
+            <!-- T39 2026-11-19 posledni /odometry/odom si uzel ulozi pri vyslani a sve
+                 vlastni tema venku neodebira (30 Hz zpet pres TCP); indoor odber zustava
+                 (vydava ho tam indoor EKF). Vychozi vypnuto = odber jako driv.
+                 ROLLBACK: odom_self_cache:=false -->
+            <param name="odom_self_cache" value="false"/>
             <!-- Drift-budget ratchet: only dock/GPS anchors reset the budget; a
                  tracker correction consumes it (it used to refill it).
                  ROLLBACK: tracker_budget_ratchet:=false -->

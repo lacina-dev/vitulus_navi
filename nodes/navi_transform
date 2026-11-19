@@ -1763,6 +1763,14 @@ class NavTfNode:
         # the wheel odometry, angular.z of the IMU gyro (both in base_link).
         self._odom_twist_wheels = bool(rospy.get_param('~odom_twist_from_wheels', False))
         self._odom_twist_max_age_s = float(rospy.get_param('~odom_twist_max_age_s', 0.2))
+        # T39 (off by default = the node subscribes to its own /odometry/odom
+        # as before): base_odom_msg is only a cache of the last /odometry/odom
+        # for the bridge preview. On: the node keeps the message it publishes
+        # and holds no subscription to /odometry/odom while outdoor (30 Hz of
+        # its own output back over TCP). Indoor it does not publish - the
+        # indoor EKF does - so the subscription exists for as long as
+        # is_indoor is True (also from start until navi_man says outdoor).
+        self._odom_self_cache = bool(rospy.get_param('~odom_self_cache', False))
         self.rtk_odom_msg = Odometry()
         self.rtk_odom_msg.pose.pose.orientation.w = 1
         self.rtk_odom_heading_msg = Odometry()
@@ -2328,7 +2336,11 @@ class NavTfNode:
         self.imu_sub = rospy.Subscriber("/bno085/imu", Imu, self.callback_imu, queue_size=200)
         self.wheel_odom_sub = rospy.Subscriber("/mobile_base_controller/odom", Odometry, self.callback_wheel_odom, queue_size=200)
         self.rtk_odom_sub = rospy.Subscriber("/odometry/gps", Odometry, self.callback_rtk_odom, queue_size=200)
-        self.base_odom_sub = rospy.Subscriber("/odometry/odom", Odometry, self.callback_base_odom, queue_size=200)
+        if self._odom_self_cache:
+            self.base_odom_sub = None
+            self._odom_self_cache_sync()
+        else:
+            self.base_odom_sub = rospy.Subscriber("/odometry/odom", Odometry, self.callback_base_odom, queue_size=200)
         self.ekf_wheel_odom_sub = rospy.Subscriber("/odometry/ekf_wheel_odom", Odometry, self.callback_ekf_wheel_odom, queue_size=200)
         self.ekf_wheel_nav_odom_sub = rospy.Subscriber("/odometry/ekf_wheel_nav_odom", Odometry, self.callback_ekf_wheel_nav_odom, queue_size=200)
         self.map_coords_sub = rospy.Subscriber("/navi_manager/map_coords", PoseStamped, self.callback_map_coords)
@@ -3303,6 +3315,8 @@ class NavTfNode:
         was_indoor = self.is_indoor
         self.is_indoor = msg.data
         rospy.loginfo_throttle(10, f"[navi_transform] is_indoor={self.is_indoor}")
+        if getattr(self, '_odom_self_cache', False):      # T39
+            self._odom_self_cache_sync()
         if was_indoor and not self.is_indoor:
             # Transitioning indoor→outdoor: restart navsat_transform_node so it
             # re-initialises with the current (accurate, post-stabilisation) GPS.
@@ -3524,7 +3538,22 @@ class NavTfNode:
         self.map_coords_msg = msg
 
     def callback_base_odom(self, msg):
+        if getattr(self, '_odom_self_cache', False) and not self.is_indoor:
+            return      # T39: a late message after the switch to outdoor
         self.base_odom_msg = msg
+
+    def _odom_self_cache_sync(self):
+        """T39 (~odom_self_cache): subscribed to /odometry/odom only while
+        indoor (the indoor EKF publishes it then, not this node)."""
+        if self.is_indoor and self.base_odom_sub is None:
+            self.base_odom_sub = rospy.Subscriber(
+                "/odometry/odom", Odometry, self.callback_base_odom, queue_size=200)
+        elif not self.is_indoor and self.base_odom_sub is not None:
+            sub, self.base_odom_sub = self.base_odom_sub, None
+            try:
+                sub.unregister()
+            except Exception as e:
+                rospy.logwarn("[navi_transform] odom_self_cache unregister: %s" % e)
 
     def callback_ekf_wheel_odom(self, msg):
         self.ekf_wheel_odom_msg = msg
@@ -5606,6 +5635,12 @@ class NavTfNode:
             # print(msg.pose.pose)
             msg.header.frame_id = "odom"
             msg.child_frame_id = "base_link"
+            if getattr(self, '_odom_self_cache', False):     # T39
+                out = self._odom_with_measured_twist(msg, stamp) \
+                    if getattr(self, '_odom_twist_wheels', False) else msg
+                self.odometry_odom_pub.publish(out)
+                self.base_odom_msg = out
+                return static_transformStamped
             self.odometry_odom_pub.publish(
                 self._odom_with_measured_twist(msg, stamp)
                 if getattr(self, '_odom_twist_wheels', False) else msg)

@@ -779,5 +779,240 @@ class RawParsers(unittest.TestCase):
                          [(b'map', b'odom', 1.5), (b'odom', b'base_link', 2.5)])
 
 
+class ClockStepInBag(unittest.TestCase):
+    """v7: skok systemovych hodin behem nahravky (chrony) - cas bagu i razitka
+    uzlu poskoci, UTC prijimace ne. Skore ma vyjit jako bez skoku."""
+    OFF = -0.30          # systemove hodiny za UTC pred skokem
+    T_TAKE = 40.0        # prevzeti GPS [s od T0]
+
+    def _true(self):
+        # 120 s jizdy promennou rychlosti; do prevzeti je EKF 10 cm vedle GPS,
+        # pak se 4 s plynule dorovnava (pod 5 cm za 2 s)
+        rng = np.random.RandomState(7)
+        n = 3600
+        t = T0 + np.arange(n) / 30.0
+        v = 0.3 + 0.1 * np.sin(0.3 * (t - T0))
+        x = np.concatenate([[0.0], np.cumsum(v[:-1] / 30.0)])
+        side = 0.10 * np.clip(1.0 - (t - T0 - self.T_TAKE) / 4.0, 0.0, 1.0)
+        D = {'wheel': odo(t, x, 0.0, v=v), 'ekf': odo(t, x, side, v=v), 'odom': odo(t, x, side, v=v),
+             'imu': imu(t), 'mo': tfrows(t, 0.0, 0.0), 'ob': tfrows(t, x, side), 'counts': {}}
+        tg = t[::3]
+        utc = tg - self.OFF
+        D['gps'] = np.column_stack([tg + 0.02, utc, x[::3], np.zeros(len(tg)), np.zeros(len(tg))])
+        tp = t[::6]
+        D['pvt'] = np.column_stack([tp + 0.05 + rng.uniform(-0.04, 0.04, len(tp)), np.full(len(tp), 3.0),
+                                    np.full(len(tp), 2.0), np.full(len(tp), 0.01), tp - self.OFF])
+        lt = T0 + np.arange(0.0, n / 30.0, 0.1)
+        D['loc_t'] = lt
+        D['loc_owner'] = np.where(lt - T0 < self.T_TAKE, 'dr', 'gps')
+        D['loc_anchor_age'] = np.full(len(lt), 0.2)
+        D['loc_heading_age'] = np.full(len(lt), 0.2)
+        return D
+
+    @staticmethod
+    def _step(D, t_step, S):
+        """Vytah tak, jak by ho nahral rosbag, kdyby systemove hodiny v case
+        t_step poskocily o S: cas bagu a razitka uzlu + S, razitka UTC beze
+        zmeny, zpravy serazene podle casu bagu (rosbag je tak cte)."""
+        out = dict(D)
+        for k, a in D.items():
+            if not (isinstance(a, np.ndarray) and a.ndim == 2):
+                continue
+            b = a.copy()
+            late = b[:, 0] >= t_step
+            b[late, 0] += S
+            if k in ns.SYS_STAMPED:
+                b[late, 1] += S
+            out[k] = b[np.argsort(b[:, 0], kind='stable')]
+        lt = D['loc_t'] + np.where(D['loc_t'] >= t_step, S, 0.0)
+        o = np.argsort(lt, kind='stable')
+        for k in [k for k in D if k.startswith('loc_')]:
+            out[k] = (lt if k == 'loc_t' else D[k])[o]
+        return out
+
+    KEYS = (('gps_gap_odom_med_cm', 0.3), ('gps_gap_odom_p95_cm', 0.5), ('gps_along_abs_p95_cm', 0.5),
+            ('takeover_gap_odom_max_cm', 0.3), ('takeover_settle_odom_max_s', 0.15),
+            ('gps_stamp_offset_s', 0.02), ('ekf_step_p99_cm', 0.2), ('gps_owner_pct', 1.0))
+
+    def _check(self, S):
+        ref = ns.score(self._true())
+        self.assertNotIn('clock_steps', ref['meta'])
+        self.assertAlmostEqual(ref['metrics']['takeover_settle_odom_max_s'], 2.0, delta=0.15)
+        self.assertAlmostEqual(ref['metrics']['takeover_gap_odom_max_cm'], 10.0, delta=0.3)
+        R = ns.score(self._step(self._true(), T0 + self.T_TAKE + 1.0, S))
+        cs = R['meta']['clock_steps']
+        self.assertEqual(len(cs), 1)
+        self.assertAlmostEqual(cs[0]['step_s'], S, delta=0.03)
+        self.assertIn('skok systemovych hodin', R['notes']['tf_gap_max_s'])
+        for k, tol in self.KEYS:
+            if ref['metrics'].get(k) is None:
+                self.assertIsNone(R['metrics'].get(k), k)
+                continue
+            self.assertAlmostEqual(R['metrics'][k], ref['metrics'][k], delta=tol, msg=k)
+        return ref, R
+
+    def test_step_forward(self):
+        self._check(+0.7)
+
+    def test_step_backward(self):
+        self._check(-0.7)
+
+    def test_without_fix_metrics_are_wrong(self):
+        # kontrola citlivosti testu: bez odstraneni skoku vyjde doba dorovnani i mezera jinak
+        ref = ns.score(self._true())['metrics']
+        keep = ns.destep
+        ns.destep = lambda D: (D, [])
+        try:
+            fw = ns.score(self._step(self._true(), T0 + self.T_TAKE + 1.0, +0.7))['metrics']
+            bw = ns.score(self._step(self._true(), T0 + self.T_TAKE + 1.0, -0.7))['metrics']
+        finally:
+            ns.destep = keep
+        self.assertGreater(abs(fw['takeover_settle_odom_max_s'] - ref['takeover_settle_odom_max_s']), 0.5)
+        self.assertGreater(bw['gps_gap_odom_p95_cm'], ref['gps_gap_odom_p95_cm'] + 2.0)
+
+    def test_no_step_leaves_extract_untouched(self):
+        D = self._true()
+        D2, steps = ns.destep(D)
+        self.assertIs(D2, D)
+        self.assertEqual(steps, [])
+
+    def test_drift_and_late_message_are_not_steps(self):
+        t = np.arange(0.0, 600.0, 0.2)
+        d = -0.2 - 0.0005 * t + np.random.RandomState(3).uniform(-0.05, 0.05, len(t))   # drift 0,3 s / 10 min
+        d[1000] += 0.4                                   # jedna opozdena zprava
+        self.assertEqual(ns.clock_steps(t + d, t), [])
+        d[1500:] += 0.25
+        st = ns.clock_steps(t + d, t)
+        self.assertEqual(len(st), 1)
+        self.assertAlmostEqual(st[0][2], 0.25, delta=0.03)
+        self.assertTrue(st[0][0] < 300.0 + d[1500] + 0.3 and st[0][1] > 299.5)
+
+    def test_fallback_to_gps_stamps_without_navpvt(self):
+        D = self._step(self._true(), T0 + 60.0, +0.5)
+        del D['pvt']
+        R = ns.score(D)
+        self.assertAlmostEqual(R['meta']['clock_steps'][0]['step_s'], 0.5, delta=0.03)
+
+
+class ClockStep(unittest.TestCase):
+    """v7: skok systemovych hodin BEHEM nahravky (chrony srovna cas skokem).
+    Cas bagu i razitka uzlu poskoci, UTC prijimace ne."""
+    OFF = -0.30          # systemove hodiny za UTC pred skokem
+    T_TAKE = 10.0        # prevzeti GPS [s od zacatku]
+    T_STEP = 11.0        # skok hodin: mezi prevzetim a dorovnanim
+
+    def _clean(self):
+        n, v = 1800, 0.3
+        t = T0 + np.arange(n) / 30.0
+        x, y = v * (t - T0), np.zeros(n)
+        # EKF je do prevzeti 10 cm vedle GPS, pak se 4 s plynule dorovnava (pod 5 cm po 2 s)
+        e = 0.10 * np.clip(1.0 - (t - T0 - self.T_TAKE) / 4.0, 0.0, 1.0)
+        D = {'wheel': odo(t, x, y, v=v), 'ekf': odo(t, x, y + e, v=v), 'odom': odo(t, x, y + e, v=v),
+             'imu': imu(t), 'mo': tfrows(t, 0.0, 0.0), 'ob': tfrows(t, x, y + e), 'counts': {}}
+        tg = t[::3]
+        utc = tg - self.OFF
+        D['gps'] = np.column_stack([tg + 0.02, utc, x[::3], y[::3], np.zeros(len(tg))])
+        D['pvt'] = np.column_stack([tg + 0.01, np.full(len(tg), 3.0), np.full(len(tg), 2.0),
+                                    np.full(len(tg), 0.01), utc])
+        lt = T0 + np.arange(0, n / 30.0, 0.1)
+        D['loc_t'] = lt
+        D['loc_owner'] = np.where(lt - T0 < self.T_TAKE, 'dr', 'gps')
+        D['loc_anchor_age'] = np.full(len(lt), 0.2)
+        D['loc_heading_age'] = np.full(len(lt), 0.2)
+        return D
+
+    def _stepped(self, step):
+        """Tataz jizda, jak by ji nahral rosbag, kdyz hodiny v T_STEP poskoci o
+        step: cas bagu a razitka uzlu od te chvile + step, zpravy serazene podle
+        casu bagu (pri skoku zpet se stare a nove prolozi)."""
+        D = self._clean()
+        ts = T0 + self.T_STEP
+        for k, a in list(D.items()):
+            if not (isinstance(a, np.ndarray) and a.ndim == 2):
+                continue
+            a = a.copy()
+            late = a[:, 0] >= ts
+            a[late, 0] += step
+            if k in ns.SYS_STAMPED:
+                a[late, 1] += step
+            D[k] = a[np.argsort(a[:, 0], kind='stable')]
+        lt = D['loc_t'] + np.where(D['loc_t'] >= ts, step, 0.0)
+        o = np.argsort(lt, kind='stable')
+        for k in ('loc_t', 'loc_owner', 'loc_anchor_age', 'loc_heading_age'):
+            D[k] = (lt if k == 'loc_t' else D[k])[o]
+        return D
+
+    KEYS = ['takeover_gap_odom_med_cm', 'takeover_settle_odom_max_s', 'gps_gap_odom_med_cm',
+            'gps_along_abs_p95_cm']
+
+    def _check(self, step):
+        A = ns.score(self._clean())
+        B = ns.score(self._stepped(step))
+        self.assertNotIn('clock_steps', A['meta'])
+        cs = B['meta']['clock_steps']
+        self.assertEqual(len(cs), 1)
+        self.assertAlmostEqual(cs[0]['step_s'], step, delta=0.02)
+        self.assertIn('skok systemovych hodin', B['notes']['tf_gap_max_s'])
+        a, b = A['metrics'], B['metrics']
+        self.assertAlmostEqual(a['takeover_settle_odom_max_s'], 2.0, delta=0.15)
+        self.assertAlmostEqual(a['takeover_gap_odom_med_cm'], 10.0, delta=0.3)
+        for k in self.KEYS:
+            if k in a:
+                self.assertAlmostEqual(a[k], b[k], delta=0.25, msg=k)
+        # p95 mezery: dorovnani po prevzeti je 8 % vzorku, kolem skoku cast vypadne -> smi jen klesnout
+        self.assertLessEqual(b['gps_gap_odom_p95_cm'], a['gps_gap_odom_p95_cm'] + 0.25)
+        self.assertLess(B['meta']['clock_steps'][0]['dropped_s'], 2 * abs(min(step, 0.0)) + 0.5)
+        # kroky pozy: prolozene zpravy nesmi vyrobit skoky
+        for k in a:
+            if k.endswith('_per_min') and isinstance(a[k], float):
+                self.assertAlmostEqual(a[k], b[k], delta=0.5, msg=k)
+        return a, b
+
+    def test_step_forward(self):
+        self._check(+0.7)
+
+    def test_step_backward(self):
+        self._check(-0.7)
+
+    def test_without_destep_metrics_are_wrong(self):
+        # kontrola citlivosti testu: bez opravy vyjde dorovnani o velikost skoku jinak
+        orig = ns.destep
+        ns.destep = lambda D: (D, [])
+        try:
+            fwd = ns.score(self._stepped(+0.7))['metrics']
+            back = ns.score(self._stepped(-0.7))['metrics']
+        finally:
+            ns.destep = orig
+        self.assertGreater(fwd['takeover_settle_odom_max_s'], 2.5)
+        self.assertGreater(abs(back['takeover_settle_odom_max_s'] - 2.0) + back['gps_gap_odom_p95_cm'] / 10.0, 0.5)
+
+    def test_constant_offset_drift_and_outliers_are_not_steps(self):
+        t = np.arange(0.0, 600.0, 0.2)
+        d = -0.68 - 5e-5 * t + 0.04 * np.sin(1.7 * t)        # posun, drift, rozptyl dodani
+        d[500] += 0.4                                        # jedna opozdena zprava
+        d[1000:1004] += 0.3                                  # kratke zdrzeni
+        self.assertEqual(ns.clock_steps(t + d, t), [])
+        D = self._clean()
+        D2, steps = ns.destep(D)
+        self.assertIs(D2, D)
+        self.assertEqual(steps, [])
+
+    def test_two_steps_and_sizes(self):
+        u = np.arange(0.0, 300.0, 0.2)
+        d = 0.1 + np.where(u >= 100, 0.25, 0.0) + np.where(u >= 200, -0.6, 0.0)
+        st = ns.clock_steps(u + d, u)
+        self.assertEqual(len(st), 2)
+        self.assertAlmostEqual(st[0][2], 0.25, places=3)
+        self.assertAlmostEqual(st[1][2], -0.6, places=3)
+        self.assertTrue(st[0][0] < 100.2 < st[0][1] + 0.3)
+
+    def test_fallback_to_gps_stamps_without_navpvt(self):
+        D = self._stepped(+0.7)
+        del D['pvt']
+        R = ns.score(D)
+        self.assertAlmostEqual(R['meta']['clock_steps'][0]['step_s'], 0.7, delta=0.02)
+        self.assertAlmostEqual(R['metrics']['takeover_settle_odom_max_s'], 2.0, delta=0.2)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)

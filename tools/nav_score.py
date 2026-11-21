@@ -100,6 +100,15 @@ C2. Mezera EKF - GPS s opravou razitek, v ramu odom
          (0 = razitka sedi; obsahuje i zpozdeni dodani navpvt a kotvy).
    takeover_gap_odom_med_cm / _max_cm, takeover_settle_odom_med_s / _max_s
          jako takeover_gap_* / takeover_settle_*, ale z teto mezery.
+   SKOK HODIN BEHEM NAHRAVKY (v7): cas bagu i razitka vsech uzlu jsou ze
+   systemovych hodin; kdyz je chrony behem jizdy skokem srovna, casova osa se
+   roztrhne (dopredu) nebo prekryje (zpet) a vsechna trvani, parovani a
+   interpolace pres skok jsou spatne. Jedine hodiny, ktere na systemu
+   nezavisi, je UTC prijimace v /gnss/navpvt: skok se pozna jako nahla zmena
+   (cas bagu - UTC) o vic nez 0,1 s (clock_steps) a pred vypoctem se z cele
+   nahravky odstrani (destep): casy za skokem se posunou zpet, zpravy z
+   nejisteho useku kolem skoku se vypusti. Nahravka bez skoku se nemeni.
+   Skoky jsou v meta.clock_steps a v poznamce u tf_gap_max_s.
 C3. "Pohyblive" prevzeti polohy po vyjezdu z doku (takeover_wander, v4)
    Co vidi majitel na mape: obraz robota po prevzeti GPS cikcak ujede
    desitky cm, i kdyz staci opravit par cm, a robot sam se pritom nehybe.
@@ -219,8 +228,8 @@ import sys
 
 import numpy as np
 
-VERSION = 6
-EXTRACT_VERSION = 3    # format vytahu (.npz v --cache); v4 az v6 pridaly jen metriky, vytah je stejny
+VERSION = 7
+EXTRACT_VERSION = 3    # format vytahu (.npz v --cache); v4 az v7 pridaly jen metriky, vytah je stejny
 
 TOPICS = {
     'tf': '/tf',
@@ -568,6 +577,104 @@ def stamp_offset(tq, pvt=None, gps=None, win_s=60.0):
     return np.interp(tq, grid, rolling_median(t, d, grid, win_s)), src
 
 
+def clock_steps(t, utc, thr_s=0.1, win_s=2.0):
+    """Skoky systemovych hodin behem nahravky. t = cas bagu (systemove hodiny),
+    utc = cas prijimace GPS tychz zprav (na systemovych hodinach nezavisi).
+    Skok = median (t - utc) za win_s po vzorku se od medianu za win_s pred nim
+    lisi o vic nez thr_s (rozptyl dodani zprav je +-0,05 s, plynuly drift
+    hodin skok neni). Vraci seznam (lo, hi, step_s): step_s = o kolik hodiny
+    poskocily (+ dopredu), (lo, hi) = usek casu bagu, kde nelze rict, zda
+    zprava vznikla pred skokem nebo po nem (dira pri skoku dopredu, prekryv pri
+    skoku zpet; o periodu zprav rozsireny)."""
+    t, utc = np.asarray(t, dtype=float), np.asarray(utc, dtype=float)
+    ok = np.isfinite(t) & np.isfinite(utc)
+    t, utc = t[ok], utc[ok]
+    if len(t) < 12:
+        return []
+    o = np.argsort(utc, kind='stable')
+    t, utc = t[o], utc[o]
+    d = t - utc
+    per = float(np.median(np.diff(utc)))
+    if not per > 0:
+        return []
+    K = int(max(5, round(win_s / per)))
+    n = len(d)
+    if n < 2 * K + 1:
+        return []
+    j = np.zeros(n)
+    for i in range(K, n - K + 1):
+        j[i] = np.median(d[i:i + K]) - np.median(d[i - K:i])
+    hot = np.abs(j) > thr_s
+    out, i = [], 0
+    while i < n:
+        if not hot[i]:
+            i += 1
+            continue
+        e = i
+        while e < n and hot[e]:
+            e += 1
+        mid = (i + e - 1) // 2                       # stred plosiny = misto skoku
+        a, b = max(1, mid - 2), min(n - 1, mid + 2)
+        i0 = a + int(np.argmax(np.abs(np.diff(d[a - 1:b + 1]))))
+        W = int(max(K, round(5.0 / per)))
+        step = float(np.median(d[i0:i0 + W]) - np.median(d[max(0, i0 - W):i0]))
+        if abs(step) > thr_s:
+            out.append((float(min(t[i0 - 1], t[i0]) - per), float(max(t[i0 - 1], t[i0]) + per), step))
+        i = e
+    return out
+
+
+SYS_STAMPED = ('mo', 'ob', 'ekf', 'odom', 'ekfw', 'wheel', 'imu')   # sloupec 1 = razitko systemovych hodin
+
+
+def destep(D):
+    """Odstrani z vytahu skoky systemovych hodin (clock_steps z /gnss/navpvt,
+    bez nej z razitek /odometry/gps). Cas bagu a razitka systemovych hodin
+    vsech temat se za skokem posunou zpet o velikost skoku, zpravy z nejisteho
+    useku kolem skoku se vypusti a radky se znovu seradi podle casu. Casova osa
+    je pak spojita (trvani, parovani a interpolace plati i pres skok); razitka
+    UTC prijimace se nemeni. Bez skoku vraci D beze zmeny. Vraci (D, skoky),
+    skoky = [{'t': cas bagu, 'step_s', 'dropped_s'}]; dropped_s = kolik sekund
+    jizdy vypadlo (2 periody zprav pri skoku dopredu, navic 2x |skok| pri skoku
+    zpet, kde se stare a nove zpravy v case bagu prekryvaji)."""
+    steps = []
+    if _have(D, 'pvt', 12) and D['pvt'].shape[1] >= 5 and np.isfinite(D['pvt'][:, 4]).sum() >= 12:
+        steps = clock_steps(D['pvt'][:, 0], D['pvt'][:, 4])
+    elif _have(D, 'gps', 12):
+        # razitko /odometry/gps obcas preskoci o celou periodu 0,1 s (3 z 66 nahravek): vyssi prah
+        steps = clock_steps(D['gps'][:, 0], D['gps'][:, 1], thr_s=0.25)
+    if not steps:
+        return D, []
+
+    def fix(tb):
+        keep = np.ones(len(tb), dtype=bool)
+        cum = np.zeros(len(tb))
+        for (lo, hi, st) in steps:
+            keep &= ~((tb > lo) & (tb < hi))
+            cum += np.where(tb >= hi, st, 0.0)
+        return keep, cum
+
+    out = dict(D)
+    for k, a in D.items():
+        if not (isinstance(a, np.ndarray) and a.ndim == 2 and len(a) and a.dtype.kind == 'f'):
+            continue
+        keep, cum = fix(a[:, 0])
+        b = a[keep].copy()
+        b[:, 0] -= cum[keep]
+        if k in SYS_STAMPED:
+            b[:, 1] -= cum[keep]
+        out[k] = b[np.argsort(b[:, 0], kind='stable')]
+    if 'loc_t' in D:
+        keep, cum = fix(np.asarray(D['loc_t'], dtype=float))
+        tl = np.asarray(D['loc_t'], dtype=float)[keep] - cum[keep]
+        o = np.argsort(tl, kind='stable')
+        n = len(D['loc_t'])
+        for k, a in D.items():
+            if k.startswith('loc_') and isinstance(a, np.ndarray) and len(a) == n:
+                out[k] = (tl if k == 'loc_t' else a[keep])[o]
+    return out, [{'t': lo, 'step_s': st, 'dropped_s': hi - lo - st} for (lo, hi, st) in steps]
+
+
 def gps_gap_odom(ekf, gps, off, episodes, pvt=None):
     """Mezera EKF - GPS v ramu odom s opravenymi razitky (oddil C2).
     off = posun hodin pro kazdy vzorek gps (pole) nebo skalar. Vraci dict
@@ -902,6 +1009,7 @@ def tf_gap_stats(T, tau, wheel):
 def score(D):
     """D = vytah z bagu (viz extract). Vraci dict {meta, metrics, notes, detail}."""
     M, notes, detail = {}, {}, {}
+    D, clock = destep(D)
 
     def missing(keys, *topics):
         have = D.get('counts') or {}
@@ -927,6 +1035,13 @@ def score(D):
         T = pair_ticks(D['mo'], D['ob'])
         tau, matched = pose_times(T, ekf)
     meta = {'yaw_ref': yref_src, 'topics': D.get('counts', {})}
+    if clock:
+        meta['clock_steps'] = [{'t': round(c['t'], 2), 'step_s': round(c['step_s'], 3),
+                                'dropped_s': round(c['dropped_s'], 2)} for c in clock]
+        notes['tf_gap_max_s'] = ('skok systemovych hodin %s s behem nahravky: casova osa opravena, '
+                                 'kolem skoku vypusteno %.1f s zprav (mezera v /tf)'
+                                 % (', '.join('%+.2f' % c['step_s'] for c in clock),
+                                    sum(c['dropped_s'] for c in clock)))
     t_all = [a[:, 0] for k, a in D.items() if isinstance(a, np.ndarray) and a.ndim == 2 and len(a)]
     t_beg = min(float(a[0]) for a in t_all) if t_all else 0.0
     t_fin = max(float(a[-1]) for a in t_all) if t_all else 0.0
